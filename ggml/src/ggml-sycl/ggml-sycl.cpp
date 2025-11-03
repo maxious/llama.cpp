@@ -4137,6 +4137,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         case GGML_OP_TOP_K:
             ggml_sycl_op_top_k(ctx, dst);
             break;
+        case GGML_OP_FLASH_ATTN_EXT:
+            ggml_sycl_op_flash_attn(ctx, dst);
+            break;
         case GGML_OP_TIMESTEP_EMBEDDING:
             ggml_sycl_op_timestep_embedding(ctx, dst);
             break;
@@ -4830,6 +4833,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_ARGSORT:
             return op->src[0]->ne[0] * sizeof(int) <=
                    ggml_sycl_info().devices[device].smpbo;
+<<<<<<< HEAD
         case GGML_OP_TOP_K: {
             const ggml_tensor * src0 = op->src[0];
             const int k = op->ne[0];
@@ -4839,6 +4843,10 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                 ggml_is_contiguous(src0) &&
                 k > 0 && k <= 32;
         }
+=======
+        case GGML_OP_FLASH_ATTN_EXT:
+            return ggml_sycl_flash_attn_ext_supported(op);
+>>>>>>> c9f6dadc4 (sycl: initialize flash-attention implementation)
         case GGML_OP_POOL_2D:
         case GGML_OP_ACC:
             return true;
