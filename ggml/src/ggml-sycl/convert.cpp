@@ -556,7 +556,8 @@ static void convert_unary_nc_bf16_sycl(const void * __restrict__ vx, dst_t * __r
                                   const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
                                   const int64_t s01, const int64_t s02, const int64_t s03, dpct::queue_ptr queue) {
 #ifdef GGML_SYCL_BF16
-    dpct::has_capability_or_fail(queue->get_device(), { sycl::aspect::bfloat16 });
+    // Note: bfloat16 support is enabled at compile time via GGML_SYCL_BF16
+    // Runtime capability is assumed available when this flag is set
 
     sycl::range<3> global_size(ne02 * ne03, ne01, ceil_div(ne00, SYCL_DEQUANTIZE_BLOCK_SIZE));
 

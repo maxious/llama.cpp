@@ -159,7 +159,8 @@ typedef uint16_t bfloat16;
 // BF16 to FP32 conversion
 static __dpct_inline__ float bf16_to_fp32(bfloat16 x) {
 #ifdef GGML_SYCL_BF16
-    return sycl::ext::oneapi::bfloat16::to_float(x);
+    // Use implicit conversion from bfloat16 to float
+    return static_cast<float>(x);
 #else
     // Software conversion: extract mantissa and exponent
     uint32_t bits = static_cast<uint32_t>(x);
@@ -177,7 +178,8 @@ static __dpct_inline__ float bf16_to_fp32(bfloat16 x) {
 // FP32 to BF16 conversion (round to nearest even)
 static __dpct_inline__ bfloat16 fp32_to_bf16(float x) {
 #ifdef GGML_SYCL_BF16
-    return sycl::ext::oneapi::bfloat16::from_float(x);
+    // Use implicit conversion from float to bfloat16
+    return bfloat16(x);
 #else
     uint32_t bits = *reinterpret_cast<uint32_t*>(&x);
     uint32_t sign = (bits >> 31) & 0x1;
