@@ -36,21 +36,22 @@ static __dpct_inline__ T op_sgn(T x) {
 
 template<typename T>
 static __dpct_inline__ T op_abs(T x) {
-    return sycl::fabs(x);
+    return sycl::fabs(static_cast<float>(x));
 }
 
 template<typename T>
 static __dpct_inline__ T op_elu(T x) {
-    return (x > static_cast<T>(0.f)) ? x : sycl::expm1(x);
+    return (x > static_cast<T>(0.f)) ? x : static_cast<T>(sycl::expm1(static_cast<float>(x)));
 }
 
 template<typename T>
 static __dpct_inline__ T op_gelu(T x) {
     const T GELU_COEF_A    = static_cast<T>(0.044715f);
     const T SQRT_2_OVER_PI = static_cast<T>(0.79788456080286535587989211986876f);
+    float x_f = static_cast<float>(x);
     return static_cast<T>(0.5f) * x *
            (static_cast<T>(1.0f) +
-            sycl::tanh(SQRT_2_OVER_PI * x * (static_cast<T>(1.0f) + GELU_COEF_A * x * x)));
+            sycl::tanh(static_cast<float>(SQRT_2_OVER_PI) * x_f * (static_cast<float>(1.0f) + static_cast<float>(GELU_COEF_A) * x_f * x_f)));
 }
 
 template<typename T>
@@ -67,17 +68,17 @@ static __dpct_inline__ T op_gelu_quick(T x) {
 template<typename T>
 static __dpct_inline__ T op_gelu_erf(T x) {
     const T SQRT_2_INV = static_cast<T>(0.70710678118654752440084436210484f);
-    return static_cast<T>(0.5f) * x * (static_cast<T>(1.0f) + sycl::erf(x * SQRT_2_INV));
+    return static_cast<T>(0.5f) * x * (static_cast<T>(1.0f) + sycl::erf(static_cast<float>(x) * static_cast<float>(SQRT_2_INV)));
 }
 
 template<typename T>
 static __dpct_inline__ T op_tanh(T x) {
-    return sycl::tanh(x);
+    return sycl::tanh(static_cast<float>(x));
 }
 
 template<typename T>
 static __dpct_inline__ T op_relu(T x) {
-    return sycl::fmax(x, static_cast<T>(0));
+    return sycl::fmax(static_cast<float>(x), 0.0f);
 }
 
 template<typename T>
@@ -87,32 +88,32 @@ static __dpct_inline__ T op_sigmoid(T x) {
 
 template<typename T>
 static __dpct_inline__ T op_sqrt(T x) {
-    return sycl::sqrt(x);
+    return sycl::sqrt(static_cast<float>(x));
 }
 
 template<typename T>
 static __dpct_inline__ T op_sin(T x) {
-    return sycl::sin(x);
+    return sycl::sin(static_cast<float>(x));
 }
 
 template<typename T>
 static __dpct_inline__ T op_cos(T x) {
-    return sycl::cos(x);
+    return sycl::cos(static_cast<float>(x));
 }
 
 template<typename T>
 static __dpct_inline__ T op_hardsigmoid(T x) {
-    return sycl::fmin(static_cast<T>(1.0f), sycl::fmax(static_cast<T>(0.0f), (x + static_cast<T>(3.0f)) / static_cast<T>(6.0f)));
+    return sycl::fmin(1.0f, sycl::fmax(0.0f, (static_cast<float>(x) + 3.0f) / 6.0f));
 }
 
 template<typename T>
 static __dpct_inline__ T op_hardswish(T x) {
-    return x * sycl::fmin(static_cast<T>(1.0f), sycl::fmax(static_cast<T>(0.0f), (x + static_cast<T>(3.0f)) / static_cast<T>(6.0f)));
+    return x * sycl::fmin(1.0f, sycl::fmax(0.0f, (static_cast<float>(x) + 3.0f) / 6.0f));
 }
 
 template<typename T>
 static __dpct_inline__ T op_exp(T x) {
-    return sycl::exp(x);
+    return sycl::exp(static_cast<float>(x));
 }
 
 template<typename T>
@@ -120,7 +121,7 @@ static __dpct_inline__ T op_log(T x) {
     if (x <= static_cast<T>(0)) {
         return neg_infinity<T>();
     }
-    return sycl::log(x);
+    return sycl::log(static_cast<float>(x));
 }
 
 template<typename T>
@@ -135,9 +136,8 @@ static __dpct_inline__ T op_step(T x) {
 
 template<typename T>
 static __dpct_inline__ T op_leaky_relu(T x, float negative_slope) {
-    T neg_slope_T = static_cast<T>(negative_slope);
-    return sycl::fmax(x, static_cast<T>(0)) +
-           sycl::fmin(x, static_cast<T>(0.0f)) * neg_slope_T;
+    return sycl::fmax(static_cast<float>(x), 0.0f) +
+           sycl::fmin(static_cast<float>(x), 0.0f) * negative_slope;
 }
 
 template<typename T>
@@ -152,22 +152,22 @@ static __dpct_inline__ T op_clamp(T x, float min_val, float max_val) {
 
 template<typename T>
 static __dpct_inline__ T op_floor(T x) {
-    return sycl::floor(x);
+    return sycl::floor(static_cast<float>(x));
 }
 
 template<typename T>
 static __dpct_inline__ T op_ceil(T x) {
-    return sycl::ceil(x);
+    return sycl::ceil(static_cast<float>(x));
 }
 
 template<typename T>
 static __dpct_inline__ T op_round(T x) {
-    return sycl::round(x);
+    return sycl::round(static_cast<float>(x));
 }
 
 template<typename T>
 static __dpct_inline__ T op_trunc(T x) {
-    return sycl::trunc(x);
+    return sycl::trunc(static_cast<float>(x));
 }
 
 template<typename T, typename F>
