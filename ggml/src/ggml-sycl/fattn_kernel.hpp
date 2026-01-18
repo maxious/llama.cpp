@@ -177,7 +177,7 @@ inline void flash_attn_dequantize_fp16_kernel(
     const int64_t row = idx / row_stride;
     const int64_t col = idx % row_stride;
 
-    dst[idx] = sycl::convert<float>(src[row * row_stride + col]);
+    dst[idx] = static_cast<float>(src[row * row_stride + col]);
 }
 
 // Intel XMX Cooperative Matrix Support

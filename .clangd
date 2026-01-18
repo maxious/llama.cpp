@@ -1,0 +1,25 @@
+# Clangd configuration for llama.cpp with SYCL support
+# This enables proper IntelliSense for Intel oneAPI SYCL development
+
+CompileFlags:
+  # Add oneAPI SYCL include paths
+  Add:
+    - -I/opt/intel/oneapi/compiler/2025.3/include
+    - -I/opt/intel/oneapi/mkl/2025.3/include
+    - -I/opt/intel/oneapi/dnnl/2025.3/include
+
+  # Set SYCL target for proper code analysis
+  CompilationDatabase: build-sycl/
+
+  # SYCL requires C++17 or later
+  Compiler: icpx
+
+# Indexing options for faster symbol lookup
+Index:
+  Background: Skip
+
+# Diagnostic suppression for known issues
+Diagnostics:
+  Suppress:
+    - undefined-template
+    - default_function_argument_not_deduced

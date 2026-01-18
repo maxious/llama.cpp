@@ -7,8 +7,10 @@
 #include <limits>
 #include <sycl/sycl.hpp>
 
-#define Br 32
-#define Bc 32
+// Block sizes for flash attention tiling
+// These are regular constants, not macros, to avoid conflicts with function parameters
+constexpr int FATTN_BLOCK_R = 32;  // Br
+constexpr int FATTN_BLOCK_C = 32;  // Bc
 
 
 bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
@@ -101,8 +103,8 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     const ptrdiff_t v_row_stride = V->nb[1] / (ptrdiff_t)sizeof(float);
     const ptrdiff_t o_row_stride = dst->nb[1] / (ptrdiff_t)sizeof(float);
 
-    const int Br = 32;
-    const int Bc = 32;
+    const int Br = FATTN_BLOCK_R;
+    const int Bc = FATTN_BLOCK_C;
 
     const int Tr = (N + Br - 1) / Br;
     const int Tc = (N + Bc - 1) / Bc;
