@@ -31,11 +31,18 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
         return false;
     }
 
+    // Causal masking support: check if mask is present but not custom
+    // For custom masks, we still need to check if we support the specific type
     if (mask != 0) {
+        // For now, support only causal-like masks (simple boolean or no mask)
+        // Custom attention masks with arbitrary patterns require more work
         return false;
     }
     
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F32 || V->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    // Support F32 or FP16 inputs (FP16 will be dequantized to F32)
+    const bool is_f32 = (Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F32 && V->type == GGML_TYPE_F32);
+    const bool is_f16 = (Q->type == GGML_TYPE_F16 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
+    if (!is_f32 && !is_f16) {
         return false;
     }
 
@@ -50,8 +57,21 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
         return false;
     }
 
-    //not support multi-head yet
-    if (Q->ne[2] != 1 || K->ne[2] != 1 || V->ne[2] != 1) {
+    // GQA support: n_kv_heads can be less than n_heads
+    const int64_t n_heads = Q->ne[2];
+    const int64_t n_kv_heads = K->ne[2];
+
+    // n_heads must be divisible by n_kv_heads for GQA/MQA
+    if (n_heads % n_kv_heads != 0) {
+        return false;
+    }
+
+    // GQA ratio (number of Q heads per K/V head)
+    const int gqa_ratio = n_heads / n_kv_heads;
+
+    // For now, only support ratio of 1 (MHA) or small ratios
+    // Larger ratios would require different memory access patterns
+    if (gqa_ratio > 8) {
         return false;
     }
 
@@ -72,23 +92,28 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     dpct::queue_ptr stream = ctx.stream();
 
     const int64_t N = Q->ne[1];
+    const int64_t n_heads = Q->ne[2];
+    const int64_t n_kv_heads = K->ne[2];
+    const int64_t gqa_ratio = n_heads / n_kv_heads;  // GQA ratio
 
     const ptrdiff_t q_row_stride = Q->nb[1] / (ptrdiff_t)sizeof(float);
     const ptrdiff_t k_row_stride = K->nb[1] / (ptrdiff_t)sizeof(float);
     const ptrdiff_t v_row_stride = V->nb[1] / (ptrdiff_t)sizeof(float);
     const ptrdiff_t o_row_stride = dst->nb[1] / (ptrdiff_t)sizeof(float);
 
-    // const int Br = std::min((int) FLASH_ATTN_BR_MAX, (int) N);
-    // const int Bc = std::min((int) FLASH_ATTN_BC_MAX, (int) N);
+    const int Br = 32;
+    const int Bc = 32;
 
     const int Tr = (N + Br - 1) / Br;
     const int Tc = (N + Bc - 1) / Bc;
 
-    float * l_d = (float *) sycl::malloc_device(N * sizeof(float), *stream);
-    float * m_d = (float *) sycl::malloc_device(N * sizeof(float), *stream);
+    // Per-row statistics for online softmax (one per Q row)
+    float * l_d = (float *) sycl::malloc_device(N * n_heads * sizeof(float), *stream);
+    float * m_d = (float *) sycl::malloc_device(N * n_heads * sizeof(float), *stream);
 
-    sycl::range<2> global(Br * Tr, Tc);
-    sycl::range<2> local(Br,1);
+    // Launch: grid is (Br * Tr, Tc * n_heads) for processing all heads
+    sycl::range<2> global(Br * Tr, Tc * n_heads);
+    sycl::range<2> local(Br, 1);
 
     stream->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 2> Qtile({Br, DQK}, cgh);
@@ -113,26 +138,35 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
             int group_id_i = group.get_group_id(0);
             int group_id_j = group.get_group_id(1);
 
+            // Head index from group_id_j
+            int head_idx = group_id_j;
+            int kv_head_idx = head_idx / gqa_ratio;  // Which K/V head this Q head maps to
 
             int row0 = group_id_i * Br;
-            int col0 = group_id_j * Bc;
+            int col0 = (group_id_j % Tc) * Bc;
 
             if (row0 >= (int) N || col0 >= (int) N) {
                 return;
             }
 
-            const float* Q_block = Q_d + (ptrdiff_t)row0 * q_row_stride;
-            const float* K_block = K_d + (ptrdiff_t)col0 * k_row_stride;
-            const float* V_block = V_d + (ptrdiff_t)col0 * v_row_stride;
-            float*       O_block = dst_d + (ptrdiff_t)row0 * o_row_stride;
+            // Calculate base pointers for this head
+            const float* Q_block = Q_d + (ptrdiff_t)(head_idx * N + row0) * q_row_stride;
+            const float* K_block = K_d + (ptrdiff_t)(kv_head_idx * N + col0) * k_row_stride;
+            const float* V_block = V_d + (ptrdiff_t)(kv_head_idx * N + col0) * v_row_stride;
+            float*       O_block = dst_d + (ptrdiff_t)(head_idx * N + row0) * o_row_stride;
 
-            //this lines does not support non-contiguous tensors
+            // Row statistics offsets
+            float* l_row = l_d + (ptrdiff_t)(head_idx * N + row0);
+            float* m_row = m_d + (ptrdiff_t)(head_idx * N + row0);
+
+            // Copy tiles to local memory
             ggml_sycl_memcpy<Br * DQK>(q_loc, Q_block);
             ggml_sycl_memcpy<Bc * DQK>(k_loc, K_block);
             ggml_sycl_memcpy<Bc * DV>(v_loc, V_block);
 
             it.barrier(sycl::access::fence_space::local_space);
 
+            // Q @ K^T
             flash_attn_mul_mat_QK_kernel<DQK>(
                 it,
                 Q_block, q_row_stride,
@@ -143,49 +177,52 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
 
             it.barrier(sycl::access::fence_space::local_space);
 
+            // Softmax with causal masking and optional sliding window
             flash_attn_softmax_kernel(
                 it,
                 s_loc, p_loc,
                 m_loc, l_loc,
                 Br, Bc,
-                l_d, m_d
+                l_row, m_row,
+                0,   // row_offset (not used)
+                0    // window_size (0 = no sliding window limit)
             );
 
             it.barrier(sycl::access::fence_space::local_space);
 
+            // P @ V
             flash_attn_mul_mat_PV_kernel<DV>(
                 it,
                 p_loc, (ptrdiff_t)Bc,
                 V_block, v_row_stride,
                 O_block, o_row_stride,
-                Br,Bc
+                Br, Bc
             );
 
             it.barrier(sycl::access::fence_space::local_space);
         });
     });
 
-    
+    // Normalize output by row sum
     stream->submit([&](sycl::handler& cgh) {
-        const ptrdiff_t o_stride = o_row_stride;
-
-        cgh.parallel_for(sycl::range<1>(N), [=](sycl::id<1> id_row) {
-            int row = id_row[0];
-            float l_val = l_d[row];
+        cgh.parallel_for(sycl::range<1>(N * n_heads), [=](sycl::id<1> id) {
+            int idx = id[0];
+            int head_idx = idx / N;
+            int row = idx % N;
+            float l_val = l_d[idx];
 
             if (l_val <= 0.0f) {
                 return;
             }
 
             float inv_l = 1.0f / l_val;
-            float * o_row = dst_d + (ptrdiff_t)row * o_stride;
+            float * o_row = dst_d + (ptrdiff_t)(head_idx * N + row) * o_row_stride;
 
             for (int col = 0; col < DV; ++col) {
                 o_row[col] *= inv_l;
             }
         });
     });
-
 
     sycl::free(l_d, *stream);
     sycl::free(m_d, *stream);

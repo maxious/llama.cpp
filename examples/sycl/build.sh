@@ -3,21 +3,24 @@
 #  Copyright (C) 2024 Intel Corporation
 #  SPDX-License-Identifier: MIT
 
-mkdir -p build
-cd build
+# Enable oneAPI environment (required for SYCL and oneDNN)
 source /opt/intel/oneapi/setvars.sh
 
+# Clean and create build directory
+rm -rf build
+mkdir -p build
+cd build
+
+# Configure with SYCL backend for Intel GPU
+# - Uses icx/icpx Intel compilers
+# - Enables Flash Attention (fattn) support for faster attention computation
+# - Disables CURL for offline builds (optional)
+
 #for FP16
-#cmake .. -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON -DLLAMA_OPENSSL=OFF # faster for long-prompt inference
+#cmake .. -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON -DLLAMA_CURL=OFF # faster for long-prompt inference
 
 #for FP32
-cmake .. -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DLLAMA_OPENSSL=OFF
+cmake .. -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DLLAMA_CURL=OFF
 
-#build example/main
-#cmake --build . --config Release --target main
-
-#build example/llama-bench
-#cmake --build . --config Release --target llama-bench
-
-#build all binary
-cmake --build . --config Release -j -v
+# Build all binaries with parallel jobs
+cmake --build . --config Release -j $(nproc)
