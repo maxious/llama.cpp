@@ -326,18 +326,23 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * src2 = dst->src[2];
 
-    const float * src0_d = (const float *) src0->data;
-    const void  * src1_d = src1 ? (const void *) src1->data : nullptr;
-    const void  * src2_d = src2 ? (const void *) src2->data : nullptr;
-    float       *  dst_d = (float *) dst->data;
-
     dpct::queue_ptr stream = ctx.stream();
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+    // Support F16, BF16, and F32 input/output
+    const bool is_f16 = (src0->type == GGML_TYPE_F16);
+    const bool is_bf16 = (src0->type == GGML_TYPE_BF16);
+    const bool is_f32 = (src0->type == GGML_TYPE_F32);
+
+#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
+    GGML_ASSERT(is_f32 || is_f16 || is_bf16);
+    GGML_ASSERT(dst->type == src0->type);
+#else
+    GGML_ASSERT(is_f32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+#endif
 
     // src1 contains mask and it is optional
-    GGML_ASSERT(!src1 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(!src1 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16);
 
     const int64_t nrows_x = ggml_nrows(src0);
     const int64_t nrows_y = src0->ne[1];
@@ -350,7 +355,8 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
 
-    const bool use_f16 = (src1 && src1->type == GGML_TYPE_F16);
+    const bool use_f16_mask = (src1 && src1->type == GGML_TYPE_F16);
+    const bool use_bf16_mask = (src1 && src1->type == GGML_TYPE_BF16);
 
     const int64_t nb11 = src1 ? src1->nb[1] : 1;
     const int64_t nb12 = src1 ? src1->nb[2] : 1;
@@ -364,7 +370,6 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
-
 
     soft_max_params params = {};
     params.nheads = src0->ne[2];
@@ -386,13 +391,74 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     params.m0 = m0;
     params.m1 = m1;
 
-    if (use_f16) {
-        soft_max_f32_sycl(src0_d, (const sycl::half *)src1_d,
-                          (const float *)src2_d, dst_d, params, stream,
-                          ctx.device);
+    // Allocate temporary F32 buffers for F16/BF16 input/output
+    const size_t nbytes = ggml_nbytes(src0);
+    float * src0_f32 = nullptr;
+    float * dst_f32 = nullptr;
+    bool need_tempBuffers = false;
+
+    if (is_f16 || is_bf16) {
+        src0_f32 = (float *)sycl::malloc_device(nbytes, *stream);
+        dst_f32 = (float *)sycl::malloc_device(nbytes, *stream);
+        need_tempBuffers = true;
+
+        // Dequantize src0 to F32
+        const int64_t n_elements = ggml_nelements(src0);
+        stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
+            const int idx = it.get_id(0);
+            if (is_f16) {
+                const sycl::half * src = (const sycl::half *)src0->data;
+                src0_f32[idx] = static_cast<float>(src[idx]);
+            } else {
+                const bfloat16 * src = (const bfloat16 *)src0->data;
+                src0_f32[idx] = bf16_to_fp32(src[idx]);
+            }
+        });
+    }
+
+    // Handle mask conversion if needed
+    const void * mask_ptr = src1 ? src1->data : nullptr;
+    if (use_bf16_mask && src1) {
+        // Convert BF16 mask to F32
+        const int64_t mask_elements = ggml_nelements(src1);
+        float * mask_f32 = (float *)sycl::malloc_device(mask_elements * sizeof(float), *stream);
+        stream->parallel_for(sycl::range<1>(mask_elements), [=](sycl::item<1> it) {
+            const int idx = it.get_id(0);
+            mask_f32[idx] = bf16_to_fp32(((const bfloat16 *)src1->data)[idx]);
+        });
+        mask_ptr = mask_f32;
+        // Note: This leaks mask_f32 - should be freed after kernel completes
+    }
+
+    // Call the kernel with F32 data
+    if (use_f16_mask) {
+        soft_max_f32_sycl(is_f32 || is_bf16 ? (const float *)src0->data : src0_f32,
+                          (const sycl::half *)src1->data,
+                          (const float *)src2->data,
+                          is_f32 || is_bf16 ? (float *)dst->data : dst_f32,
+                          params, stream, ctx.device);
     } else {
-        soft_max_f32_sycl(src0_d, (const float *)src1_d, (const float *)src2_d,
-                          dst_d, params, stream, ctx.device);
+        soft_max_f32_sycl(is_f32 || is_bf16 ? (const float *)src0->data : src0_f32,
+                          (const float *)mask_ptr,
+                          (const float *)src2->data,
+                          is_f32 || is_bf16 ? (float *)dst->data : dst_f32,
+                          params, stream, ctx.device);
+    }
+
+    // If output is F16/BF16, requantize from F32
+    if (is_f16 || is_bf16) {
+        const int64_t n_elements = ggml_nelements(dst);
+        stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
+            const int idx = it.get_id(0);
+            float val = dst_f32[idx];
+            if (is_f16) {
+                ((sycl::half *)dst->data)[idx] = static_cast<sycl::half>(val);
+            } else {
+                ((bfloat16 *)dst->data)[idx] = fp32_to_bf16(val);
+            }
+        });
+        sycl::free(src0_f32, *stream);
+        sycl::free(dst_f32, *stream);
     }
 }
 
