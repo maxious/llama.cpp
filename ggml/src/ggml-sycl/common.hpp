@@ -147,6 +147,102 @@ typedef float dfloat; // dequantize float
 typedef sycl::float2 dfloat2;
 #endif // GGML_SYCL_F16
 
+// BF16 type definitions and conversion utilities
+#ifdef GGML_SYCL_BF16
+// Use SYCL's bfloat16 type if available (Intel GPU with supporting runtime)
+typedef sycl::ext::oneapi::bfloat16 bfloat16;
+#else
+// Fallback: represent BF16 as uint16_t for storage
+typedef uint16_t bfloat16;
+#endif // GGML_SYCL_BF16
+
+// BF16 to FP32 conversion
+static __dpct_inline__ float bf16_to_fp32(bfloat16 x) {
+#ifdef GGML_SYCL_BF16
+    return sycl::ext::oneapi::bfloat16::to_float(x);
+#else
+    // Software conversion: extract mantissa and exponent
+    uint32_t bits = static_cast<uint32_t>(x);
+    // BF16: 1 sign bit, 8 exponent bits, 7 mantissa bits
+    // FP32: 1 sign bit, 8 exponent bits, 23 mantissa bits
+    uint32_t sign = (bits >> 15) & 0x1;
+    uint32_t exp = (bits >> 7) & 0xFF;
+    uint32_t mantissa = bits & 0x7F;
+    
+    uint32_t fp32_bits = (sign << 31) | (exp << 23) | (mantissa << 16);
+    return *reinterpret_cast<float*>(&fp32_bits);
+#endif
+}
+
+// FP32 to BF16 conversion (round to nearest even)
+static __dpct_inline__ bfloat16 fp32_to_bf16(float x) {
+#ifdef GGML_SYCL_BF16
+    return sycl::ext::oneapi::bfloat16::from_float(x);
+#else
+    uint32_t bits = *reinterpret_cast<uint32_t*>(&x);
+    uint32_t sign = (bits >> 31) & 0x1;
+    uint32_t exp = (bits >> 23) & 0xFF;
+    uint32_t mantissa = bits & 0x7FFFFF;
+    
+    // Round mantissa to 7 bits (keep upper 16 bits of mantissa, check lower bits)
+    uint32_t mantissa_upper = mantissa >> 16;
+    uint32_t mantissa_lower = mantissa & 0xFFFF;
+    
+    // Round to nearest even
+    uint32_t round_up = (mantissa_lower > 0x8000) || 
+                        (mantissa_lower == 0x8000 && (mantissa_upper & 1));
+    
+    uint32_t bf16_mantissa = mantissa_upper + round_up;
+    
+    // Handle overflow to exponent
+    if (bf16_mantissa >= 0x80) {
+        bf16_mantissa = 0;
+        if (exp < 0xFF) exp++;
+    }
+    
+    uint16_t bf16_bits = static_cast<uint16_t>((sign << 15) | (exp << 7) | bf16_mantissa);
+    return static_cast<bfloat16>(bf16_bits);
+#endif
+}
+
+// Helper to convert FP16 to FP32
+static __dpct_inline__ float fp16_to_fp32(sycl::half x) {
+    return static_cast<float>(x);
+}
+
+// Helper to convert FP32 to FP16
+static __dpct_inline__ sycl::half fp32_to_fp16(float x) {
+    return static_cast<sycl::half>(x);
+}
+
+// Type traits for supported SYCL floating point types
+template<typename T>
+struct sycl_float_type {
+    static constexpr bool is_supported = false;
+};
+
+template<>
+struct sycl_float_type<float> {
+    static constexpr bool is_supported = true;
+    static constexpr ggml_type type_id = GGML_TYPE_F32;
+};
+
+#ifdef GGML_SYCL_F16
+template<>
+struct sycl_float_type<sycl::half> {
+    static constexpr bool is_supported = true;
+    static constexpr ggml_type type_id = GGML_TYPE_F16;
+};
+#endif
+
+#ifdef GGML_SYCL_BF16
+template<>
+struct sycl_float_type<bfloat16> {
+    static constexpr bool is_supported = true;
+    static constexpr ggml_type type_id = GGML_TYPE_BF16;
+};
+#endif
+
 #define MMVQ_MAX_BATCH_SIZE  8
 
 static int g_all_sycl_device_count = -1;

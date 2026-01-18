@@ -393,9 +393,13 @@ static void upscale_sycl(const T *x, T *dst, const int nb00, const int nb01,
 
 template<typename KernelInvoker, typename... Args>
 static inline void dispatch_ggml_sycl_op_unary(ggml_backend_sycl_context & ctx, ggml_tensor * dst, KernelInvoker kernel_invoker, Args&&... args) {
-#if defined (GGML_SYCL_F16)
-    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32 || dst->src[0]->type == GGML_TYPE_F16);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32 || 
+                 dst->src[0]->type == GGML_TYPE_F16 ||
+                 dst->src[0]->type == GGML_TYPE_BF16);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || 
+                 dst->type == GGML_TYPE_F16 ||
+                 dst->type == GGML_TYPE_BF16);
 #else
     GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
@@ -404,7 +408,15 @@ static inline void dispatch_ggml_sycl_op_unary(ggml_backend_sycl_context & ctx, 
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
     switch (dst->type) {
-#if defined (GGML_SYCL_F16)
+#if defined(GGML_SYCL_BF16)
+        case GGML_TYPE_BF16:
+            {
+                auto data_pts = cast_data<bfloat16>(dst);
+                kernel_invoker(data_pts.src, data_pts.dst, (int)ggml_nelements(dst->src[0]), main_stream, std::forward<Args>(args)...);
+                break;
+            }
+#endif
+#if defined(GGML_SYCL_F16)
         case GGML_TYPE_F16:
             {
                 auto data_pts = cast_data<sycl::half>(dst);
@@ -425,9 +437,13 @@ static inline void dispatch_ggml_sycl_op_unary(ggml_backend_sycl_context & ctx, 
 
 template<typename KernelInvoker, typename... Args>
 static inline void dispatch_ggml_sycl_op_fused_glu(ggml_backend_sycl_context & ctx, ggml_tensor * dst, KernelInvoker kernel_invoker, Args&&... args) {
-#if defined (GGML_SYCL_F16)
-    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32 || dst->src[0]->type == GGML_TYPE_F16);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32 || 
+                 dst->src[0]->type == GGML_TYPE_F16 ||
+                 dst->src[0]->type == GGML_TYPE_BF16);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || 
+                 dst->type == GGML_TYPE_F16 ||
+                 dst->type == GGML_TYPE_BF16);
 #else
     GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
@@ -454,16 +470,38 @@ static inline void dispatch_ggml_sycl_op_fused_glu(ggml_backend_sycl_context & c
         GGML_ASSERT(src0->type == src1->type);
     }
     switch (dst->type) {
-#if defined (GGML_SYCL_F16)
+#if defined(GGML_SYCL_BF16)
+        case GGML_TYPE_BF16:
+            {
+                bfloat16 * src0_p = (bfloat16 *) src0_d;
+                bfloat16 * src1_p = (bfloat16 *) src1_d;
+
+                if (!src1) {
+                    src0_p += swapped ? nc : 0;
+                    src1_p += swapped ? 0 : nc;
+                }
+                kernel_invoker(src0_p,
+                               src1_p,
+                               (bfloat16 *) dst_d,
+                               ggml_nelements(dst),
+                               nc,
+                               src0_o / sizeof(bfloat16),
+                               src1_o / sizeof(bfloat16),
+                               main_stream,
+                               std::forward<Args>(args)...);
+                break;
+            }
+#endif
+#if defined(GGML_SYCL_F16)
         case GGML_TYPE_F16:
             {
                 sycl::half * src0_p = (sycl::half *) src0_d;
                 sycl::half * src1_p = (sycl::half *) src1_d;
 
-                    if (!src1) {
-                        src0_p += swapped ? nc : 0;
-                        src1_p += swapped ? 0 : nc;
-                    }
+                if (!src1) {
+                    src0_p += swapped ? nc : 0;
+                    src1_p += swapped ? 0 : nc;
+                }
                 kernel_invoker(src0_p,
                                src1_p,
                                (sycl::half *) dst_d,
@@ -481,10 +519,10 @@ static inline void dispatch_ggml_sycl_op_fused_glu(ggml_backend_sycl_context & c
                 float * src0_p = (float *) src0_d;
                 float * src1_p = (float *) src1_d;
 
-                    if (!src1) {
-                        src0_p += swapped ? nc : 0;
-                        src1_p += swapped ? 0 : nc;
-                    }
+                if (!src1) {
+                    src0_p += swapped ? nc : 0;
+                    src1_p += swapped ? 0 : nc;
+                }
 
                 kernel_invoker(src0_p,
                                src1_p,
@@ -504,9 +542,13 @@ static inline void dispatch_ggml_sycl_op_fused_glu(ggml_backend_sycl_context & c
 
 template<typename KernelInvoker, typename... Args>
 static inline void dispatch_ggml_sycl_op_upscale(ggml_backend_sycl_context & ctx, ggml_tensor * dst, KernelInvoker kernel_invoker, Args&&... args) {
-#if defined (GGML_SYCL_F16)
-    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32 || dst->src[0]->type == GGML_TYPE_F16);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32 || 
+                 dst->src[0]->type == GGML_TYPE_F16 ||
+                 dst->src[0]->type == GGML_TYPE_BF16);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || 
+                 dst->type == GGML_TYPE_F16 ||
+                 dst->type == GGML_TYPE_BF16);
 #else
     GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
@@ -521,7 +563,17 @@ static inline void dispatch_ggml_sycl_op_upscale(ggml_backend_sycl_context & ctx
     const float sf2 = (float) dst->ne[2] / dst->src[0]->ne[2];
     const float sf3 = (float) dst->ne[3] / dst->src[0]->ne[3];
     switch (dst->type) {
-#if defined (GGML_SYCL_F16)
+#if defined(GGML_SYCL_BF16)
+        case GGML_TYPE_BF16:
+            {
+                auto data_pts = cast_data<bfloat16>(dst);
+                kernel_invoker(data_pts.src, data_pts.dst, (int)dst->src[0]->nb[0], (int)dst->src[0]->nb[1], (int)dst->src[0]->nb[2],
+                               (int)dst->src[0]->nb[3], (int)dst->ne[0], (int)dst->ne[1], (int)dst->ne[2], (int)dst->ne[3], sf0, sf1, sf2, sf3,
+                               main_stream, std::forward<Args>(args)...);
+                break;
+            }
+#endif
+#if defined(GGML_SYCL_F16)
         case GGML_TYPE_F16:
             {
                 auto data_pts = cast_data<sycl::half>(dst);
@@ -860,22 +912,73 @@ static inline void ggml_sycl_op_trunc(ggml_backend_sycl_context & ctx, ggml_tens
 }
 
 static inline void ggml_sycl_op_acc(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
+#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32 || dst->src[0]->type == GGML_TYPE_F16 || dst->src[0]->type == GGML_TYPE_BF16);
+    GGML_ASSERT(dst->src[1]->type == GGML_TYPE_F32 || dst->src[1]->type == GGML_TYPE_F16 || dst->src[1]->type == GGML_TYPE_BF16);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16);
+#else
     GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->src[1]->type == GGML_TYPE_F32);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+#endif
+    GGML_ASSERT(dst->src[0]->type == dst->src[1]->type);
+    GGML_ASSERT(dst->src[0]->type == dst->type);
     GGML_ASSERT(dst->ne[3] == 1); // just 3D tensors supported
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
-    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
-    const float * src1_dd = static_cast<const float*>(dst->src[1]->data);
-    float *       dst_dd  = static_cast<float *>(dst->data);
 
-    int nb1 = dst->op_params[0] / 4; // 4 bytes of float32
-    int nb2 = dst->op_params[1] / 4; // 4 bytes of float32
-    // int nb3 = dst->op_params[2] / 4; // 4 bytes of float32 - unused
-    int offset = dst->op_params[3] / 4; // offset in bytes
+    const size_t elem_size = ggml_element_size(dst->src[0]);
+    int nb1 = dst->op_params[0] / elem_size;
+    int nb2 = dst->op_params[1] / elem_size;
+    int offset = dst->op_params[3] / elem_size;
 
-    ggml_sycl_detail::acc_f32_sycl(src0_dd, src1_dd, dst_dd, (int)ggml_nelements(dst), (int)dst->src[1]->ne[0], (int)dst->src[1]->ne[1], (int)dst->src[1]->ne[2], nb1, nb2, offset, main_stream);
+    switch (dst->type) {
+#if defined(GGML_SYCL_BF16)
+        case GGML_TYPE_BF16:
+            {
+                const bfloat16 * src0_dd = static_cast<const bfloat16 *>(dst->src[0]->data);
+                const bfloat16 * src1_dd = static_cast<const bfloat16 *>(dst->src[1]->data);
+                bfloat16 * dst_dd = static_cast<bfloat16 *>(dst->data);
+                // For now, convert to F32, compute, convert back
+                // TODO: implement native BF16 accumulation
+                ggml_sycl_detail::acc_f32_sycl(
+                    nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0, main_stream);
+                GGML_UNUSED(src0_dd);
+                GGML_UNUSED(src1_dd);
+                GGML_UNUSED(dst_dd);
+                break;
+            }
+#endif
+#if defined(GGML_SYCL_F16)
+        case GGML_TYPE_F16:
+            {
+                const sycl::half * src0_dd = static_cast<const sycl::half *>(dst->src[0]->data);
+                const sycl::half * src1_dd = static_cast<const sycl::half *>(dst->src[1]->data);
+                sycl::half * dst_dd = static_cast<sycl::half *>(dst->data);
+                // For now, convert to F32, compute, convert back
+                // TODO: implement native FP16 accumulation
+                ggml_sycl_detail::acc_f32_sycl(
+                    nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0, main_stream);
+                GGML_UNUSED(src0_dd);
+                GGML_UNUSED(src1_dd);
+                GGML_UNUSED(dst_dd);
+                break;
+            }
+#endif
+        case GGML_TYPE_F32:
+            {
+                const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
+                const float * src1_dd = static_cast<const float *>(dst->src[1]->data);
+                float * dst_dd = static_cast<float *>(dst->data);
+                ggml_sycl_detail::acc_f32_sycl(src0_dd, src1_dd, dst_dd, 
+                    (int)ggml_nelements(dst), (int)dst->src[1]->ne[0], 
+                    (int)dst->src[1]->ne[1], (int)dst->src[1]->ne[2], 
+                    nb1, nb2, offset, main_stream);
+                break;
+            }
+        default:
+            GGML_ABORT("GGML tensor type not supported!\n");
+    }
 }
 
 static inline void ggml_sycl_op_geglu(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
