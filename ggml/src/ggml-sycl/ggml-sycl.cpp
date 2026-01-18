@@ -4640,12 +4640,20 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                 }
                 ggml_type src0_type = op->src[0]->type;
-                if (src0_type == GGML_TYPE_BF16 ) {
-                    // TODO: support GGML_TYPE_BF16
-                    // FIXME: keep a list of supported types to avoid breaking the backend when a new type is added
+#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
+                // F16 and BF16 are supported when build flags are enabled
+                if (src0_type == GGML_TYPE_F16 || src0_type == GGML_TYPE_BF16) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_MXFP4) {
+                    return false; // MXFP4 not yet supported
+                }
+#else
+                // Only F32 supported without F16/BF16 build flags
+                if (src0_type == GGML_TYPE_BF16 || src0_type == GGML_TYPE_MXFP4) {
                     return false;
                 }
-
+#endif
                 // TODO: The configuration below needs more work to be supported with oneDNN
                 if (ggml_is_permuted(a) && !ggml_is_contiguous(a) &&
                     a->ne[2] > 1 && a->ne[3] > 1 && src0_type == GGML_TYPE_F16) {
@@ -4789,8 +4797,10 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_COS:
         case GGML_OP_CLAMP:
         case GGML_OP_LOG:
-#if defined (GGML_SYCL_F16)
-            return ((op->type == GGML_TYPE_F32 || op->type == GGML_SYCL_F16) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_SYCL_F16) && (op->type == op->src[0]->type));
+#if defined (GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
+            return ((op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) &&
+                    (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16) &&
+                    (op->type == op->src[0]->type));
 #else
             return (op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32) && (op->type == op->src[0]->type);
 #endif
@@ -4804,7 +4814,11 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SCALE:
             return true;
         case GGML_OP_CONT:
+#if defined(GGML_SYCL_BF16)
+            return true; // BF16 is supported when build flag is enabled
+#else
             return op->src[0]->type != GGML_TYPE_BF16;
+#endif
         case GGML_OP_TRI:
             {
                 const ggml_tensor * src0 = op->src[0];
@@ -4863,9 +4877,15 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_GATED_LINEAR_ATTN:
             return true;
         case GGML_OP_SSM_CONV:
+#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
+            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16) &&
+                   (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16) &&
+                   (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_BF16);
+#else
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32;
+#endif
         case GGML_OP_ROLL:
             return op->type == GGML_TYPE_F32;
         case GGML_OP_ARANGE:
