@@ -86,10 +86,10 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
 
-    const float * Q_d   = (const float *) Q->data;
-    const float * K_d   = (const float *) K->data;
-    const float * V_d   = (const float *) V->data;
-    float *       dst_d = (float *) dst->data;
+    const bool is_f16 = (Q->type == GGML_TYPE_F16);
+    const float * Q_d_f32;
+    const float * K_d_f32;
+    const float * V_d_f32;
 
     dpct::queue_ptr stream = ctx.stream();
 
@@ -102,6 +102,82 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     const ptrdiff_t k_row_stride = K->nb[1] / (ptrdiff_t)sizeof(float);
     const ptrdiff_t v_row_stride = V->nb[1] / (ptrdiff_t)sizeof(float);
     const ptrdiff_t o_row_stride = dst->nb[1] / (ptrdiff_t)sizeof(float);
+
+    // Handle FP16 by dequantizing to F32 first
+    if (is_f16) {
+        const sycl::half * Q_d = (const sycl::half *) Q->data;
+        const sycl::half * K_d = (const sycl::half *) K->data;
+        const sycl::half * V_d = (const sycl::half *) V->data;
+
+        // Allocate F32 buffers on device
+        float * Q_d_f32_alloc = (float *) sycl::malloc_device(N * DQK * n_heads * sizeof(float), *stream);
+        float * K_d_f32_alloc = (float *) sycl::malloc_device(N * DQK * n_kv_heads * sizeof(float), *stream);
+        float * V_d_f32_alloc = (float *) sycl::malloc_device(N * DV * n_kv_heads * sizeof(float), *stream);
+
+        // Get strides in elements for FP16
+        const ptrdiff_t q_row_stride_f16 = Q->nb[1] / (ptrdiff_t)sizeof(sycl::half);
+        const ptrdiff_t k_row_stride_f16 = K->nb[1] / (ptrdiff_t)sizeof(sycl::half);
+        const ptrdiff_t v_row_stride_f16 = V->nb[1] / (ptrdiff_t)sizeof(sycl::half);
+
+        // Dequantize Q heads (all n_heads heads)
+        for (int64_t head = 0; head < n_heads; ++head) {
+            const int64_t n_elements = N * DQK;
+            const ptrdiff_t row_stride = q_row_stride_f16;
+            stream->submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
+                    const int idx = it.get_id(0);
+                    if (idx < n_elements) {
+                        const int64_t row = idx / row_stride;
+                        const int64_t col = idx % row_stride;
+                        Q_d_f32_alloc[head * N * DQK + idx] = static_cast<float>(Q_d[head * N * q_row_stride_f16 + row * q_row_stride_f16 + col]);
+                    }
+                });
+            });
+        }
+
+        // Dequantize K heads
+        for (int64_t head = 0; head < n_kv_heads; ++head) {
+            const int64_t n_elements = N * DQK;
+            const ptrdiff_t row_stride = k_row_stride_f16;
+            stream->submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
+                    const int idx = it.get_id(0);
+                    if (idx < n_elements) {
+                        const int64_t row = idx / row_stride;
+                        const int64_t col = idx % row_stride;
+                        K_d_f32_alloc[head * N * DQK + idx] = static_cast<float>(K_d[head * N * k_row_stride_f16 + row * k_row_stride_f16 + col]);
+                    }
+                });
+            });
+        }
+
+        // Dequantize V heads
+        for (int64_t head = 0; head < n_kv_heads; ++head) {
+            const int64_t n_elements = N * DV;
+            const ptrdiff_t row_stride = v_row_stride_f16;
+            stream->submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
+                    const int idx = it.get_id(0);
+                    if (idx < n_elements) {
+                        const int64_t row = idx / row_stride;
+                        const int64_t col = idx % row_stride;
+                        V_d_f32_alloc[head * N * DV + idx] = static_cast<float>(V_d[head * N * v_row_stride_f16 + row * v_row_stride_f16 + col]);
+                    }
+                });
+            });
+        }
+
+        Q_d_f32 = Q_d_f32_alloc;
+        K_d_f32 = K_d_f32_alloc;
+        V_d_f32 = V_d_f32_alloc;
+    } else {
+        // F32 case - direct pointer cast
+        Q_d_f32 = (const float *) Q->data;
+        K_d_f32 = (const float *) K->data;
+        V_d_f32 = (const float *) V->data;
+    }
+
+    float *       dst_d = (float *) dst->data;
 
     const int Br = FATTN_BLOCK_R;
     const int Bc = FATTN_BLOCK_C;
@@ -152,9 +228,9 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
             }
 
             // Calculate base pointers for this head
-            const float* Q_block = Q_d + (ptrdiff_t)(head_idx * N + row0) * q_row_stride;
-            const float* K_block = K_d + (ptrdiff_t)(kv_head_idx * N + col0) * k_row_stride;
-            const float* V_block = V_d + (ptrdiff_t)(kv_head_idx * N + col0) * v_row_stride;
+            const float* Q_block = Q_d_f32 + (ptrdiff_t)(head_idx * N + row0) * q_row_stride;
+            const float* K_block = K_d_f32 + (ptrdiff_t)(kv_head_idx * N + col0) * k_row_stride;
+            const float* V_block = V_d_f32 + (ptrdiff_t)(kv_head_idx * N + col0) * v_row_stride;
             float*       O_block = dst_d + (ptrdiff_t)(head_idx * N + row0) * o_row_stride;
 
             // Row statistics offsets
