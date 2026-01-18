@@ -431,16 +431,18 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     }
 
     // Call the kernel with F32 data
+    // src2 contains optional sinks (can be NULL)
+    const void * sinks_ptr = src2 ? src2->data : nullptr;
     if (use_f16_mask) {
         soft_max_f32_sycl(is_f32 || is_bf16 ? (const float *)src0->data : src0_f32,
                           (const sycl::half *)src1->data,
-                          (const float *)src2->data,
+                          (const float *)sinks_ptr,
                           is_f32 || is_bf16 ? (float *)dst->data : dst_f32,
                           params, stream, ctx.device);
     } else {
         soft_max_f32_sycl(is_f32 || is_bf16 ? (const float *)src0->data : src0_f32,
                           (const float *)mask_ptr,
-                          (const float *)src2->data,
+                          (const float *)sinks_ptr,
                           is_f32 || is_bf16 ? (float *)dst->data : dst_f32,
                           params, stream, ctx.device);
     }
