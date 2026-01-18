@@ -413,14 +413,22 @@ static void l2_norm_f32_sycl(const float* x, float* dst, const int ncols,
 void ggml_sycl_op_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
 
-    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+    // Support F16, BF16, and F32
+    const bool is_f16 = (src0->type == GGML_TYPE_F16);
+    const bool is_bf16 = (src0->type == GGML_TYPE_BF16);
+    const bool is_f32 = (src0->type == GGML_TYPE_F32);
+
+#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
+    GGML_ASSERT(is_f32 || is_f16 || is_bf16);
+    GGML_ASSERT(dst->type == src0->type);
+#else
+    GGML_ASSERT(is_f32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+#endif
 
     GGML_TENSOR_UNARY_OP_LOCALS
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
-    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
-    float *       dst_dd  = static_cast<float *>(dst->data);
 
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
@@ -431,39 +439,134 @@ void ggml_sycl_op_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
-    norm_f32_sycl(src0_dd, dst_dd, ne00, ne01, ne02, ne03, s01, s02, s03, eps, main_stream, ctx.device);
+    const size_t nbytes = ggml_nbytes(src0);
+    float * src0_f32 = nullptr;
+    float * dst_f32 = nullptr;
+    bool need_temp_buffers = false;
+
+    if (is_f16 || is_bf16) {
+        src0_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
+        dst_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
+        need_temp_buffers = true;
+
+        const int64_t n_elements = ggml_nelements(src0);
+        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
+            const int idx = it.get_id(0);
+            if (is_f16) {
+                const sycl::half * src = (const sycl::half *)src0->data;
+                src0_f32[idx] = static_cast<float>(src[idx]);
+            } else {
+                const bfloat16 * src = (const bfloat16 *)src0->data;
+                src0_f32[idx] = bf16_to_fp32(src[idx]);
+            }
+        });
+    }
+
+    const float * src_ptr = is_f32 ? (const float *)src0->data : src0_f32;
+    float * dst_ptr = is_f32 ? (float *)dst->data : dst_f32;
+
+    norm_f32_sycl(src_ptr, dst_ptr, ne00, ne01, ne02, ne03, s01, s02, s03, eps, main_stream, ctx.device);
+
+    if (need_temp_buffers) {
+        const int64_t n_elements = ggml_nelements(dst);
+        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
+            const int idx = it.get_id(0);
+            float val = dst_f32[idx];
+            if (is_f16) {
+                ((sycl::half *)dst->data)[idx] = static_cast<sycl::half>(val);
+            } else {
+                ((bfloat16 *)dst->data)[idx] = fp32_to_bf16(val);
+            }
+        });
+        sycl::free(src0_f32, *main_stream);
+        sycl::free(dst_f32, *main_stream);
+    }
 }
 
 void ggml_sycl_op_group_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
 
-    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+    const ggml_tensor * src0 = dst->src[0];
+    const bool is_f16 = (src0->type == GGML_TYPE_F16);
+    const bool is_bf16 = (src0->type == GGML_TYPE_BF16);
+    const bool is_f32 = (src0->type == GGML_TYPE_F32);
+
+#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
+    GGML_ASSERT(is_f32 || is_f16 || is_bf16);
+    GGML_ASSERT(dst->type == src0->type);
+#else
+    GGML_ASSERT(is_f32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+#endif
 
     int num_groups = dst->op_params[0];
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
 
-    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
-    float *       dst_dd  = static_cast<float *>(dst->data);
-
     float eps;
     memcpy(&eps, dst->op_params + 1, sizeof(float));
 
-    int group_size = dst->src[0]->ne[0] * dst->src[0]->ne[1] * ((dst->src[0]->ne[2] + num_groups - 1) / num_groups);
-    group_norm_f32_sycl(src0_dd, dst_dd, num_groups, eps, group_size, dst->src[0]->ne[0] * dst->src[0]->ne[1] * dst->src[0]->ne[2], main_stream, ctx.device);
+    const size_t nbytes = ggml_nbytes(src0);
+    float * src0_f32 = nullptr;
+    float * dst_f32 = nullptr;
+    bool need_temp_buffers = false;
+
+    if (is_f16 || is_bf16) {
+        src0_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
+        dst_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
+        need_temp_buffers = true;
+
+        const int64_t n_elements = ggml_nelements(src0);
+        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
+            const int idx = it.get_id(0);
+            if (is_f16) {
+                const sycl::half * src = (const sycl::half *)src0->data;
+                src0_f32[idx] = static_cast<float>(src[idx]);
+            } else {
+                const bfloat16 * src = (const bfloat16 *)src0->data;
+                src0_f32[idx] = bf16_to_fp32(src[idx]);
+            }
+        });
+    }
+
+    const float * src_ptr = is_f32 ? (const float *)src0->data : src0_f32;
+    float * dst_ptr = is_f32 ? (float *)dst->data : dst_f32;
+
+    int group_size = src0->ne[0] * src0->ne[1] * ((src0->ne[2] + num_groups - 1) / num_groups);
+    group_norm_f32_sycl(src_ptr, dst_ptr, num_groups, eps, group_size, src0->ne[0] * src0->ne[1] * src0->ne[2], main_stream, ctx.device);
+
+    if (need_temp_buffers) {
+        const int64_t n_elements = ggml_nelements(dst);
+        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
+            const int idx = it.get_id(0);
+            float val = dst_f32[idx];
+            if (is_f16) {
+                ((sycl::half *)dst->data)[idx] = static_cast<sycl::half>(val);
+            } else {
+                ((bfloat16 *)dst->data)[idx] = fp32_to_bf16(val);
+            }
+        });
+        sycl::free(src0_f32, *main_stream);
+        sycl::free(dst_f32, *main_stream);
+    }
 }
 
 void ggml_sycl_op_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
-    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+    const bool is_f16 = (src0->type == GGML_TYPE_F16);
+    const bool is_bf16 = (src0->type == GGML_TYPE_BF16);
+    const bool is_f32 = (src0->type == GGML_TYPE_F32);
+
+#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
+    GGML_ASSERT(is_f32 || is_f16 || is_bf16);
+    GGML_ASSERT(dst->type == src0->type);
+#else
+    GGML_ASSERT(is_f32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+#endif
 
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
-
-    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
-    float *       dst_dd  = static_cast<float *>(dst->data);
 
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
@@ -474,7 +577,49 @@ void ggml_sycl_op_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const int64_t s01 = nb01 / ts0;
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
-    rms_norm_f32_sycl(src0_dd, dst_dd, ne00, ne01, ne02, ne03, s01, s02, s03, eps, main_stream, ctx.device);
+
+    const size_t nbytes = ggml_nbytes(src0);
+    float * src0_f32 = nullptr;
+    float * dst_f32 = nullptr;
+    bool need_temp_buffers = false;
+
+    if (is_f16 || is_bf16) {
+        src0_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
+        dst_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
+        need_temp_buffers = true;
+
+        const int64_t n_elements = ggml_nelements(src0);
+        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
+            const int idx = it.get_id(0);
+            if (is_f16) {
+                const sycl::half * src = (const sycl::half *)src0->data;
+                src0_f32[idx] = static_cast<float>(src[idx]);
+            } else {
+                const bfloat16 * src = (const bfloat16 *)src0->data;
+                src0_f32[idx] = bf16_to_fp32(src[idx]);
+            }
+        });
+    }
+
+    const float * src_ptr = is_f32 ? (const float *)src0->data : src0_f32;
+    float * dst_ptr = is_f32 ? (float *)dst->data : dst_f32;
+
+    rms_norm_f32_sycl(src_ptr, dst_ptr, ne00, ne01, ne02, ne03, s01, s02, s03, eps, main_stream, ctx.device);
+
+    if (need_temp_buffers) {
+        const int64_t n_elements = ggml_nelements(dst);
+        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
+            const int idx = it.get_id(0);
+            float val = dst_f32[idx];
+            if (is_f16) {
+                ((sycl::half *)dst->data)[idx] = static_cast<sycl::half>(val);
+            } else {
+                ((bfloat16 *)dst->data)[idx] = fp32_to_bf16(val);
+            }
+        });
+        sycl::free(src0_f32, *main_stream);
+        sycl::free(dst_f32, *main_stream);
+    }
 }
 
 void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -635,20 +780,69 @@ void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * d
 
 void ggml_sycl_op_l2_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
 
-    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+    const ggml_tensor * src0 = dst->src[0];
+    const bool is_f16 = (src0->type == GGML_TYPE_F16);
+    const bool is_bf16 = (src0->type == GGML_TYPE_BF16);
+    const bool is_f32 = (src0->type == GGML_TYPE_F32);
+
+#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
+    GGML_ASSERT(is_f32 || is_f16 || is_bf16);
+    GGML_ASSERT(dst->type == src0->type);
+#else
+    GGML_ASSERT(is_f32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+#endif
 
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
 
-    const int64_t ne00 = dst->src[0]->ne[0];
-    const int64_t nrows = ggml_nrows(dst->src[0]);
-    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
-    float * dst_dd = static_cast<float *>(dst->data);
+    const int64_t ne00 = src0->ne[0];
+    const int64_t nrows = ggml_nrows(src0);
 
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
 
-    l2_norm_f32_sycl(src0_dd, dst_dd, ne00, nrows, eps, main_stream, ctx.device);
+    const size_t nbytes = ggml_nbytes(src0);
+    float * src0_f32 = nullptr;
+    float * dst_f32 = nullptr;
+    bool need_temp_buffers = false;
+
+    if (is_f16 || is_bf16) {
+        src0_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
+        dst_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
+        need_temp_buffers = true;
+
+        const int64_t n_elements = ggml_nelements(src0);
+        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
+            const int idx = it.get_id(0);
+            if (is_f16) {
+                const sycl::half * src = (const sycl::half *)src0->data;
+                src0_f32[idx] = static_cast<float>(src[idx]);
+            } else {
+                const bfloat16 * src = (const bfloat16 *)src0->data;
+                src0_f32[idx] = bf16_to_fp32(src[idx]);
+            }
+        });
+    }
+
+    const float * src_ptr = is_f32 ? (const float *)src0->data : src0_f32;
+    float * dst_ptr = is_f32 ? (float *)dst->data : dst_f32;
+
+    l2_norm_f32_sycl(src_ptr, dst_ptr, ne00, nrows, eps, main_stream, ctx.device);
+
+    if (need_temp_buffers) {
+        const int64_t n_elements = ggml_nelements(dst);
+        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
+            const int idx = it.get_id(0);
+            float val = dst_f32[idx];
+            if (is_f16) {
+                ((sycl::half *)dst->data)[idx] = static_cast<sycl::half>(val);
+            } else {
+                ((bfloat16 *)dst->data)[idx] = fp32_to_bf16(val);
+            }
+        });
+        sycl::free(src0_f32, *main_stream);
+        sycl::free(dst_f32, *main_stream);
+    }
 
 }
