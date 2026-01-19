@@ -24,7 +24,7 @@ namespace oneapi {
     namespace math = mkl;
 }
 #else
-#include <oneapi/math.hpp>
+#include <syclcompat/math.hpp>
 #endif
 
 #include "ggml.h"

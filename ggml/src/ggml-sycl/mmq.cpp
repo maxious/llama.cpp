@@ -3066,33 +3066,26 @@ catch (sycl::exception const &exc) {
 }
 
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
+
 #include <sycl/ext/oneapi/matrix/matrix-intel.hpp>
+#include <sycl/ext/oneapi/group_local_memory.hpp>
+
 namespace cm = sycl::ext::oneapi::experimental::matrix;
+using sycl::ext::oneapi::group_local_memory;
 
-// Helper to convert uint16 to float32 (float16 bitcast pattern from llm-scaler)
-static inline float u16_to_f32(uint16_t val) {
-    uint32_t bits = val;
-    bits <<= 16;
-    float result;
-    std::memcpy(&result, &bits, sizeof(float));
-    return result;
-}
-
-// Check if device supports XMX for quantized matmul
 // Check if device supports XMX for quantized matmul
 bool ggml_sycl_q4_has_xmx_support(sycl::device device) {
     return device.has(sycl::aspect::ext_intel_matrix) &&
            device.has(sycl::aspect::ext_intel_gpu_eu_simd_width);
 }
 
-// XMX-accelerated Q4_0 x Q8_1 matmul kernel
-// Based on patterns from llm-scaler Triton kernels and Intel cooperative matrices
+// XMX-accelerated Q4_0 x Q8_1 matmul kernel for oneAPI 2025.3
 void ggml_mul_mat_q4_0_q8_1_xmx_sycl(
     const void * __restrict__ vx,      // Q4_0 blocks [n_blocks, 18 bytes]
     const void * __restrict__ vy,      // Q8_1 blocks [n_blocks, 36 bytes]
     float * __restrict__ dst,           // Output [nrows_x, ncols_y]
-    const int ncols_x,                  // Rows in X (should be multiple of 32)
-    const int nrows_x,                  // Columns in X
+    const int ncols_x,                  // Columns in X (should be multiple of 32)
+    const int nrows_x,                  // Rows in X
     const int ncols_y,                  // Columns in Y
     const int nrows_y,                  // Rows in Y (should be 32)
     const int nrows_dst,
@@ -3104,18 +3097,18 @@ void ggml_mul_mat_q4_0_q8_1_xmx_sycl(
 
     bool has_matrix = device.has(sycl::aspect::ext_intel_matrix);
     bool has_eu_simd = device.has(sycl::aspect::ext_intel_gpu_eu_simd_width);
-    fprintf(stderr, "ggml_sycl: XMX check - matrix: %d, eu_simd: %d\n", has_matrix, has_eu_simd);
+    fprintf(stderr, "ggml_sycl: XMX Q4_0 check - matrix: %d, eu_simd: %d\n", has_matrix, has_eu_simd);
 
     if (!has_matrix || !has_eu_simd) {
-        fprintf(stderr, "ggml_sycl: XMX not supported, falling back to MMQ\n");
+        fprintf(stderr, "ggml_sycl: XMX not supported for Q4_0, falling back\n");
         return;
     }
 
     fprintf(stderr, "ggml_sycl: Using XMX Q4_0 kernel\n");
 
-    constexpr int BLOCK_M = 32;  // Rows per workgroup
-    constexpr int BLOCK_N = 32;  // Columns per workgroup
-    constexpr int THREADS = 64;  // Threads per workgroup
+    constexpr int BLOCK_M = 32;
+    constexpr int BLOCK_N = 32;
+    constexpr int THREADS = 64;
 
     // Q4_0 block: d (2B) + qs (16B) = 18 bytes, 32 elements
     constexpr int Q4_BLOCK_SIZE = 32;
@@ -3126,7 +3119,6 @@ void ggml_mul_mat_q4_0_q8_1_xmx_sycl(
     constexpr int Q8_BYTES_PER_BLOCK = 34;
 
     const int64_t nblocks_x = nrows_x / Q4_BLOCK_SIZE;
-    const int64_t nblocks_y = ncols_x / Q8_BLOCK_SIZE;
 
     // Grid: (ncols_y / BLOCK_N) workgroups, each processing BLOCK_M rows
     const sycl::range<2> global(
@@ -3135,106 +3127,129 @@ void ggml_mul_mat_q4_0_q8_1_xmx_sycl(
     );
     const sycl::range<2> local(BLOCK_N, THREADS / 2);
 
-    // Shared memory for dequantized tiles
-    constexpr int SHMEM_SIZE = BLOCK_M * 32 + BLOCK_N * 32 + 256;
+    constexpr int SHMEM_SIZE = BLOCK_M * 32 + BLOCK_N * 32;
 
     stream->submit([&](sycl::handler &cgh) {
-        sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
+        // Use group_local_memory for cooperative matrix shared memory
+        float *shmem = group_local_memory<float[SHMEM_SIZE]>(cgh);
 
         cgh.parallel_for(sycl::nd_range<2>(global, local),
             [=](sycl::nd_item<2> it) [[intel::reqd_sub_group_size(16)]] {
+                using namespace sycl::ext::oneapi::experimental::matrix;
 
-            const int tid = it.get_local_id(0) + it.get_local_id(1) * it.get_local_range(0);
-            const int gid_x = it.get_group(0);
-            const int gid_y = it.get_group(1);
-            const int lid = it.get_local_id(0);
-            const int sg_id = it.get_sub_group().get_id()[0];
+                const int lid = it.get_local_id(0);
+                const int sg_id = it.get_sub_group().get_id()[0];
 
-            if (gid_x >= ncols_y || gid_y * BLOCK_M >= nrows_x) return;
+                const int gid_x = it.get_group(0);
+                const int gid_y = it.get_group(1);
 
-            float *out_ptr = dst + (gid_y * BLOCK_M) * nrows_dst + gid_x * BLOCK_N;
+                if (gid_x >= ncols_y || gid_y * BLOCK_M >= nrows_x) return;
 
-            float *shQ = shmem.get_pointer();
-            float *shK = shQ + BLOCK_M * 32;
-            float *shAcc = shK + BLOCK_N * 32;
+                float *shQ = shmem;
+                float *shK = shQ + BLOCK_M * 32;
+                float *shAcc = shK + BLOCK_N * 32;
 
-            // Process all blocks
-            for (int block = 0; block < nblocks_x; ++block) {
-                const int q_block_offset = block * Q4_BYTES_PER_BLOCK;
-                const uint8_t *q_block = (const uint8_t *)vx + q_block_offset;
+                // Process all blocks
+                for (int block = 0; block < nblocks_x; ++block) {
+                    const int q_block_offset = block * Q4_BYTES_PER_BLOCK;
+                    const uint8_t *q_block = (const uint8_t *)vx + q_block_offset;
 
-                // Load scale (float16, little-endian)
-                uint16_t d_bits = q_block[0] | (q_block[1] << 8);
-                float d = u16_to_f32(d_bits);
+                    // Load scale (float16, little-endian)
+                    uint16_t d_bits = q_block[0] | (q_block[1] << 8);
+                    uint32_t bits = d_bits;
+                    bits <<= 16;
+                    float d;
+                    std::memcpy(&d, &bits, sizeof(float));
 
-                // Dequantize Q4_0
-                for (int i = lid; i < Q4_BLOCK_SIZE; i += THREADS) {
-                    int row_in_tile = i;
-                    if (row_in_tile < BLOCK_M && gid_y * BLOCK_M + row_in_tile < nrows_x) {
-                        uint8_t qs_byte = q_block[2 + i / 2];
-                        int q_low = (qs_byte & 0x0F) - 8;
-                        int q_high = ((qs_byte >> 4) & 0x0F) - 8;
-                        shQ[row_in_tile * 32 + i] = d * (float)q_low;
-                        if (i + 16 < 32) {
-                            shQ[row_in_tile * 32 + i + 16] = d * (float)q_high;
+                    // Dequantize Q4_0 into shared memory
+                    // Each thread processes 32 elements in a warp-synchronous manner
+                    for (int i = lid; i < Q4_BLOCK_SIZE; i += BLOCK_N) {
+                        int row_in_tile = i % 16;
+                        int col_in_tile = i / 16;
+                        int tile_row = gid_y * BLOCK_M + row_in_tile;
+                        int tile_col = col_in_tile * 16;
+
+                        if (tile_row < nrows_x && gid_x * BLOCK_N + tile_col < ncols_y) {
+                            uint8_t qs_byte = q_block[2 + i];
+                            int q0 = (qs_byte & 0x0F);
+                            int q1 = (qs_byte >> 4);
+                            shQ[row_in_tile * 32 + i] = d * ((float)q0 - 8.0f);
+                            shQ[(row_in_tile + 16) * 32 + i] = d * ((float)q1 - 8.0f);
                         }
                     }
-                }
 
-                const int k_block_row = gid_x;
-                const int k_block_offset = k_block_row * Q8_BYTES_PER_BLOCK;
-                const uint8_t *k_block = (const uint8_t *)vy + k_block_offset;
+                    const int k_block_offset = gid_x * Q8_BYTES_PER_BLOCK;
+                    const uint8_t *k_block = (const uint8_t *)vy + k_block_offset;
 
-                for (int i = lid; i < Q8_BLOCK_SIZE; i += THREADS) {
-                    int col_in_tile = i;
-                    if (col_in_tile < BLOCK_N && k_block_row * BLOCK_N + col_in_tile < ncols_y) {
-                        uint8_t qs_byte = k_block[2 + i];
-                        int8_t q_val = qs_byte > 127 ? qs_byte - 256 : qs_byte;
-                        shK[col_in_tile * 32 + i] = (float)q_val;
-                    }
-                }
+                    // Dequantize Q8_1 into shared memory
+                    for (int i = lid; i < Q8_BLOCK_SIZE; i += BLOCK_N) {
+                        int row_in_tile = i % 16;
+                        int col_in_tile = i / 16;
+                        int tile_row = row_in_tile;
+                        int tile_col = gid_x * BLOCK_N + col_in_tile * 16;
 
-                it.barrier(sycl::access::fence_space::local_space);
-
-                // Compute with cooperative matrices
-                for (int j = 0; j < BLOCK_N; ++j) {
-                    cm::joint_matrix<float, 16, 16, cm::use_accumulator> matAcc;
-                    cm::joint_matrix_fill(matAcc, 0.0f);
-
-                    for (int k = 0; k < 32; k += 16) {
-                        cm::joint_matrix<float, 16, 16, cm::use_a> mq;
-                        cm::joint_matrix<float, 16, 16, cm::use_b> mk;
-
-                        cm::joint_matrix_load(mq, shQ, (sg_id * 16) * 32 + k, 32);
-                        cm::joint_matrix_load(mk, shK, j * 32 + k, 32);
-
-                        matAcc = cm::joint_matrix_mad(mq, mk, matAcc);
+                        if (gid_y * BLOCK_M + tile_row < nrows_x && tile_col < ncols_y) {
+                            uint8_t qs_byte = k_block[2 + i];
+                            int8_t q_val = qs_byte > 127 ? qs_byte - 256 : qs_byte;
+                            shK[i * 32 + row_in_tile * 32] = (float)q_val;
+                            shK[i * 32 + row_in_tile * 32 + 16] = (float)(k_block[2 + i + 16] > 127 ? k_block[2 + i + 16] - 256 : k_block[2 + i + 16]);
+                        }
                     }
 
-                    cm::joint_matrix_store(matAcc, shAcc, (sg_id * 16) * 32 + j * 16, 32);
-                }
+                    it.barrier(sycl::access::fence_space::local_space);
 
-                it.barrier(sycl::access::fence_space::local_space);
+                    // Compute with cooperative matrices using sub_group
+                    auto sg = it.get_sub_group();
 
-                for (int i = 0; i < 16; ++i) {
-                    int row = gid_y * BLOCK_M + sg_id * 16 + i;
-                    int col = gid_x * BLOCK_N + lid;
+                    for (int j = 0; j < BLOCK_N; j += 16) {
+                        joint_matrix<sycl::sub_group, float, use::accumulator, 16, 16, layout::dynamic> matAcc;
+                        joint_matrix_fill(sg, matAcc, 0.0f);
 
-                    if (row < nrows_x && col < ncols_y) {
-                        out_ptr[row * nrows_dst + col] = shAcc[i * 32 + lid];
+                        for (int k = 0; k < 32; k += 16) {
+                            joint_matrix<sycl::sub_group, float, use::a, 16, 16, layout::row_major> mq;
+                            joint_matrix<sycl::sub_group, float, use::b, 16, 16, layout::col_major> mk;
+
+                            auto mq_ptr = sycl::address_space_cast<
+                                sycl::access::address_space::local_space,
+                                sycl::access::decorated::yes>(&shQ[(sg_id * 16) * 32 + k]);
+                            auto mk_ptr = sycl::address_space_cast<
+                                sycl::access::address_space::local_space,
+                                sycl::access::decorated::yes>(&shK[j * 32 + k]);
+
+                            joint_matrix_load(sg, mq, mq_ptr, 32);
+                            joint_matrix_load(sg, mk, mk_ptr, 32);
+
+                            matAcc = joint_matrix_mad(sg, mq, mk, matAcc);
+                        }
+
+                        auto acc_ptr = sycl::address_space_cast<
+                            sycl::access::address_space::local_space,
+                            sycl::access::decorated::yes>(&shAcc[(sg_id * 16) * 32 + j]);
+                        joint_matrix_store(sg, matAcc, acc_ptr, 32);
                     }
-                }
 
-                it.barrier(sycl::access::fence_space::local_space);
-            }
-        });
+                    it.barrier(sycl::access::fence_space::local_space);
+
+                    // Store results
+                    for (int i = 0; i < 16; ++i) {
+                        int row = gid_y * BLOCK_M + sg_id * 16 + i;
+                        int col = gid_x * BLOCK_N + lid;
+
+                        if (row < nrows_x && col < ncols_y) {
+                            dst[row * nrows_dst + col] = shAcc[i * 32 + lid];
+                        }
+                    }
+
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+            });
     });
 }
 catch (sycl::exception const &exc) {
     std::cerr << "XMX Q4_0 kernel: " << exc.what() << std::endl;
 }
 
-// Q2_K XMX-accelerated matmul kernel
+// Q2_K XMX-accelerated matmul kernel for oneAPI 2025.3
 // Q2_K format: d (2B) + dmin (2B) + scales (4B) + qs (32B) = 40 bytes per 256-element block
 void ggml_mul_mat_q2_K_q8_1_xmx_sycl(
     const void * __restrict__ vx,
@@ -3248,7 +3263,8 @@ void ggml_mul_mat_q2_K_q8_1_xmx_sycl(
     dpct::queue_ptr stream) try {
 
     sycl::device device = stream->get_device();
-    if (!ggml_sycl_q4_has_xmx_support(device)) {
+    if (!device.has(sycl::aspect::ext_intel_matrix) ||
+        !device.has(sycl::aspect::ext_intel_gpu_eu_simd_width)) {
         fprintf(stderr, "ggml_sycl: XMX not supported for Q2_K, falling back\n");
         return;
     }
@@ -3271,100 +3287,126 @@ void ggml_mul_mat_q2_K_q8_1_xmx_sycl(
     );
     const sycl::range<2> local(BLOCK_N, THREADS / 2);
 
-    constexpr int SHMEM_SIZE = BLOCK_M * 32 + BLOCK_N * 32 + 256;
+    constexpr int SHMEM_SIZE = BLOCK_M * 32 + BLOCK_N * 32;
 
     stream->submit([&](sycl::handler &cgh) {
-        sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
+        float *shmem = group_local_memory<float[SHMEM_SIZE]>(cgh);
 
         cgh.parallel_for(sycl::nd_range<2>(global, local),
             [=](sycl::nd_item<2> it) [[intel::reqd_sub_group_size(16)]] {
+                using namespace sycl::ext::oneapi::experimental::matrix;
 
-            const int gid_x = it.get_group(0);
-            const int gid_y = it.get_group(1);
-            const int lid = it.get_local_id(0);
-            const int sg_id = it.get_sub_group().get_id()[0];
+                const int lid = it.get_local_id(0);
+                const int sg_id = it.get_sub_group().get_id()[0];
+                const int gid_x = it.get_group(0);
+                const int gid_y = it.get_group(1);
 
-            if (gid_x >= ncols_y || gid_y * BLOCK_M >= nrows_x) return;
+                if (gid_x >= ncols_y || gid_y * BLOCK_M >= nrows_x) return;
 
-            float *out_ptr = dst + (gid_y * BLOCK_M) * nrows_dst + gid_x * BLOCK_N;
-            float *shQ = shmem.get_pointer();
-            float *shK = shQ + BLOCK_M * 32;
-            float *shAcc = shK + BLOCK_N * 32;
+                float *shQ = shmem;
+                float *shK = shQ + BLOCK_M * 32;
+                float *shAcc = shK + BLOCK_N * 32;
 
-            for (int block = 0; block < nblocks_x; ++block) {
-                // Q2_K block layout: d(2) + dmin(2) + scales(4) + qs(32)
-                const uint8_t *q_block = (const uint8_t *)vx + block * Q2_BYTES_PER_BLOCK;
+                for (int block = 0; block < nblocks_x; ++block) {
+                    // Q2_K block layout: d(2) + dmin(2) + scales(4) + qs(32)
+                    const uint8_t *q_block = (const uint8_t *)vx + block * Q2_BYTES_PER_BLOCK;
 
-                // Load d and dmin (float16, little-endian)
-                uint16_t d_bits = q_block[0] | (q_block[1] << 8);
-                uint16_t dmin_bits = q_block[2] | (q_block[3] << 8);
-                float d = u16_to_f32(d_bits);
-                float dmin = u16_to_f32(dmin_bits);
+                    // Load d and dmin (float16, little-endian)
+                    uint16_t d_bits = q_block[0] | (q_block[1] << 8);
+                    uint16_t dmin_bits = q_block[2] | (q_block[3] << 8);
+                    uint32_t bits = d_bits;
+                    bits <<= 16;
+                    std::memcpy(&d, &bits, sizeof(float));
+                    bits = dmin_bits;
+                    bits <<= 16;
+                    std::memcpy(&dmin, &bits, sizeof(float));
 
-                // Load scales (4 bytes, each byte is a scale for 32 elements)
-                float scales[4];
-                for (int s = 0; s < 4; ++s) {
-                    scales[s] = (float)(q_block[4 + s] & 0x3F) / 64.0f;
-                }
-
-                // Dequantize Q2_K into shared memory
-                // Each 32-element sub-block uses the same scale
-                for (int i = lid; i < Q2_BLOCK_SIZE; i += THREADS) {
-                    int row_in_tile = i % 32;
-                    int sub_block = i / 32;
-                    int tile_row = i / 32;
-
-                    if (gid_y * BLOCK_M + tile_row < nrows_x) {
-                        uint8_t qs_byte = q_block[8 + i / 4];
-                        int shift = (i % 4) * 2;
-                        int q_val = (qs_byte >> shift) & 0x03;
-                        float scale = scales[sub_block];
-                        shQ[tile_row * 32 + row_in_tile] = d * scale * (float)q_val - dmin;
-                    }
-                }
-
-                // Load K tile
-                const uint8_t *k_block = (const uint8_t *)vy + gid_x * Q8_BYTES_PER_BLOCK;
-                for (int i = lid; i < Q8_BLOCK_SIZE; i += THREADS) {
-                    if (gid_x * BLOCK_N + i < ncols_y) {
-                        uint8_t qs_byte = k_block[2 + i];
-                        int8_t q_val = qs_byte > 127 ? qs_byte - 256 : qs_byte;
-                        shK[i * 32 + i] = (float)q_val;
-                    }
-                }
-
-                it.barrier(sycl::access::fence_space::local_space);
-
-                // Compute with cooperative matrices
-                for (int j = 0; j < BLOCK_N; ++j) {
-                    cm::joint_matrix<float, 16, 16, cm::use_accumulator> matAcc;
-                    cm::joint_matrix_fill(matAcc, 0.0f);
-
-                    for (int k = 0; k < 32; k += 16) {
-                        cm::joint_matrix<float, 16, 16, cm::use_a> mq;
-                        cm::joint_matrix<float, 16, 16, cm::use_b> mk;
-                        cm::joint_matrix_load(mq, shQ, (sg_id * 16) * 32 + k, 32);
-                        cm::joint_matrix_load(mk, shK, j * 32 + k, 32);
-                        matAcc = cm::joint_matrix_mad(mq, mk, matAcc);
+                    // Load scales (4 bytes, each byte is a scale for 64 elements)
+                    float scales[4];
+                    for (int s = 0; s < 4; ++s) {
+                        scales[s] = (float)(q_block[4 + s] & 0x3F) / 64.0f;
                     }
 
-                    cm::joint_matrix_store(matAcc, shAcc, (sg_id * 16) * 32 + j * 16, 32);
-                }
+                    // Dequantize Q2_K into shared memory
+                    // Each 64-element sub-block uses the same scale
+                    for (int i = lid; i < Q2_BLOCK_SIZE; i += BLOCK_N) {
+                        int sub_block = (i / 64) % 4;
+                        int row_in_tile = i / 32;
+                        int col_in_tile = i % 32;
+                        int tile_row = gid_y * BLOCK_M + row_in_tile;
 
-                it.barrier(sycl::access::fence_space::local_space);
-
-                for (int i = 0; i < 16; ++i) {
-                    int row = gid_y * BLOCK_M + sg_id * 16 + i;
-                    int col = gid_x * BLOCK_N + lid;
-
-                    if (row < nrows_x && col < ncols_y) {
-                        out_ptr[row * nrows_dst + col] = shAcc[i * 32 + lid];
+                        if (tile_row < nrows_x && gid_x * BLOCK_N + col_in_tile < ncols_y) {
+                            uint8_t qs_byte = q_block[8 + i / 4];
+                            int shift = (i % 4) * 2;
+                            int q_val = (qs_byte >> shift) & 0x03;
+                            float scale = scales[sub_block];
+                            shQ[row_in_tile * 32 + col_in_tile] = d * scale * (float)q_val - dmin;
+                        }
                     }
-                }
 
-                it.barrier(sycl::access::fence_space::local_space);
-            }
-        });
+                    // Load K tile
+                    const uint8_t *k_block = (const uint8_t *)vy + gid_x * Q8_BYTES_PER_BLOCK;
+                    for (int i = lid; i < Q8_BLOCK_SIZE; i += BLOCK_N) {
+                        int row_in_tile = i % 16;
+                        int col_in_tile = i / 16;
+                        int tile_row = row_in_tile;
+                        int tile_col = gid_x * BLOCK_N + col_in_tile * 16;
+
+                        if (gid_y * BLOCK_M + tile_row < nrows_x && tile_col < ncols_y) {
+                            uint8_t qs_byte = k_block[2 + i];
+                            int8_t q_val = qs_byte > 127 ? qs_byte - 256 : qs_byte;
+                            shK[i * 32 + tile_row * 32] = (float)q_val;
+                            shK[i * 32 + tile_row * 32 + 16] = (float)(k_block[2 + i + 16] > 127 ? k_block[2 + i + 16] - 256 : k_block[2 + i + 16]);
+                        }
+                    }
+
+                    it.barrier(sycl::access::fence_space::local_space);
+
+                    // Compute with cooperative matrices
+                    auto sg = it.get_sub_group();
+
+                    for (int j = 0; j < BLOCK_N; j += 16) {
+                        joint_matrix<sycl::sub_group, float, use::accumulator, 16, 16, layout::dynamic> matAcc;
+                        joint_matrix_fill(sg, matAcc, 0.0f);
+
+                        for (int k = 0; k < 32; k += 16) {
+                            joint_matrix<sycl::sub_group, float, use::a, 16, 16, layout::row_major> mq;
+                            joint_matrix<sycl::sub_group, float, use::b, 16, 16, layout::col_major> mk;
+
+                            auto mq_ptr = sycl::address_space_cast<
+                                sycl::access::address_space::local_space,
+                                sycl::access::decorated::yes>(&shQ[(sg_id * 16) * 32 + k]);
+                            auto mk_ptr = sycl::address_space_cast<
+                                sycl::access::address_space::local_space,
+                                sycl::access::decorated::yes>(&shK[j * 32 + k]);
+
+                            joint_matrix_load(sg, mq, mq_ptr, 32);
+                            joint_matrix_load(sg, mk, mk_ptr, 32);
+
+                            matAcc = joint_matrix_mad(sg, mq, mk, matAcc);
+                        }
+
+                        auto acc_ptr = sycl::address_space_cast<
+                            sycl::access::address_space::local_space,
+                            sycl::access::decorated::yes>(&shAcc[(sg_id * 16) * 32 + j]);
+                        joint_matrix_store(sg, matAcc, acc_ptr, 32);
+                    }
+
+                    it.barrier(sycl::access::fence_space::local_space);
+
+                    // Store results
+                    for (int i = 0; i < 16; ++i) {
+                        int row = gid_y * BLOCK_M + sg_id * 16 + i;
+                        int col = gid_x * BLOCK_N + lid;
+
+                        if (row < nrows_x && col < ncols_y) {
+                            dst[row * nrows_dst + col] = shAcc[i * 32 + lid];
+                        }
+                    }
+
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+            });
     });
 }
 catch (sycl::exception const &exc) {
