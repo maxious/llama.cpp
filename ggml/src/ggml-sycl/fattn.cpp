@@ -14,10 +14,14 @@ constexpr int FATTN_BLOCK_C = 32;  // Bc
 
 
 // Check if device supports XMX (cooperative matrix) for flash attention
-// Note: Arc B60 (Xe2/Battlemage) has limited cooperative matrix support.
-// Float32 matrices for use::a/use::b are not supported, and bfloat16 has
-// compilation issues. We disable XMX for flash attention on affected devices
-// but keep it enabled for other operations (like MMQ matmul).
+// All Intel GPUs with XMX support can use the fused flash attention kernel,
+// but with different tile sizes:
+// - DG2/Arc B60/Battlemage (Xe2): 8x16x16 tiles with bf16 A/B
+// - PVC (Ponte Vecchio): 8x16x16 tiles
+// - Future GPUs: varies
+//
+// NOTE: The XMX kernel is currently EXPERIMENTAL and has correctness issues.
+// It's disabled by default. Set GGML_SYCL_FLASH_ATTN_XMX=1 to enable for testing.
 inline bool ggml_sycl_flash_attn_has_xmx(sycl::device device) {
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
     // Check for basic cooperative matrix support
@@ -25,31 +29,39 @@ inline bool ggml_sycl_flash_attn_has_xmx(sycl::device device) {
         !device.has(sycl::aspect::ext_intel_matrix)) {
         return false;
     }
-
-    // Arc B60 (Xe2/Battlemage) has known limitations with cooperative matrices
-    // for flash attention. The 16x16 float32 matrices are not supported for
-    // use::a/use::b operands. Disable XMX for flash attention on this device.
-    std::string device_name = device.get_info<sycl::info::device::name>();
-    // Look for B60 or Battlemage in device name
-    if (device_name.find("B60") != std::string::npos ||
-        device_name.find("Battlemage") != std::string::npos) {
-        return false;
+    // Check environment variable to enable experimental XMX kernel
+    static bool xmx_enabled = false;
+    static bool env_checked = false;
+    if (!env_checked) {
+        const char* env = getenv("GGML_SYCL_FLASH_ATTN_XMX");
+        xmx_enabled = (env != nullptr && strcmp(env, "1") == 0);
+        env_checked = true;
+        if (xmx_enabled) {
+            fprintf(stderr, "ggml_sycl: XMX flash attention ENABLED (experimental)\n");
+        }
     }
-
-    return true;
+    return xmx_enabled;
 #else
     return false;
 #endif
 }
 
-// Check if device should use oneMKL BLAS for flash attention
-// Arc B60 (Xe2/Battlemage) benefits from oneMKL's optimized GEMM kernels
+// Get the appropriate tile kind for flash attention XMX kernel
+// DG2/Arc uses 8x8 tiles, PVC uses 16x16 tiles
+inline xmx_tile_kind ggml_sycl_flash_attn_get_tile_kind(sycl::device device) {
+#ifdef SYCL_EXT_COOPERATIVE_MATRICES
+    return ggml_sycl_get_tile_kind(device);
+#else
+    return xmx_tile_kind::tile_8x8;  // Fallback, won't be used
+#endif
+}
+
+// Check if device should use oneMKL BLAS for flash attention (fallback path)
+// This is kept as a fallback option but the XMX path is now preferred
 inline bool ggml_sycl_flash_attn_use_mkl(sycl::device device) {
 #ifdef GGML_SYCL_USE_INTEL_ONEMKL
-    std::string device_name = device.get_info<sycl::info::device::name>();
-    // Arc B60 and Battlemage devices should use oneMKL path
-    if (device_name.find("B60") != std::string::npos ||
-        device_name.find("Battlemage") != std::string::npos) {
+    // Only use MKL if XMX is not available
+    if (!ggml_sycl_flash_attn_has_xmx(device)) {
         return true;
     }
 #endif
@@ -473,23 +485,65 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
     float * l_d = (float *) sycl::malloc_device(N * n_heads * sizeof(float), *stream);
     float * m_d = (float *) sycl::malloc_device(N * n_heads * sizeof(float), *stream);
 
-    sycl::range<2> global(Tr * BLOCK_M, Tc * n_heads);
-    sycl::range<2> local(BLOCK_M, 32);
+    // Work-group size must divide global size evenly on Intel GPUs
+    // Each work-group processes one BLOCK_M x BLOCK_N tile
+    // Use 64 threads per work-group (4 subgroups of 16)
+    constexpr int THREADS_PER_WG = 64;
+    
+    // Global size: one work-group per row-block per head
+    // Dimension 0: Tr work-groups (each handling BLOCK_M rows)
+    // Dimension 1: n_heads work-groups
+    sycl::range<2> global(Tr * THREADS_PER_WG, n_heads);
+    sycl::range<2> local(THREADS_PER_WG, 1);
 
-    stream->submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> shmem(sycl::range<1>(8192), cgh);
+    // Get tile kind based on device architecture
+    xmx_tile_kind tile_kind = ggml_sycl_flash_attn_get_tile_kind(stream->get_device());
 
-        cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-            flash_attn_coopmat_kernel<DQK>(
-                it,
-                Q_d_f32, K_d_f32, V_d_f32, dst_d,
-                l_d, m_d,
-                N, n_heads, n_kv_heads, gqa_ratio,
-                scale, 1, 0,
-                shmem.get_multi_ptr<sycl::access::decorated::no>().get()
-            );
+    // Calculate shared memory size based on HEAD_DIM
+    // Layout: [bf16: Q, K, V, P] + [float: S, rowMax, rowSum, rowAlpha, shAcc]
+    constexpr int Q_STRIDE = DQK + 8;
+    constexpr int K_STRIDE = DQK + 8;
+    constexpr int V_STRIDE = DQK + 8;
+    constexpr int P_STRIDE = BLOCK_N + 8;
+    constexpr int S_STRIDE = BLOCK_N + 8;
+    constexpr size_t BF16_BYTES = (BLOCK_M * Q_STRIDE + BLOCK_N * K_STRIDE + 
+                                    BLOCK_N * V_STRIDE + BLOCK_M * P_STRIDE) * sizeof(sycl::half);
+    constexpr size_t FLOAT_BYTES = (BLOCK_M * S_STRIDE + BLOCK_M * 3 + BLOCK_M * DQK) * sizeof(float);
+    constexpr size_t SHMEM_SIZE = (BF16_BYTES + FLOAT_BYTES + sizeof(float) - 1) / sizeof(float);
+
+    if (tile_kind == xmx_tile_kind::tile_8x8) {
+        // DG2/Arc B60: Use 8x8x16 tiles
+        stream->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
+
+            cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                flash_attn_coopmat_kernel_dg2<DQK>(
+                    it,
+                    Q_d_f32, K_d_f32, V_d_f32, dst_d,
+                    l_d, m_d,
+                    N, n_heads, n_kv_heads, gqa_ratio,
+                    scale, 1, 0,
+                    shmem.get_multi_ptr<sycl::access::decorated::no>().get()
+                );
+            });
         });
-    });
+    } else {
+        // PVC and other GPUs: Use 16x16x16 tiles
+        stream->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
+
+            cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                flash_attn_coopmat_kernel_pvc<DQK>(
+                    it,
+                    Q_d_f32, K_d_f32, V_d_f32, dst_d,
+                    l_d, m_d,
+                    N, n_heads, n_kv_heads, gqa_ratio,
+                    scale, 1, 0,
+                    shmem.get_multi_ptr<sycl::access::decorated::no>().get()
+                );
+            });
+        });
+    }
 
     stream->submit([&](sycl::handler& cgh) {
         cgh.parallel_for(sycl::range<1>(N * n_heads), [=](sycl::id<1> id) {
@@ -661,10 +715,12 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         sycl::device device = ctx.stream()->get_device();
         sycl_use_xmx = ggml_sycl_flash_attn_has_xmx(device);
         xmx_checked = true;
-        fprintf(stderr, "ggml_sycl: XMX detection: device=%s, has_xmx=%d\n", 
-                device.get_info<sycl::info::device::name>().c_str(), sycl_use_xmx);
+        xmx_tile_kind tile_kind = ggml_sycl_flash_attn_get_tile_kind(device);
+        const char * tile_str = (tile_kind == xmx_tile_kind::tile_8x8) ? "8x8x16 (DG2/Arc)" : "16x16x16 (PVC)";
+        fprintf(stderr, "ggml_sycl: XMX detection: device=%s, has_xmx=%d, tile_kind=%s\n", 
+                device.get_info<sycl::info::device::name>().c_str(), sycl_use_xmx, tile_str);
         if (sycl_use_xmx) {
-            fprintf(stderr, "ggml_sycl: Using XMX (cooperative matrix) for flash attention\n");
+            fprintf(stderr, "ggml_sycl: Using XMX (cooperative matrix) for flash attention with %s tiles\n", tile_str);
         }
     }
 
