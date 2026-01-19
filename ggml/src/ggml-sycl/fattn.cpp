@@ -520,14 +520,16 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
     xmx_tile_kind tile_kind = ggml_sycl_flash_attn_get_tile_kind(stream->get_device());
 
     // Calculate shared memory size based on HEAD_DIM
-    // Layout: [bf16: Q, K, V, P] + [float: S, rowMax, rowSum, rowAlpha, shAcc]
+    // Layout: [bf16: Q, K, V, P, VT] + [float: S, rowMax, rowSum, rowAlpha, shAcc]
     constexpr int Q_STRIDE = DQK + 8;
     constexpr int K_STRIDE = DQK + 8;
     constexpr int V_STRIDE = DQK + 8;
     constexpr int P_STRIDE = BLOCK_N + 8;
+    constexpr int V_T_STRIDE = BLOCK_N;  // V^T buffer stride
     constexpr int S_STRIDE = BLOCK_N + 8;
     constexpr size_t BF16_BYTES = (BLOCK_M * Q_STRIDE + BLOCK_N * K_STRIDE + 
-                                    BLOCK_N * V_STRIDE + BLOCK_M * P_STRIDE) * sizeof(sycl::half);
+                                    BLOCK_N * V_STRIDE + BLOCK_M * P_STRIDE +
+                                    DQK * V_T_STRIDE) * sizeof(sycl::half);  // Include shVT
     constexpr size_t FLOAT_BYTES = (BLOCK_M * S_STRIDE + BLOCK_M * 3 + BLOCK_M * DQK) * sizeof(float);
     constexpr size_t SHMEM_SIZE = (BF16_BYTES + FLOAT_BYTES + sizeof(float) - 1) / sizeof(float);
 
@@ -565,23 +567,8 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
         });
     }
 
-    stream->submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::range<1>(N * n_heads), [=](sycl::id<1> id) {
-            int idx = id[0];
-            int head_idx = idx / N;
-            int row = idx % N;
-            float l_val = l_d[idx];
-
-            if (l_val <= 0.0f) return;
-
-            float inv_l = 1.0f / l_val;
-            float * o_row = dst_d + (ptrdiff_t)(head_idx * N + row) * o_row_stride;
-
-            for (int col = 0; col < DV; ++col) {
-                o_row[col] *= inv_l;
-            }
-        });
-    });
+    // Note: The coopmat kernel already normalizes by dividing by rowSum internally,
+    // so no post-normalization pass is needed. l_d/m_d are unused for XMX path.
 
     if (is_f16) {
         sycl::free((void *)Q_d_f32, *stream);
@@ -704,15 +691,17 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
     xmx_tile_kind tile_kind = ggml_sycl_flash_attn_get_tile_kind(stream->get_device());
 
     // Calculate shared memory size based on PADDED_HEAD_DIM
+    // Layout: [bf16: Q, K, V, P, VT] + [float: S, rowMax, rowSum, rowAlpha, shAcc]
     constexpr int Q_STRIDE = PADDED_HEAD_DIM + 8;
     constexpr int K_STRIDE = PADDED_HEAD_DIM + 8;
     constexpr int V_STRIDE = PADDED_HEAD_DIM + 8;
     constexpr int P_STRIDE = BLOCK_N + 8;
     constexpr int S_STRIDE = BLOCK_N + 8;
     constexpr int V_T_STRIDE = BLOCK_N;  // Stride for V^T (stored transposed)
+    // shVT has PADDED_HEAD_DIM rows (each row is BLOCK_N elements)
     constexpr size_t BF16_BYTES = (BLOCK_M * Q_STRIDE + BLOCK_N * K_STRIDE +
                                     BLOCK_N * V_STRIDE + BLOCK_M * P_STRIDE +
-                                    BLOCK_N * V_T_STRIDE) * sizeof(sycl::half);
+                                    PADDED_HEAD_DIM * V_T_STRIDE) * sizeof(sycl::half);
     constexpr size_t FLOAT_BYTES = (BLOCK_M * S_STRIDE + BLOCK_M * 3 + BLOCK_M * PADDED_HEAD_DIM) * sizeof(float);
     constexpr size_t SHMEM_SIZE = (BF16_BYTES + FLOAT_BYTES + sizeof(float) - 1) / sizeof(float);
 
@@ -750,23 +739,8 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
         });
     }
 
-    stream->submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::range<1>(N * n_heads), [=](sycl::id<1> id) {
-            int idx = id[0];
-            int head_idx = idx / N;
-            int row = idx % N;
-            float l_val = l_d[idx];
-
-            if (l_val <= 0.0f) return;
-
-            float inv_l = 1.0f / l_val;
-            float * o_row = dst_d + (ptrdiff_t)(head_idx * N + row) * o_row_stride;
-
-            for (int col = 0; col < HEAD_DIM; ++col) {
-                o_row[col] *= inv_l;
-            }
-        });
-    });
+    // Note: The coopmat kernel already normalizes by dividing by rowSum internally,
+    // so no post-normalization pass is needed. l_d/m_d are unused for XMX path.
 
     if (is_f16) {
         sycl::free((void *)Q_d_f32, *stream);
@@ -901,15 +875,8 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
 #endif // GGML_SYCL_USE_INTEL_ONEMKL
 
 void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    static FILE *dbg = fopen("/tmp/llama_sycl_debug.txt", "a");
-    fprintf(dbg, "ggml_sycl_op_flash_attn: called at %ld\n", (long)time(NULL));
-    fflush(dbg);
-    fprintf(stderr, "===== GGML SYCL FLASH ATTN CALLED =====\n");
-    fflush(stderr);
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * V    = dst->src[2];
-
-    fprintf(stderr, "ggml_sycl_op_flash_attn: Q->ne[0]=%ld, Q->type=%d\n", Q->ne[0], Q->type);
 
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
     // Try XMX path first if device supports it
@@ -930,7 +897,6 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     }
 
     if (sycl_use_xmx) {
-        fprintf(stderr, "ggml_sycl: XMX path: head_dim=%ld\n", Q->ne[0]);
         const int64_t actual_d = Q->ne[0];
         const int64_t padded_d = get_padded_head_size(actual_d);
         
@@ -1019,7 +985,6 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     }
 
     if (sycl_use_mkl) {
-        fprintf(stderr, "ggml_sycl: oneMKL path: head_dim=%ld\n", Q->ne[0]);
         const int64_t actual_d = Q->ne[0];
         const int64_t padded_d = get_padded_head_size(actual_d);
         
