@@ -14,7 +14,7 @@
 #include "vecdotq.hpp"
 
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
-#include <sycl/ext/oneapi/matrix>
+#include <sycl/ext/oneapi/matrix/matrix-intel.hpp>
 namespace cm = sycl::ext::oneapi::experimental::matrix;
 #endif
 
@@ -3130,22 +3130,24 @@ void ggml_mul_mat_q4_0_q8_1_xmx_sycl(
     constexpr int SHMEM_SIZE = BLOCK_M * 32 + BLOCK_N * 32;
 
     stream->submit([&](sycl::handler &cgh) {
-        // Use group_local_memory for cooperative matrix shared memory
-        float *shmem = group_local_memory<float[SHMEM_SIZE]>(cgh);
-
         cgh.parallel_for(sycl::nd_range<2>(global, local),
-            [=](sycl::nd_item<2> it) [[intel::reqd_sub_group_size(16)]] {
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                 using namespace sycl::ext::oneapi::experimental::matrix;
 
+                // oneAPI 2025.3: group_local_memory_for_overwrite returns pointer to array
+                auto shmem_ptr = sycl::ext::oneapi::group_local_memory_for_overwrite<
+                    float[SHMEM_SIZE]>(it.get_group());
+                float (*shmem)[SHMEM_SIZE] = shmem_ptr.get();
+
                 const int lid = it.get_local_id(0);
-                const int sg_id = it.get_sub_group().get_id()[0];
+                const int sg_id = it.get_sub_group().get_group_id()[0];
 
                 const int gid_x = it.get_group(0);
                 const int gid_y = it.get_group(1);
 
                 if (gid_x >= ncols_y || gid_y * BLOCK_M >= nrows_x) return;
 
-                float *shQ = shmem;
+                float *shQ = shmem[0];
                 float *shK = shQ + BLOCK_M * 32;
                 float *shAcc = shK + BLOCK_N * 32;
 
@@ -3219,13 +3221,14 @@ void ggml_mul_mat_q4_0_q8_1_xmx_sycl(
                             joint_matrix_load(sg, mq, mq_ptr, 32);
                             joint_matrix_load(sg, mk, mk_ptr, 32);
 
-                            matAcc = joint_matrix_mad(sg, mq, mk, matAcc);
+                            // oneAPI 2025.3: joint_matrix_mad takes 5 args (Group, D, A, B, C), returns void
+                            joint_matrix_mad(sg, matAcc, mq, mk, matAcc);
                         }
 
                         auto acc_ptr = sycl::address_space_cast<
                             sycl::access::address_space::local_space,
                             sycl::access::decorated::yes>(&shAcc[(sg_id * 16) * 32 + j]);
-                        joint_matrix_store(sg, matAcc, acc_ptr, 32);
+                        joint_matrix_store(sg, matAcc, acc_ptr, 32, layout::row_major);
                     }
 
                     it.barrier(sycl::access::fence_space::local_space);
@@ -3290,20 +3293,23 @@ void ggml_mul_mat_q2_K_q8_1_xmx_sycl(
     constexpr int SHMEM_SIZE = BLOCK_M * 32 + BLOCK_N * 32;
 
     stream->submit([&](sycl::handler &cgh) {
-        float *shmem = group_local_memory<float[SHMEM_SIZE]>(cgh);
-
         cgh.parallel_for(sycl::nd_range<2>(global, local),
-            [=](sycl::nd_item<2> it) [[intel::reqd_sub_group_size(16)]] {
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                 using namespace sycl::ext::oneapi::experimental::matrix;
 
+                // oneAPI 2025.3: group_local_memory_for_overwrite returns pointer to array
+                auto shmem_ptr = sycl::ext::oneapi::group_local_memory_for_overwrite<
+                    float[SHMEM_SIZE]>(it.get_group());
+                float (*shmem)[SHMEM_SIZE] = shmem_ptr.get();
+
                 const int lid = it.get_local_id(0);
-                const int sg_id = it.get_sub_group().get_id()[0];
+                const int sg_id = it.get_sub_group().get_group_id()[0];
                 const int gid_x = it.get_group(0);
                 const int gid_y = it.get_group(1);
 
                 if (gid_x >= ncols_y || gid_y * BLOCK_M >= nrows_x) return;
 
-                float *shQ = shmem;
+                float *shQ = shmem[0];
                 float *shK = shQ + BLOCK_M * 32;
                 float *shAcc = shK + BLOCK_N * 32;
 
@@ -3316,9 +3322,11 @@ void ggml_mul_mat_q2_K_q8_1_xmx_sycl(
                     uint16_t dmin_bits = q_block[2] | (q_block[3] << 8);
                     uint32_t bits = d_bits;
                     bits <<= 16;
+                    float d;
                     std::memcpy(&d, &bits, sizeof(float));
                     bits = dmin_bits;
                     bits <<= 16;
+                    float dmin;
                     std::memcpy(&dmin, &bits, sizeof(float));
 
                     // Load scales (4 bytes, each byte is a scale for 64 elements)
@@ -3383,13 +3391,14 @@ void ggml_mul_mat_q2_K_q8_1_xmx_sycl(
                             joint_matrix_load(sg, mq, mq_ptr, 32);
                             joint_matrix_load(sg, mk, mk_ptr, 32);
 
-                            matAcc = joint_matrix_mad(sg, mq, mk, matAcc);
+                            // oneAPI 2025.3: joint_matrix_mad takes 5 args (Group, D, A, B, C), returns void
+                            joint_matrix_mad(sg, matAcc, mq, mk, matAcc);
                         }
 
                         auto acc_ptr = sycl::address_space_cast<
                             sycl::access::address_space::local_space,
                             sycl::access::decorated::yes>(&shAcc[(sg_id * 16) * 32 + j]);
-                        joint_matrix_store(sg, matAcc, acc_ptr, 32);
+                        joint_matrix_store(sg, matAcc, acc_ptr, 32, layout::row_major);
                     }
 
                     it.barrier(sycl::access::fence_space::local_space);

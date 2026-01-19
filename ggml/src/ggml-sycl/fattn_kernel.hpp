@@ -202,11 +202,10 @@ inline void flash_attn_dequantize_fp16_kernel(
 // - Online softmax with streaming statistics
 
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
-#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/ext/oneapi/matrix/matrix-intel.hpp>
 #include <sycl/ext/oneapi/group_local_memory.hpp>
 
 namespace cm = sycl::ext::oneapi::experimental::matrix;
-namespace syclex = sycl::ext::oneapi;
 
 // Cooperative matrix dimensions for Intel XMX hardware
 constexpr int GGML_SYCL_CM_M = 16;  // Rows per SG
@@ -220,66 +219,56 @@ inline bool ggml_sycl_has_coopmat_support(sycl::device device) {
 }
 
 // Intel XMX Flash Attention using cooperative matrices
-// Based on Aule-Attention reference implementation
-// Uses 16x16 cooperative matrices, 2 subgroups per workgroup (64 threads total)
+// Updated for oneAPI 2025.3 API
 template <int64_t HEAD_DIM>
-void flash_attn_coopmat_kernel(
+inline void flash_attn_coopmat_kernel(
     sycl::nd_item<2> it,
-    const float * Q,      // Query tensor [n_heads, N, HEAD_DIM]
-    const float * K,      // Key tensor [n_kv_heads, N, HEAD_DIM]
-    const float * V,      // Value tensor [n_kv_heads, N, HEAD_DIM]
-    float * O,            // Output tensor [n_heads, N, HEAD_DIM]
-    float * l_d,          // Row sums (online softmax) [n_heads, N]
-    float * m_d,          // Row maxes (online softmax) [n_heads, N]
-    const int64_t N,      // Sequence length
-    const int n_heads,    // Number of query heads
-    const int n_kv_heads, // Number of key/value heads
-    const int gqa_ratio,  // GQA ratio (n_heads / n_kv_heads)
-    const float scale,    // Attention scale factor
-    const int causal,     // Causal mask (1=enabled)
-    const int window_size // Sliding window (0=no limit)
+    const float * Q,
+    const float * K,
+    const float * V,
+    float * O,
+    float * l_d,
+    float * m_d,
+    const int64_t N,
+    const int n_heads,
+    const int n_kv_heads,
+    const int gqa_ratio,
+    const float scale,
+    const int causal,
+    const int window_size,
+    float * shmem
 ) {
-    // Block sizes
-    constexpr int BLOCK_M = 32;  // Rows per workgroup
-    constexpr int BLOCK_N = 32;  // Columns per workgroup
-    constexpr int THREADS = 64;  // Threads per workgroup
-    constexpr int SUBGROUPS = 2; // Subgroups per workgroup
+    using namespace sycl::ext::oneapi::experimental::matrix;
 
-    // Cooperative matrix parameters
-    constexpr int TM = GGML_SYCL_CM_M; // 16
-    constexpr int TN = GGML_SYCL_CM_N; // 16
-    constexpr int TK = GGML_SYCL_CM_K; // 16
+    constexpr int BLOCK_M = 32;
+    constexpr int BLOCK_N = 32;
+    constexpr int THREADS = 64;
 
-    // Stride with bank conflict avoidance (+8)
+    constexpr int TM = 16;
+    constexpr int TN = 16;
+    constexpr int TK = 16;
+
     constexpr int Q_STRIDE = HEAD_DIM + 8;
     constexpr int K_STRIDE = HEAD_DIM + 8;
     constexpr int V_STRIDE = HEAD_DIM + 8;
     constexpr int S_STRIDE = BLOCK_N + 8;
 
-    // Local memory size
     constexpr int SHMEM_SIZE = (BLOCK_M * Q_STRIDE) + (BLOCK_N * K_STRIDE) +
                                (BLOCK_N * V_STRIDE) + (BLOCK_M * S_STRIDE) +
-                               (BLOCK_M * 3); // rowMax, rowSum, rowAlpha
+                               (BLOCK_M * 3);
 
-    // Local memory using group_local_memory extension
-    auto shmem = syclex::group_local_memory_for_overwrite<float[SHMEM_SIZE]>(it.get_group());
+    const int lid = it.get_local_id(0);
+    const int gid_x = it.get_group(0);
+    const int gid_y = it.get_group(1);
+    auto sg = it.get_sub_group();
+    const int sg_id = 0;
 
-    const int tid = it.get_local_id(0) + it.get_local_id(1) * it.get_local_range(0);
-    const int gid_x = it.get_group(0); // Block row index
-    const int gid_y = it.get_group(1); // Head index
-    const int lid = it.get_local_id(0); // Thread within workgroup
-    auto sg = it.get_sub_group(); // Subgroup for matrix operations
-    const int sg_id = 0; // Single subgroup per workgroup for XMX
-
-    // Calculate output row for this workgroup
     const int row0 = gid_x * BLOCK_M;
     if (row0 >= N) return;
 
-    // Calculate K/V head index for this Q head
     const int head_idx = gid_y;
     const int kv_head_idx = head_idx / gqa_ratio;
 
-    // Memory offsets
     const ptrdiff_t q_offset = (ptrdiff_t)(head_idx * N + row0) * HEAD_DIM;
     const ptrdiff_t k_offset = (ptrdiff_t)(kv_head_idx * N) * HEAD_DIM;
     const ptrdiff_t v_offset = (ptrdiff_t)(kv_head_idx * N) * HEAD_DIM;
@@ -287,8 +276,7 @@ void flash_attn_coopmat_kernel(
     const ptrdiff_t l_offset = (ptrdiff_t)(head_idx * N + row0);
     const ptrdiff_t m_offset = (ptrdiff_t)(head_idx * N + row0);
 
-    // Local memory pointers
-    float * shQ = shmem + 0;
+    float * shQ = shmem;
     float * shK = shQ + BLOCK_M * Q_STRIDE;
     float * shV = shK + BLOCK_N * K_STRIDE;
     float * shS = shV + BLOCK_N * V_STRIDE;
@@ -296,20 +284,11 @@ void flash_attn_coopmat_kernel(
     float * rowSum = rowMax + BLOCK_M;
     float * rowAlpha = rowSum + BLOCK_M;
 
-    // Multi_ptr for joint_matrix operations (local memory)
-    auto shQ_mp = sycl::multi_ptr<float, sycl::access::address_space::local_space, sycl::access::decorated::no>(shQ);
-    auto shK_mp = sycl::multi_ptr<float, sycl::access::address_space::local_space, sycl::access::decorated::no>(shK);
-    auto shV_mp = sycl::multi_ptr<float, sycl::access::address_space::local_space, sycl::access::decorated::no>(shV);
-    auto shS_mp = sycl::multi_ptr<float, sycl::access::address_space::local_space, sycl::access::decorated::no>(shS);
-
-    // Initialize row statistics
     if (lid < BLOCK_M) {
         rowMax[lid] = -1.0e20f;
         rowSum[lid] = 0.0f;
     }
 
-    // Load Q tile into shared memory
-    // Each thread loads multiple elements to cover BLOCK_M * HEAD_DIM with THREADS threads
     for (int i = lid; i < BLOCK_M * HEAD_DIM; i += THREADS) {
         const int r = i / HEAD_DIM;
         const int c = i % HEAD_DIM;
@@ -324,27 +303,19 @@ void flash_attn_coopmat_kernel(
 
     it.barrier(sycl::access::fence_space::local_space);
 
-    // Number of K/V blocks to process
     const int num_kv_blocks = (N + BLOCK_N - 1) / BLOCK_N;
+    constexpr int NUM_V_MATRICES = (HEAD_DIM + TM - 1) / TM;
 
-    // Output accumulator matrices (8 x 16x16 = 128 elements per SG)
-    // This covers HEAD_DIM = 128 with 8 cooperative matrices
-    constexpr int NUM_V_MATRICES = (HEAD_DIM + TM - 1) / TM; // 8 for HEAD_DIM=128
-
-    // Initialize output accumulators
-    cm::joint_matrix<sycl::sub_group, float, cm::use::accumulator, TM, TN> matO[NUM_V_MATRICES];
+    joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> matO[NUM_V_MATRICES];
     for (int i = 0; i < NUM_V_MATRICES; ++i) {
-        cm::joint_matrix_fill(sg, matO[i], 0.0f);
+        joint_matrix_fill(sg, matO[i], 0.0f);
     }
 
-    // Process all K/V blocks
     for (int kv_block = 0; kv_block < num_kv_blocks; ++kv_block) {
         const int col0 = kv_block * BLOCK_N;
 
-        // Causal check: skip blocks that are entirely in the future
         if (causal == 1 && col0 > row0 + BLOCK_M) continue;
 
-        // Load K and V tiles into shared memory
         for (int i = lid; i < BLOCK_N * HEAD_DIM; i += THREADS) {
             const int r = i / HEAD_DIM;
             const int c = i % HEAD_DIM;
@@ -365,67 +336,46 @@ void flash_attn_coopmat_kernel(
 
         it.barrier(sycl::access::fence_space::local_space);
 
-        // Compute Q @ K^T for this block using cooperative matrices
-        // Q tile: BLOCK_M x HEAD_DIM, K tile: BLOCK_N x HEAD_DIM
-        // We compute BLOCK_M x BLOCK_N = 32 x 32 score matrix
-        // Using TM=16, TN=16, we need (32/16) x (32/16) = 2 x 2 = 4 coopmat operations per SG
-
-        // Process Q rows assigned to this subgroup (sg_id * 16 to sg_id * 16 + 15)
         for (int j = 0; j < BLOCK_N; j += TN) {
-            // Initialize score matrix for this 16x16 block
-            cm::joint_matrix<sycl::sub_group, float, cm::use::accumulator, TM, TN> matS;
-            cm::joint_matrix_fill(sg, matS, 0.0f);
+            joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> matS;
+            joint_matrix_fill(sg, matS, 0.0f);
 
-            // Multiply Q rows with K columns
             for (int k = 0; k < HEAD_DIM; k += TK) {
-                cm::joint_matrix<sycl::sub_group, float, cm::use::a, TM, TK> mq;
-                cm::joint_matrix<sycl::sub_group, float, cm::use::b, TK, TN> mk;
+                joint_matrix<sycl::sub_group, float, use::a, TM, TK, layout::row_major> mq;
+                joint_matrix<sycl::sub_group, float, use::b, TK, TN, layout::col_major> mk;
 
-                // Load Q tile from shared memory (manual load + joint_matrix_fill)
-                for (int i = 0; i < TM; ++i) {
-                    for (int j = 0; j < TK; ++j) {
-                        mq[i * TK + j] = shQ[(sg_id * TM + i) * Q_STRIDE + k + j];
-                    }
-                }
-                cm::joint_matrix_fill(sg, mq, 0.0f); // Clear first
+                auto mq_ptr = sycl::address_space_cast<
+                    sycl::access::address_space::local_space,
+                    sycl::access::decorated::yes>(&shQ[(sg_id * TM) * Q_STRIDE + k]);
+                auto mk_ptr = sycl::address_space_cast<
+                    sycl::access::address_space::local_space,
+                    sycl::access::decorated::yes>(&shK[j * K_STRIDE + k]);
 
-                // Load K tile from shared memory
-                for (int i = 0; i < TK; ++i) {
-                    for (int j = 0; j < TN; ++j) {
-                        mk[i * TN + j] = shK[(j + i) * K_STRIDE + k + j];
-                    }
-                }
-                cm::joint_matrix_fill(sg, mk, 0.0f); // Clear first
+                joint_matrix_load(sg, mq, mq_ptr, Q_STRIDE);
+                joint_matrix_load(sg, mk, mk_ptr, K_STRIDE);
 
-                // matS += mq * mk
-                cm::joint_matrix_mad(sg, matS, mq, mk, matS);
+                joint_matrix_mad(sg, matS, mq, mk, matS);
             }
 
-            // Store score matrix to shared memory
-            cm::joint_matrix_store(
-                matS, shS,
-                (sg_id * TM) * S_STRIDE + j,
-                S_STRIDE
-            );
+            auto shS_ptr = sycl::address_space_cast<
+                sycl::access::address_space::local_space,
+                sycl::access::decorated::yes>(&shS[(sg_id * TM) * S_STRIDE + j]);
+            joint_matrix_store(sg, matS, shS_ptr, S_STRIDE, layout::row_major);
         }
 
         it.barrier(sycl::access::fence_space::local_space);
 
-        // Online softmax with causal masking
         if (lid < BLOCK_M) {
             const int row = lid;
             float m = -1.0e20f;
 
-            // Find block max with causal masking
             for (int c = 0; c < BLOCK_N; ++c) {
                 float s_val = shS[row * S_STRIDE + c];
 
-                // Causal mask: only attend to positions <= current row
                 if (causal == 1 && col0 + c > row0 + row) {
                     s_val = -1.0e20f;
                 }
 
-                // Sliding window mask
                 if (window_size > 0 && col0 + c < row0 + row - window_size + 1) {
                     s_val = -1.0e20f;
                 }
@@ -434,14 +384,12 @@ void flash_attn_coopmat_kernel(
                 m = sycl::fmax(m, s_val);
             }
 
-            // Merge with previous block statistics
             float m_prev = rowMax[row];
             float m_new = sycl::fmax(m_prev, m);
             float alpha = sycl::exp(sycl::fmax(m_prev - m_new, -20.0f));
             rowAlpha[row] = alpha;
             rowMax[row] = m_new;
 
-            // Compute exp(s - m_new) and row sum
             float s_sum = 0.0f;
             for (int c = 0; c < BLOCK_N; ++c) {
                 float s_val = shS[row * S_STRIDE + c];
@@ -454,87 +402,75 @@ void flash_attn_coopmat_kernel(
 
         it.barrier(sycl::access::fence_space::local_space);
 
-        // P @ V multiplication using cooperative matrices
-        // shS: BLOCK_M x BLOCK_N, shV: BLOCK_N x HEAD_DIM
-        // Output: BLOCK_M x HEAD_DIM
-
-        // First, scale previous output by rowAlpha
         for (int i = 0; i < NUM_V_MATRICES; ++i) {
-            cm::joint_matrix_store(matO[i], shK, sg_id * 2048 + i * 256, 16);
+            auto shK_ptr = sycl::address_space_cast<
+                sycl::access::address_space::local_space,
+                sycl::access::decorated::yes>(&shK[sg_id * TM * HEAD_DIM + i * TM]);
+            joint_matrix_store(sg, matO[i], shK_ptr, HEAD_DIM, layout::row_major);
         }
         it.barrier(sycl::access::fence_space::local_space);
 
         for (int i = lid; i < BLOCK_M * HEAD_DIM; i += THREADS) {
-            const int my_sg = i / (HEAD_DIM / TM * TM);
-            const int r = (i % (HEAD_DIM / TM * TM)) / TM;
-            shK[i] *= rowAlpha[my_sg * TM + r];
+            const int my_sg = i / HEAD_DIM;
+            const int r = i % HEAD_DIM;
+            shK[i] *= rowAlpha[my_sg];
         }
         it.barrier(sycl::access::fence_space::local_space);
 
         for (int i = 0; i < NUM_V_MATRICES; ++i) {
-            cm::joint_matrix_load(matO[i], shK, sg_id * 2048 + i * 256, 16);
+            auto shK_ptr = sycl::address_space_cast<
+                sycl::access::address_space::local_space,
+                sycl::access::decorated::yes>(&shK[sg_id * TM * HEAD_DIM + i * TM]);
+            joint_matrix_load(sg, matO[i], shK_ptr, HEAD_DIM);
         }
         it.barrier(sycl::access::fence_space::local_space);
 
-        // P @ V: shS (32x32) @ shV (32x128) -> O (32x128)
-        // Each 16x16 block of shS multiplies with corresponding 16x16 block of shV
         for (int k = 0; k < BLOCK_N; k += TN) {
-            // Load P tile (16x16)
-            cm::joint_matrix<float, TM, TN, cm::use_a> mp;
-            cm::joint_matrix_load(
-                mp, shS,
-                (sg_id * TM) * S_STRIDE + k,
-                S_STRIDE
-            );
+            joint_matrix<sycl::sub_group, float, use::a, TM, TN, layout::row_major> mp;
+            auto shS_ptr = sycl::address_space_cast<
+                sycl::access::address_space::local_space,
+                sycl::access::decorated::yes>(&shS[(sg_id * TM) * S_STRIDE + k]);
+            joint_matrix_load(sg, mp, shS_ptr, S_STRIDE);
 
-            // Multiply with V tiles (16x128 across multiple matrices)
             for (int i = 0; i < NUM_V_MATRICES; ++i) {
-                cm::joint_matrix<float, TM, TN, cm::use_b> mv;
-                cm::joint_matrix_load(
-                    mv, shV,
-                    k * V_STRIDE + i * TM,
-                    V_STRIDE
-                );
-                matO[i] = cm::joint_matrix_mad(mp, mv, matO[i]);
+                joint_matrix<sycl::sub_group, float, use::b, TM, TN, layout::col_major> mv;
+                auto shV_ptr = sycl::address_space_cast<
+                    sycl::access::address_space::local_space,
+                    sycl::access::decorated::yes>(&shV[k * V_STRIDE + i * TM]);
+                joint_matrix_load(sg, mv, shV_ptr, V_STRIDE);
+
+                joint_matrix_mad(sg, matO[i], mp, mv, matO[i]);
             }
         }
     }
 
-    // Normalize by row sum and store output
     for (int i = 0; i < NUM_V_MATRICES; ++i) {
-        cm::joint_matrix_store(matO[i], shK, sg_id * 2048 + i * 256, 16);
+        auto shK_ptr = sycl::address_space_cast<
+            sycl::access::address_space::local_space,
+            sycl::access::decorated::yes>(&shK[sg_id * TM * HEAD_DIM + i * TM]);
+        joint_matrix_store(sg, matO[i], shK_ptr, HEAD_DIM, layout::row_major);
     }
     it.barrier(sycl::access::fence_space::local_space);
 
-    // Scale by 1/rowSum
     for (int i = lid; i < BLOCK_M * HEAD_DIM; i += THREADS) {
-        const int my_sg = i / (HEAD_DIM / TM * TM);
-        const int r = (i % (HEAD_DIM / TM * TM)) / TM;
+        const int my_sg = i / HEAD_DIM;
+        const int r = i % HEAD_DIM;
         const int row = my_sg * TM + r;
         float s = rowSum[row];
         shK[i] /= (s > 1e-10f ? s : 1.0f);
     }
+
     it.barrier(sycl::access::fence_space::local_space);
 
-    // Store normalized output
-    for (int i = 0; i < NUM_V_MATRICES; ++i) {
-        cm::joint_matrix_load(matO[i], shK, sg_id * 2048 + i * 256, 16);
-    }
-    it.barrier(sycl::access::fence_space::local_space);
-
-    // Store to global memory
-    for (int i = 0; i < NUM_V_MATRICES; ++i) {
-        cm::joint_matrix_store(
-            matO[i],
-            O + o_offset,
-            HEAD_DIM,
-            // Layout depends on implementation
-            sycl::ext::oneapi::experimental::matrix::layout::row_major
-        );
+    if (lid < BLOCK_M * HEAD_DIM) {
+        const int q_row = row0 + lid;
+        if (q_row < N) {
+            O[o_offset + (ptrdiff_t)lid * HEAD_DIM + (lid % HEAD_DIM)] = shK[lid];
+        }
     }
 
-    // Store final softmax statistics
-    it.barrier(sycl::access::fence_space::local_space);
+    rowMax[lid] = rowMax[lid];
+    rowSum[lid] = rowSum[lid];
 }
 
 #endif // SYCL_EXT_COOPERATIVE_MATRICES
