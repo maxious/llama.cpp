@@ -14,13 +14,46 @@ constexpr int FATTN_BLOCK_C = 32;  // Bc
 
 
 // Check if device supports XMX (cooperative matrix) for flash attention
+// Note: Arc B60 (Xe2/Battlemage) has limited cooperative matrix support.
+// Float32 matrices for use::a/use::b are not supported, and bfloat16 has
+// compilation issues. We disable XMX for flash attention on affected devices
+// but keep it enabled for other operations (like MMQ matmul).
 inline bool ggml_sycl_flash_attn_has_xmx(sycl::device device) {
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
-    return device.has(sycl::aspect::ext_intel_gpu_eu_simd_width) &&
-           device.has(sycl::aspect::ext_intel_matrix);
+    // Check for basic cooperative matrix support
+    if (!device.has(sycl::aspect::ext_intel_gpu_eu_simd_width) ||
+        !device.has(sycl::aspect::ext_intel_matrix)) {
+        return false;
+    }
+
+    // Arc B60 (Xe2/Battlemage) has known limitations with cooperative matrices
+    // for flash attention. The 16x16 float32 matrices are not supported for
+    // use::a/use::b operands. Disable XMX for flash attention on this device.
+    std::string device_name = device.get_info<sycl::info::device::name>();
+    // Look for B60 or Battlemage in device name
+    if (device_name.find("B60") != std::string::npos ||
+        device_name.find("Battlemage") != std::string::npos) {
+        return false;
+    }
+
+    return true;
 #else
     return false;
 #endif
+}
+
+// Check if device should use oneMKL BLAS for flash attention
+// Arc B60 (Xe2/Battlemage) benefits from oneMKL's optimized GEMM kernels
+inline bool ggml_sycl_flash_attn_use_mkl(sycl::device device) {
+#ifdef GGML_SYCL_USE_INTEL_ONEMKL
+    std::string device_name = device.get_info<sycl::info::device::name>();
+    // Arc B60 and Battlemage devices should use oneMKL path
+    if (device_name.find("B60") != std::string::npos ||
+        device_name.find("Battlemage") != std::string::npos) {
+        return true;
+    }
+#endif
+    return false;
 }
 
 
@@ -446,14 +479,14 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
     stream->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> shmem(sycl::range<1>(8192), cgh);
 
-        cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) {
+        cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
             flash_attn_coopmat_kernel<DQK>(
                 it,
                 Q_d_f32, K_d_f32, V_d_f32, dst_d,
                 l_d, m_d,
                 N, n_heads, n_kv_heads, gqa_ratio,
                 scale, 1, 0,
-                shmem.get_pointer()
+                shmem.get_multi_ptr<sycl::access::decorated::no>().get()
             );
         });
     });
@@ -485,6 +518,128 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
     sycl::free(m_d, *stream);
 }
 #endif // SYCL_EXT_COOPERATIVE_MATRICES
+
+#ifdef GGML_SYCL_USE_INTEL_ONEMKL
+// oneMKL-based flash attention for Arc B60 (Xe2/Battlemage)
+// Uses oneMKL BLAS for QK^T and PV GEMMs, bypassing cooperative matrix issues
+template<int64_t DQK, int64_t DV>
+void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    const int64_t N = Q->ne[1];
+    const int64_t n_heads = Q->ne[2];
+    const int64_t n_kv_heads = K->ne[2];
+    const int64_t gqa_ratio = n_heads / n_kv_heads;
+
+    const float * Q_d = (const float *) Q->data;
+    const float * K_d = (const float *) K->data;
+    const float * V_d = (const float *) V->data;
+    float * O_d = (float *) dst->data;
+
+    dpct::queue_ptr stream = ctx.stream();
+
+    float scale = 1.0f;
+    std::memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    scale *= sycl::rsqrt(static_cast<float>(DQK));
+
+    float * S_scores = (float *) sycl::malloc_device(N * N * sizeof(float), *stream);
+    float * S_max = (float *) sycl::malloc_device(N * sizeof(float), *stream);
+    float * S_sum = (float *) sycl::malloc_device(N * sizeof(float), *stream);
+
+    // Leading dimensions - must satisfy: lda >= k (no transpose), ldb >= k (no transpose), ldc >= n
+    const int64_t lda_q = DQK;  // Q row stride (columns)
+    const int64_t ldb_k = DQK;  // K row stride (columns)
+    const int64_t ldc_s = N;    // S is N x N
+    const int64_t lda_v = DV;   // V row stride (columns)
+    const int64_t ldc_o = DV;   // O is N x DV
+
+    for (int64_t head = 0; head < n_heads; ++head) {
+        const int64_t kv_head = head / gqa_ratio;
+
+        const float * Q_head = Q_d + head * N * DQK;
+        const float * K_head = K_d + kv_head * N * DQK;
+        const float * V_head = V_d + kv_head * N * DV;
+        float * O_head = O_d + head * N * DV;
+
+        stream->submit([&](sycl::handler& cgh) {
+            cgh.single_task([=]() {
+                for (int64_t i = 0; i < N * N; ++i) {
+                    S_scores[i] = 0.0f;
+                }
+            });
+        });
+
+        // Q @ K^T GEMM: (N x DQK) @ (DQK x N) -> (N x N)
+        // For row-major: C = A @ B^T
+        // Here: S = Q @ K^T means S[i,j] = sum_k Q[i,k] * K[j,k]
+        // With no transpose: C = A @ B, so we need K^T as input
+        // But we have K in (N x DQK) layout, so we transpose K
+        oneapi::mkl::blas::gemm(*stream,
+             oneapi::mkl::transpose::N, oneapi::mkl::transpose::T,
+             N, N, DQK,
+             scale,
+             Q_head, lda_q,
+             K_head, ldb_k,
+             0.0f,
+             S_scores, ldc_s);
+
+        stream->wait_and_throw();
+
+        // Softmax: row-wise max, exp, sum, normalize
+        stream->submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) {
+                const int64_t row = idx[0];
+
+                float row_max = -1.0e20f;
+                for (int64_t col = 0; col < N; ++col) {
+                    row_max = sycl::fmax(row_max, S_scores[row * N + col]);
+                }
+                S_max[row] = row_max;
+
+                float sum = 0.0f;
+                for (int64_t col = 0; col < N; ++col) {
+                    S_scores[row * N + col] = sycl::exp(sycl::fmax(S_scores[row * N + col] - row_max, -20.0f));
+                    sum += S_scores[row * N + col];
+                }
+                S_sum[row] = sum;
+            });
+        });
+
+        stream->wait_and_throw();
+
+        stream->submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::range<1>(N * N), [=](sycl::id<1> idx) {
+                const int64_t i = idx[0];
+                const int64_t row = i / N;
+                float row_sum = S_sum[row];
+                if (row_sum > 1.0e-10f) {
+                    S_scores[i] /= row_sum;
+                }
+            });
+        });
+
+        stream->wait_and_throw();
+
+        // P @ V GEMM: (N x N) @ (N x DV) -> (N x DV)
+        oneapi::mkl::blas::gemm(*stream,
+             oneapi::mkl::transpose::N, oneapi::mkl::transpose::N,
+             N, DV, N,
+             1.0f,
+             S_scores, N,
+             V_head, lda_v,
+             0.0f,
+             O_head, ldc_o);
+    }
+
+    stream->wait_and_throw();
+
+    sycl::free(S_scores, *stream);
+    sycl::free(S_max, *stream);
+    sycl::free(S_sum, *stream);
+}
+#endif // GGML_SYCL_USE_INTEL_ONEMKL
 
 void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     static FILE *dbg = fopen("/tmp/llama_sycl_debug.txt", "a");
@@ -547,6 +702,51 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
             // Disable XMX for subsequent calls to avoid repeated failures
             sycl_use_xmx = false;
             fprintf(stderr, "ggml_sycl: XMX kernel failed: %s, falling back to non-XMX path\n", e.what());
+        }
+    }
+#endif
+
+#ifdef GGML_SYCL_USE_INTEL_ONEMKL
+    // Try oneMKL path for Arc B60 and similar devices
+    static bool sycl_use_mkl = false;
+    static bool mkl_checked = false;
+
+    if (!mkl_checked) {
+        sycl::device device = ctx.stream()->get_device();
+        sycl_use_mkl = ggml_sycl_flash_attn_use_mkl(device);
+        mkl_checked = true;
+        if (sycl_use_mkl) {
+            fprintf(stderr, "ggml_sycl: Using oneMKL BLAS for flash attention (device=%s)\n",
+                    device.get_info<sycl::info::device::name>().c_str());
+        }
+    }
+
+    if (sycl_use_mkl) {
+        fprintf(stderr, "ggml_sycl: oneMKL path: head_dim=%ld\n", Q->ne[0]);
+        switch (Q->ne[0]) {
+            case 32:
+                GGML_ASSERT(V->ne[0] == 32);
+                ggml_sycl_op_flash_attn_mkl<32, 32>(ctx, dst);
+                return;
+            case 64:
+                GGML_ASSERT(V->ne[0] == 64);
+                ggml_sycl_op_flash_attn_mkl<64, 64>(ctx, dst);
+                return;
+            case 96:
+                GGML_ASSERT(V->ne[0] == 96);
+                ggml_sycl_op_flash_attn_mkl<96, 96>(ctx, dst);
+                return;
+            case 128:
+                GGML_ASSERT(V->ne[0] == 128);
+                ggml_sycl_op_flash_attn_mkl<128, 128>(ctx, dst);
+                return;
+            case 256:
+                GGML_ASSERT(V->ne[0] == 256);
+                ggml_sycl_op_flash_attn_mkl<256, 256>(ctx, dst);
+                return;
+            default:
+                fprintf(stderr, "ggml_sycl: oneMKL flash attention not supported for head size %ld, falling back\n", Q->ne[0]);
+                break;
         }
     }
 #endif
