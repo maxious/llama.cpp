@@ -25,6 +25,10 @@ inline bool ggml_sycl_flash_attn_has_xmx(sycl::device device) {
 
 
 bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
+    static FILE *dbg = fopen("/tmp/llama_sycl_support.txt", "a");
+    fprintf(dbg, "ggml_sycl_flash_attn_ext_supported: called\n");
+    fflush(dbg);
+    
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -37,25 +41,35 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     std::memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     if( max_bias != 0.0f || logit_softcap != 0.0f){
+        fprintf(dbg, "  rejected: max_bias=%f or logit_softcap=%f\n", max_bias, logit_softcap);
+        fflush(dbg);
         return false;
     }
 
     if (Q == nullptr || K == nullptr || V == nullptr) {
+        fprintf(dbg, "  rejected: null tensor\n");
+        fflush(dbg);
         return false;
     }
 
     // Causal masking support: check if mask is present but not custom
     // For custom masks, we still need to check if we support the specific type
-    if (mask != 0) {
-        // For now, support only causal-like masks (simple boolean or no mask)
-        // Custom attention masks with arbitrary patterns require more work
+    if (mask != nullptr && mask->type != GGML_TYPE_F32 && mask->type != GGML_TYPE_F16) {
+        fprintf(dbg, "  rejected: mask present and not F32/F16, type=%d, ne[0]=%ld\n", mask->type, mask->ne[0]);
+        fflush(dbg);
         return false;
     }
     
     // Support F32 or FP16 inputs (FP16 will be dequantized to F32)
-    const bool is_f32 = (Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F32 && V->type == GGML_TYPE_F32);
-    const bool is_f16 = (Q->type == GGML_TYPE_F16 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
-    if (!is_f32 && !is_f16) {
+    // Also support mixed types: Q can be F32 while K/V are F16 (common pattern)
+    const bool is_all_f32 = (Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F32 && V->type == GGML_TYPE_F32);
+    const bool is_all_f16 = (Q->type == GGML_TYPE_F16 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
+    const bool is_mixed_f32_q = (Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
+    if (!is_all_f32 && !is_all_f16 && !is_mixed_f32_q) {
+        fprintf(stderr, "ggml_sycl_flash_attn_ext_supported: rejected, type not F32/F16 (Q=%d, K=%d, V=%d)\n",
+                Q->type, K->type, V->type);
+        fprintf(dbg, "  rejected: type not F32/F16 (Q=%d, K=%d, V=%d)\n", Q->type, K->type, V->type);
+        fflush(dbg);
         return false;
     }
 
@@ -63,10 +77,16 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     int64_t DV  = V->ne[0];
 
     if (DQK != DV){
+        fprintf(stderr, "ggml_sycl_flash_attn_ext_supported: rejected, DQK != DV (%ld != %ld)\n", DQK, DV);
+        fprintf(dbg, "  rejected: DQK != DV (%ld != %ld)\n", DQK, DV);
+        fflush(dbg);
         return false;
     }
 
     if (DV != 32 && DV != 64 && DV != 80 && DV != 96 && DV != 112 && DV != 128 && DV != 256 && DV != 512){
+        fprintf(stderr, "ggml_sycl_flash_attn_ext_supported: rejected, unsupported head size %ld\n", DV);
+        fprintf(dbg, "  rejected: unsupported head size %ld\n", DV);
+        fflush(dbg);
         return false;
     }
 
@@ -467,8 +487,15 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
 #endif // SYCL_EXT_COOPERATIVE_MATRICES
 
 void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    static FILE *dbg = fopen("/tmp/llama_sycl_debug.txt", "a");
+    fprintf(dbg, "ggml_sycl_op_flash_attn: called at %ld\n", (long)time(NULL));
+    fflush(dbg);
+    fprintf(stderr, "===== GGML SYCL FLASH ATTN CALLED =====\n");
+    fflush(stderr);
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * V    = dst->src[2];
+
+    fprintf(stderr, "ggml_sycl_op_flash_attn: Q->ne[0]=%ld, Q->type=%d\n", Q->ne[0], Q->type);
 
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
     // Try XMX path first if device supports it
@@ -479,38 +506,48 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         sycl::device device = ctx.stream()->get_device();
         sycl_use_xmx = ggml_sycl_flash_attn_has_xmx(device);
         xmx_checked = true;
+        fprintf(stderr, "ggml_sycl: XMX detection: device=%s, has_xmx=%d\n", 
+                device.get_info<sycl::info::device::name>().c_str(), sycl_use_xmx);
         if (sycl_use_xmx) {
             fprintf(stderr, "ggml_sycl: Using XMX (cooperative matrix) for flash attention\n");
         }
     }
 
     if (sycl_use_xmx) {
-        switch (Q->ne[0]) {
-            case 32:
-                GGML_ASSERT(V->ne[0] == 32);
-                ggml_sycl_op_flash_attn_coopmat<32, 32>(ctx, dst);
-                return;
-            case 64:
-                GGML_ASSERT(V->ne[0] == 64);
-                ggml_sycl_op_flash_attn_coopmat<64, 64>(ctx, dst);
-                return;
-            case 96:
-                GGML_ASSERT(V->ne[0] == 96);
-                ggml_sycl_op_flash_attn_coopmat<96, 96>(ctx, dst);
-                return;
-            case 128:
-                GGML_ASSERT(V->ne[0] == 128);
-                ggml_sycl_op_flash_attn_coopmat<128, 128>(ctx, dst);
-                return;
-            case 256:
-                GGML_ASSERT(V->ne[0] == 256);
-                ggml_sycl_op_flash_attn_coopmat<256, 256>(ctx, dst);
-                return;
-            default:
-                break;
+        fprintf(stderr, "ggml_sycl: XMX path: head_dim=%ld\n", Q->ne[0]);
+        try {
+            switch (Q->ne[0]) {
+                case 32:
+                    GGML_ASSERT(V->ne[0] == 32);
+                    ggml_sycl_op_flash_attn_coopmat<32, 32>(ctx, dst);
+                    return;
+                case 64:
+                    GGML_ASSERT(V->ne[0] == 64);
+                    ggml_sycl_op_flash_attn_coopmat<64, 64>(ctx, dst);
+                    return;
+                case 96:
+                    GGML_ASSERT(V->ne[0] == 96);
+                    ggml_sycl_op_flash_attn_coopmat<96, 96>(ctx, dst);
+                    return;
+                case 128:
+                    GGML_ASSERT(V->ne[0] == 128);
+                    ggml_sycl_op_flash_attn_coopmat<128, 128>(ctx, dst);
+                    return;
+                case 256:
+                    GGML_ASSERT(V->ne[0] == 256);
+                    ggml_sycl_op_flash_attn_coopmat<256, 256>(ctx, dst);
+                    return;
+                default:
+                    break;
+            }
+            // Fall back to non-XMX path for unsupported head sizes
+            fprintf(stderr, "ggml_sycl: XMX flash attention not supported for head size %ld, falling back\n", Q->ne[0]);
+        } catch (const std::exception& e) {
+            // XMX kernel failed, fall back to non-XMX path
+            // Disable XMX for subsequent calls to avoid repeated failures
+            sycl_use_xmx = false;
+            fprintf(stderr, "ggml_sycl: XMX kernel failed: %s, falling back to non-XMX path\n", e.what());
         }
-        // Fall back to non-XMX path for unsupported head sizes
-        fprintf(stderr, "ggml_sycl: XMX flash attention not supported for head size %ld, falling back\n", Q->ne[0]);
     }
 #endif
 
