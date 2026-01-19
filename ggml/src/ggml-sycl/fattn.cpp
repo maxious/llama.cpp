@@ -432,7 +432,8 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
                 Q_d_f32, K_d_f32, V_d_f32, dst_d,
                 l_d, m_d,
                 N, n_heads, n_kv_heads, gqa_ratio,
-                scale, 1, 0
+                scale, 1, 0,
+                shmem.get_pointer()
             );
         });
     });
