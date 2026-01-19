@@ -181,26 +181,6 @@ inline void flash_attn_dequantize_fp16_kernel(
     dst[idx] = static_cast<float>(src[row * row_stride + col]);
 }
 
-// Intel XMX Cooperative Matrix Support
-// This is a placeholder for Intel GPU XMX (eXtended Matrix) acceleration
-// using cooperative matrix operations.
-//
-// Requirements:
-// - Intel Xe3+ GPU (Arc Battlemage, Data Center GPU Max series)
-// - oneAPI compiler 2025.0+
-// - Compile with: -fsycl -fsycl-device-code-split=per_kernel
-// - Enable: SYCL_EXT_COOPERATIVE_MATRICES macro
-//
-// The cooperative matrix implementation provides ~2-4x speedup over
-// basic tiled implementation by using Intel's matrix multiplication
-// units (XMUs) directly.
-//
-// Key patterns from Aule-Attention reference:
-// - 16x16 cooperative matrices (CM_M=16, CM_N=16, CM_K=16)
-// - 2 subgroups per workgroup (32 threads / 16 per SG)
-// - Shared memory tiling with bank conflict avoidance (stride + 8)
-// - Online softmax with streaming statistics
-
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
 #include <sycl/ext/oneapi/matrix/matrix-intel.hpp>
 #include <sycl/ext/oneapi/group_local_memory.hpp>
@@ -209,13 +189,8 @@ inline void flash_attn_dequantize_fp16_kernel(
 namespace cm = sycl::ext::oneapi::experimental::matrix;
 
 // Use bfloat16 for XMX operations - Intel XMX hardware supports bf16, fp16, int8
-// but NOT fp32 matrices for joint_matrix operations
+// but NOT fp32 matrices for joint_matrix A/B operands on some devices (including Arc B60)
 using bfloat16 = sycl::ext::oneapi::bfloat16;
-
-// Cooperative matrix dimensions for Intel XMX hardware
-constexpr int GGML_SYCL_CM_M = 16;  // Rows per SG
-constexpr int GGML_SYCL_CM_N = 16;  // Columns per block
-constexpr int GGML_SYCL_CM_K = 16;  // Inner dimension
 
 // Check if device supports cooperative matrices
 inline bool ggml_sycl_has_coopmat_support(sycl::device device) {
@@ -324,7 +299,7 @@ inline void flash_attn_coopmat_kernel(
     const int num_kv_blocks = (N + BLOCK_N - 1) / BLOCK_N;
 
     // Output accumulator - stays as float for precision
-    joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> matO[NUM_V_MATRICES];
+    joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN, layout::dynamic> matO[NUM_V_MATRICES];
     for (int i = 0; i < NUM_V_MATRICES; ++i) {
         joint_matrix_fill(sg, matO[i], 0.0f);
     }
@@ -357,7 +332,7 @@ inline void flash_attn_coopmat_kernel(
 
         // Q @ K^T computation using bfloat16 for XMX A/B matrices
         for (int j = 0; j < BLOCK_N; j += TN) {
-            joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN> matS;
+            joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN, layout::dynamic> matS;
             joint_matrix_fill(sg, matS, 0.0f);
 
             for (int k = 0; k < HEAD_DIM; k += TK) {
@@ -375,6 +350,7 @@ inline void flash_attn_coopmat_kernel(
                 joint_matrix_load(sg, mq, mq_ptr, Q_STRIDE);
                 joint_matrix_load(sg, mk, mk_ptr, K_STRIDE);
 
+                // oneAPI 2025.3: joint_matrix_mad takes 5 args (Group, D, A, B, C), returns void
                 joint_matrix_mad(sg, matS, mq, mk, matS);
             }
 
@@ -434,7 +410,6 @@ inline void flash_attn_coopmat_kernel(
         it.barrier(sycl::access::fence_space::local_space);
 
         // Scale by rowAlpha and convert to bfloat16 for XMX
-        // accum_scratch is float, shK is bfloat16
         for (int i = lid; i < NUM_V_MATRICES * HEAD_DIM; i += THREADS) {
             const int mat_idx = i / HEAD_DIM;
             const int r = i % HEAD_DIM;
@@ -445,9 +420,7 @@ inline void flash_attn_coopmat_kernel(
         }
         it.barrier(sycl::access::fence_space::local_space);
 
-        // Load scaled accumulators back - matO is float, shK is bfloat16
-        // This requires conversion: we need to load as float, not bfloat16
-        // So we load from accum_scratch (float) directly, not from shK (bfloat16)
+        // Load scaled accumulators back
         for (int i = 0; i < NUM_V_MATRICES; ++i) {
             auto scratch_ptr = sycl::address_space_cast<
                 sycl::access::address_space::local_space,
@@ -457,7 +430,6 @@ inline void flash_attn_coopmat_kernel(
         it.barrier(sycl::access::fence_space::local_space);
 
         // Convert P (shS, float) to bfloat16 for XMX P @ V computation
-        // XMX requires bf16/fp16 for use::a matrices
         // Reuse beginning of shK for P_bf16 storage (K tiles are done)
         for (int i = lid; i < BLOCK_M * BLOCK_N; i += THREADS) {
             const int row = i / BLOCK_N;
