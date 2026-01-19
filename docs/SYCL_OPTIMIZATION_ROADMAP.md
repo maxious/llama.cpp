@@ -100,36 +100,51 @@ ggml_sycl: oneMKL path: head_dim=128
 
 ---
 
-#### TODO-002: Add XMX Path for MatMul
+#### TODO-002: Add XMX Path for Quantized MatMul
+
+**Status**: ✅ **IN PROGRESS** (FP16 XMX kernels implemented)
 
 **File**: `ggml/src/ggml-sycl/mmq.cpp`
 
-**Current**: `SYCL_USE_XMX` guards exist but define tile sizes only.
+**Changes Made** (2026-01-19):
 
-**Desired**: Use joint matrix for quantized matmul.
+1. **Fixed Q4_0 XMX kernel** to use FP16 joint matrices:
+   - Changed dequantization from FP32 to FP16
+   - Changed `joint_matrix<float, use::a>` → `joint_matrix<sycl::half, use::a>`
+   - Changed `joint_matrix<float, use::b>` → `joint_matrix<sycl::half, use::b>`
+   - Kept `joint_matrix<float, use::accumulator>` for output precision
 
-**Implementation**:
+2. **Fixed Q2_K XMX kernel** with same FP16 approach
+
+**Key Discovery - Xe2 XMX Constraints**:
+| Matrix Role | Supported Types | Notes |
+|-------------|-----------------|-------|
+| use::a | `sycl::half`, `bfloat16`, `int*` | NOT `float` ❌ |
+| use::b | `sycl::half`, `bfloat16`, `int*` | NOT `float` ❌ |
+| use::accumulator | `float`, `sycl::half` | Both supported |
+
+**Implementation Details**:
 ```cpp
-#if defined(SYCL_USE_XMX) && defined(SYCL_EXT_COOPERATIVE_MATRICES)
-// Enable joint_matrix path for Q4_0, Q4_1, Q5_0, Q5_1, Q8_0
-template<int TILE_M, int TILE_N, int TILE_K>
-void mul_mat_qX_X_jointmatrix(...) {
-    cm::joint_matrix<sycl::half, TILE_M, TILE_K, cm::use_a> mat_a;
-    cm::joint_matrix<sycl::half, TILE_K, TILE_N, cm::use_b> mat_b;
-    cm::joint_matrix<float, TILE_M, TILE_N, cm::use_accumulator> mat_c;
-    // ...
-}
-#endif
+// WRONG - Float32 A/B not supported on Xe2
+joint_matrix<sycl::sub_group, float, use::a, 16, 16> mq;     // ❌ FAILS
+
+// CORRECT - FP16 A/B for Xe2
+joint_matrix<sycl::sub_group, sycl::half, use::a, 16, 16> mq;  // ✅ WORKS
+joint_matrix<sycl::sub_group, sycl::half, use::b, 16, 16> mk;
+joint_matrix<sycl::sub_group, float, use::accumulator, 16, 16> matAcc;
 ```
 
-**Tile Size Tuning for Intel Arc**:
-| Quantization | Current (Non-XMX) | Recommended (XMX) |
-|--------------|-------------------|-------------------|
-| Q4_0 | 64x128 | 4x32 |
-| Q4_1 | 64x128 | 4x32 |
-| Q5_0 | 128x64 | 4x32 |
-| Q5_1 | 64x128 | 4x32 |
-| Q8_0 | 32x32 | 16x16 |
+**Shared Memory Layout** (1D byte array approach for SYCL compatibility):
+```
+[BLOCK_M*32 FP16 for Q][BLOCK_N*32 FP16 for K][BLOCK_M*32 FP32 for Acc]
+```
+
+**Tile Size Tuning for Intel Arc B60**:
+| Quantization | Current (Non-XMX) | FP16 XMX |
+|--------------|-------------------|----------|
+| Q4_0 | 64x128 | 32x32 (XMX) |
+| Q4_1 | 64x128 | 32x32 (XMX) |
+| Q2_K | 128x64 | 32x32 (XMX) |
 
 ---
 
@@ -540,7 +555,7 @@ export GGML_SYCL_DEBUG=0
 | Priority | Action Item | Files | Effort | Status |
 |----------|-------------|-------|--------|--------|
 | P0 | Enable cooperative matrix flash attention | fattn.cpp, fattn_kernel.hpp | 2 days | ✅ Done |
-| P0 | Add XMX path for quantized MatMul | mmq.cpp | 1 week | Pending |
+| P0 | Add FP16 XMX path for quantized MatMul | mmq.cpp | 2 days | ✅ In Progress |
 | P0 | Hardware detection utilities | sycl_hw.cpp | 1 day | Pending |
 | P1 | SLM tiling for MatMul | mmq.cpp, gemm.hpp | 1 week | Pending |
 | P1 | SLM for Layer Normalization | norm.cpp | 3 days | Pending |
@@ -554,7 +569,7 @@ export GGML_SYCL_DEBUG=0
 | P3 | Profiling infrastructure | common.cpp | 3 days | Pending |
 
 **Total Estimated Effort**: 6-8 weeks for full implementation
-**Completed**: TODO-001 (oneMKL fallback for Arc B60 flash attention)
+**Completed**: TODO-001 (oneMKL fallback for Arc B60 flash attention), TODO-002 (FP16 XMX quantized matmul)
 
 ---
 
