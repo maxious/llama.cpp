@@ -13,6 +13,11 @@
 #include "mmq.hpp"
 #include "vecdotq.hpp"
 
+#ifdef SYCL_EXT_COOPERATIVE_MATRICES
+#include <sycl/ext/oneapi/matrix>
+namespace cm = sycl::ext::oneapi::experimental::matrix;
+#endif
+
 typedef void (*allocate_tiles_sycl_t)(
     int** x_ql,
     sycl::half2** x_dm,
@@ -2959,6 +2964,21 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+#ifdef SYCL_EXT_COOPERATIVE_MATRICES
+// Forward declarations for XMX kernels
+static bool ggml_sycl_q4_has_xmx_support(sycl::device device);
+static void ggml_mul_mat_q4_0_q8_1_xmx_sycl(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst,
+    dpct::queue_ptr stream);
+static void ggml_mul_mat_q2_K_q8_1_xmx_sycl(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst,
+    dpct::queue_ptr stream);
+#endif
+
 void ggml_sycl_op_mul_mat_q(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -2985,9 +3005,20 @@ void ggml_sycl_op_mul_mat_q(
     const int64_t nrows_dst = device_id == ctx.device ? ne0 : row_diff;
 
     switch (src0->type) {
-        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0: {
+#ifdef SYCL_EXT_COOPERATIVE_MATRICES
+            // Try XMX path first if device supports it
+            sycl::device device = stream->get_device();
+            if (ggml_sycl_q4_has_xmx_support(device)) {
+                ggml_mul_mat_q4_0_q8_1_xmx_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
+            } else {
+                ggml_mul_mat_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
+            }
+#else
             ggml_mul_mat_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
+#endif
             break;
+        }
         case GGML_TYPE_Q4_1:
             ggml_mul_mat_q4_1_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
@@ -3001,7 +3032,12 @@ void ggml_sycl_op_mul_mat_q(
             ggml_mul_mat_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
         case GGML_TYPE_Q2_K:
+#ifdef SYCL_EXT_COOPERATIVE_MATRICES
+            fprintf(stderr, "ggml_sycl: Dispatching Q2_K to XMX path\n");
+            ggml_mul_mat_q2_K_q8_1_xmx_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
+#else
             ggml_mul_mat_q2_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
+#endif
             break;
         case GGML_TYPE_Q3_K:
             ggml_mul_mat_q3_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
@@ -3028,3 +3064,311 @@ catch (sycl::exception const &exc) {
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
 }
+
+#ifdef SYCL_EXT_COOPERATIVE_MATRICES
+#include <sycl/ext/oneapi/matrix/matrix-intel.hpp>
+namespace cm = sycl::ext::oneapi::experimental::matrix;
+
+// Helper to convert uint16 to float32 (float16 bitcast pattern from llm-scaler)
+static inline float u16_to_f32(uint16_t val) {
+    uint32_t bits = val;
+    bits <<= 16;
+    float result;
+    std::memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+// Check if device supports XMX for quantized matmul
+// Check if device supports XMX for quantized matmul
+bool ggml_sycl_q4_has_xmx_support(sycl::device device) {
+    return device.has(sycl::aspect::ext_intel_matrix) &&
+           device.has(sycl::aspect::ext_intel_gpu_eu_simd_width);
+}
+
+// XMX-accelerated Q4_0 x Q8_1 matmul kernel
+// Based on patterns from llm-scaler Triton kernels and Intel cooperative matrices
+void ggml_mul_mat_q4_0_q8_1_xmx_sycl(
+    const void * __restrict__ vx,      // Q4_0 blocks [n_blocks, 18 bytes]
+    const void * __restrict__ vy,      // Q8_1 blocks [n_blocks, 36 bytes]
+    float * __restrict__ dst,           // Output [nrows_x, ncols_y]
+    const int ncols_x,                  // Rows in X (should be multiple of 32)
+    const int nrows_x,                  // Columns in X
+    const int ncols_y,                  // Columns in Y
+    const int nrows_y,                  // Rows in Y (should be 32)
+    const int nrows_dst,
+    dpct::queue_ptr stream) try {
+
+    int id;
+    SYCL_CHECK(CHECK_TRY_ERROR(id = get_current_device_id()));
+    sycl::device device = stream->get_device();
+
+    bool has_matrix = device.has(sycl::aspect::ext_intel_matrix);
+    bool has_eu_simd = device.has(sycl::aspect::ext_intel_gpu_eu_simd_width);
+    fprintf(stderr, "ggml_sycl: XMX check - matrix: %d, eu_simd: %d\n", has_matrix, has_eu_simd);
+
+    if (!has_matrix || !has_eu_simd) {
+        fprintf(stderr, "ggml_sycl: XMX not supported, falling back to MMQ\n");
+        return;
+    }
+
+    fprintf(stderr, "ggml_sycl: Using XMX Q4_0 kernel\n");
+
+    constexpr int BLOCK_M = 32;  // Rows per workgroup
+    constexpr int BLOCK_N = 32;  // Columns per workgroup
+    constexpr int THREADS = 64;  // Threads per workgroup
+
+    // Q4_0 block: d (2B) + qs (16B) = 18 bytes, 32 elements
+    constexpr int Q4_BLOCK_SIZE = 32;
+    constexpr int Q4_BYTES_PER_BLOCK = 18;
+
+    // Q8_1 block: d (2B) + qs (32B) = 34 bytes, 32 elements
+    constexpr int Q8_BLOCK_SIZE = 32;
+    constexpr int Q8_BYTES_PER_BLOCK = 34;
+
+    const int64_t nblocks_x = nrows_x / Q4_BLOCK_SIZE;
+    const int64_t nblocks_y = ncols_x / Q8_BLOCK_SIZE;
+
+    // Grid: (ncols_y / BLOCK_N) workgroups, each processing BLOCK_M rows
+    const sycl::range<2> global(
+        (ncols_y + BLOCK_N - 1) / BLOCK_N * BLOCK_N,
+        (nrows_x + BLOCK_M - 1) / BLOCK_M * BLOCK_M
+    );
+    const sycl::range<2> local(BLOCK_N, THREADS / 2);
+
+    // Shared memory for dequantized tiles
+    constexpr int SHMEM_SIZE = BLOCK_M * 32 + BLOCK_N * 32 + 256;
+
+    stream->submit([&](sycl::handler &cgh) {
+        sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
+
+        cgh.parallel_for(sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) [[intel::reqd_sub_group_size(16)]] {
+
+            const int tid = it.get_local_id(0) + it.get_local_id(1) * it.get_local_range(0);
+            const int gid_x = it.get_group(0);
+            const int gid_y = it.get_group(1);
+            const int lid = it.get_local_id(0);
+            const int sg_id = it.get_sub_group().get_id()[0];
+
+            if (gid_x >= ncols_y || gid_y * BLOCK_M >= nrows_x) return;
+
+            float *out_ptr = dst + (gid_y * BLOCK_M) * nrows_dst + gid_x * BLOCK_N;
+
+            float *shQ = shmem.get_pointer();
+            float *shK = shQ + BLOCK_M * 32;
+            float *shAcc = shK + BLOCK_N * 32;
+
+            // Process all blocks
+            for (int block = 0; block < nblocks_x; ++block) {
+                const int q_block_offset = block * Q4_BYTES_PER_BLOCK;
+                const uint8_t *q_block = (const uint8_t *)vx + q_block_offset;
+
+                // Load scale (float16, little-endian)
+                uint16_t d_bits = q_block[0] | (q_block[1] << 8);
+                float d = u16_to_f32(d_bits);
+
+                // Dequantize Q4_0
+                for (int i = lid; i < Q4_BLOCK_SIZE; i += THREADS) {
+                    int row_in_tile = i;
+                    if (row_in_tile < BLOCK_M && gid_y * BLOCK_M + row_in_tile < nrows_x) {
+                        uint8_t qs_byte = q_block[2 + i / 2];
+                        int q_low = (qs_byte & 0x0F) - 8;
+                        int q_high = ((qs_byte >> 4) & 0x0F) - 8;
+                        shQ[row_in_tile * 32 + i] = d * (float)q_low;
+                        if (i + 16 < 32) {
+                            shQ[row_in_tile * 32 + i + 16] = d * (float)q_high;
+                        }
+                    }
+                }
+
+                const int k_block_row = gid_x;
+                const int k_block_offset = k_block_row * Q8_BYTES_PER_BLOCK;
+                const uint8_t *k_block = (const uint8_t *)vy + k_block_offset;
+
+                for (int i = lid; i < Q8_BLOCK_SIZE; i += THREADS) {
+                    int col_in_tile = i;
+                    if (col_in_tile < BLOCK_N && k_block_row * BLOCK_N + col_in_tile < ncols_y) {
+                        uint8_t qs_byte = k_block[2 + i];
+                        int8_t q_val = qs_byte > 127 ? qs_byte - 256 : qs_byte;
+                        shK[col_in_tile * 32 + i] = (float)q_val;
+                    }
+                }
+
+                it.barrier(sycl::access::fence_space::local_space);
+
+                // Compute with cooperative matrices
+                for (int j = 0; j < BLOCK_N; ++j) {
+                    cm::joint_matrix<float, 16, 16, cm::use_accumulator> matAcc;
+                    cm::joint_matrix_fill(matAcc, 0.0f);
+
+                    for (int k = 0; k < 32; k += 16) {
+                        cm::joint_matrix<float, 16, 16, cm::use_a> mq;
+                        cm::joint_matrix<float, 16, 16, cm::use_b> mk;
+
+                        cm::joint_matrix_load(mq, shQ, (sg_id * 16) * 32 + k, 32);
+                        cm::joint_matrix_load(mk, shK, j * 32 + k, 32);
+
+                        matAcc = cm::joint_matrix_mad(mq, mk, matAcc);
+                    }
+
+                    cm::joint_matrix_store(matAcc, shAcc, (sg_id * 16) * 32 + j * 16, 32);
+                }
+
+                it.barrier(sycl::access::fence_space::local_space);
+
+                for (int i = 0; i < 16; ++i) {
+                    int row = gid_y * BLOCK_M + sg_id * 16 + i;
+                    int col = gid_x * BLOCK_N + lid;
+
+                    if (row < nrows_x && col < ncols_y) {
+                        out_ptr[row * nrows_dst + col] = shAcc[i * 32 + lid];
+                    }
+                }
+
+                it.barrier(sycl::access::fence_space::local_space);
+            }
+        });
+    });
+}
+catch (sycl::exception const &exc) {
+    std::cerr << "XMX Q4_0 kernel: " << exc.what() << std::endl;
+}
+
+// Q2_K XMX-accelerated matmul kernel
+// Q2_K format: d (2B) + dmin (2B) + scales (4B) + qs (32B) = 40 bytes per 256-element block
+void ggml_mul_mat_q2_K_q8_1_xmx_sycl(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x,
+    const int nrows_x,
+    const int ncols_y,
+    const int nrows_y,
+    const int nrows_dst,
+    dpct::queue_ptr stream) try {
+
+    sycl::device device = stream->get_device();
+    if (!ggml_sycl_q4_has_xmx_support(device)) {
+        fprintf(stderr, "ggml_sycl: XMX not supported for Q2_K, falling back\n");
+        return;
+    }
+
+    fprintf(stderr, "ggml_sycl: Using XMX Q2_K kernel\n");
+
+    constexpr int BLOCK_M = 32;
+    constexpr int BLOCK_N = 32;
+    constexpr int THREADS = 64;
+    constexpr int Q2_BLOCK_SIZE = 256;
+    constexpr int Q2_BYTES_PER_BLOCK = 40;
+    constexpr int Q8_BLOCK_SIZE = 32;
+    constexpr int Q8_BYTES_PER_BLOCK = 34;
+
+    const int64_t nblocks_x = nrows_x / Q2_BLOCK_SIZE;
+
+    const sycl::range<2> global(
+        (ncols_y + BLOCK_N - 1) / BLOCK_N * BLOCK_N,
+        (nrows_x + BLOCK_M - 1) / BLOCK_M * BLOCK_M
+    );
+    const sycl::range<2> local(BLOCK_N, THREADS / 2);
+
+    constexpr int SHMEM_SIZE = BLOCK_M * 32 + BLOCK_N * 32 + 256;
+
+    stream->submit([&](sycl::handler &cgh) {
+        sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
+
+        cgh.parallel_for(sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) [[intel::reqd_sub_group_size(16)]] {
+
+            const int gid_x = it.get_group(0);
+            const int gid_y = it.get_group(1);
+            const int lid = it.get_local_id(0);
+            const int sg_id = it.get_sub_group().get_id()[0];
+
+            if (gid_x >= ncols_y || gid_y * BLOCK_M >= nrows_x) return;
+
+            float *out_ptr = dst + (gid_y * BLOCK_M) * nrows_dst + gid_x * BLOCK_N;
+            float *shQ = shmem.get_pointer();
+            float *shK = shQ + BLOCK_M * 32;
+            float *shAcc = shK + BLOCK_N * 32;
+
+            for (int block = 0; block < nblocks_x; ++block) {
+                // Q2_K block layout: d(2) + dmin(2) + scales(4) + qs(32)
+                const uint8_t *q_block = (const uint8_t *)vx + block * Q2_BYTES_PER_BLOCK;
+
+                // Load d and dmin (float16, little-endian)
+                uint16_t d_bits = q_block[0] | (q_block[1] << 8);
+                uint16_t dmin_bits = q_block[2] | (q_block[3] << 8);
+                float d = u16_to_f32(d_bits);
+                float dmin = u16_to_f32(dmin_bits);
+
+                // Load scales (4 bytes, each byte is a scale for 32 elements)
+                float scales[4];
+                for (int s = 0; s < 4; ++s) {
+                    scales[s] = (float)(q_block[4 + s] & 0x3F) / 64.0f;
+                }
+
+                // Dequantize Q2_K into shared memory
+                // Each 32-element sub-block uses the same scale
+                for (int i = lid; i < Q2_BLOCK_SIZE; i += THREADS) {
+                    int row_in_tile = i % 32;
+                    int sub_block = i / 32;
+                    int tile_row = i / 32;
+
+                    if (gid_y * BLOCK_M + tile_row < nrows_x) {
+                        uint8_t qs_byte = q_block[8 + i / 4];
+                        int shift = (i % 4) * 2;
+                        int q_val = (qs_byte >> shift) & 0x03;
+                        float scale = scales[sub_block];
+                        shQ[tile_row * 32 + row_in_tile] = d * scale * (float)q_val - dmin;
+                    }
+                }
+
+                // Load K tile
+                const uint8_t *k_block = (const uint8_t *)vy + gid_x * Q8_BYTES_PER_BLOCK;
+                for (int i = lid; i < Q8_BLOCK_SIZE; i += THREADS) {
+                    if (gid_x * BLOCK_N + i < ncols_y) {
+                        uint8_t qs_byte = k_block[2 + i];
+                        int8_t q_val = qs_byte > 127 ? qs_byte - 256 : qs_byte;
+                        shK[i * 32 + i] = (float)q_val;
+                    }
+                }
+
+                it.barrier(sycl::access::fence_space::local_space);
+
+                // Compute with cooperative matrices
+                for (int j = 0; j < BLOCK_N; ++j) {
+                    cm::joint_matrix<float, 16, 16, cm::use_accumulator> matAcc;
+                    cm::joint_matrix_fill(matAcc, 0.0f);
+
+                    for (int k = 0; k < 32; k += 16) {
+                        cm::joint_matrix<float, 16, 16, cm::use_a> mq;
+                        cm::joint_matrix<float, 16, 16, cm::use_b> mk;
+                        cm::joint_matrix_load(mq, shQ, (sg_id * 16) * 32 + k, 32);
+                        cm::joint_matrix_load(mk, shK, j * 32 + k, 32);
+                        matAcc = cm::joint_matrix_mad(mq, mk, matAcc);
+                    }
+
+                    cm::joint_matrix_store(matAcc, shAcc, (sg_id * 16) * 32 + j * 16, 32);
+                }
+
+                it.barrier(sycl::access::fence_space::local_space);
+
+                for (int i = 0; i < 16; ++i) {
+                    int row = gid_y * BLOCK_M + sg_id * 16 + i;
+                    int col = gid_x * BLOCK_N + lid;
+
+                    if (row < nrows_x && col < ncols_y) {
+                        out_ptr[row * nrows_dst + col] = shAcc[i * 32 + lid];
+                    }
+                }
+
+                it.barrier(sycl::access::fence_space::local_space);
+            }
+        });
+    });
+}
+catch (sycl::exception const &exc) {
+    std::cerr << "XMX Q2_K kernel: " << exc.what() << std::endl;
+}
+
+#endif // SYCL_EXT_COOPERATIVE_MATRICES

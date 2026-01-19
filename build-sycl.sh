@@ -2,9 +2,9 @@
 #  MIT license
 #  Copyright (C) 2024 Intel Corporation
 #  SPDX-License-Identifier: MIT
-
-# SYCL Build Script for llama.cpp with Flash Attention enhancements
-# Usage: ./build-sycl.sh [--clean] [--f16] [--bf16]
+#
+# SYCL Build Script for llama.cpp
+# Usage: ./build-sycl.sh [--clean] [--f16] [--bf16] [--asan] [--ubsan] [--sanitize]
 
 set -e
 
@@ -15,6 +15,9 @@ cd "$SCRIPT_DIR"
 CLEAN=false
 ENABLE_F16=false
 ENABLE_BF16=false
+ENABLE_ASAN=false
+ENABLE_UBSAN=false
+BUILD_TYPE="Release"
 
 while [[ "$1" == --* ]]; do
     case "$1" in
@@ -30,9 +33,33 @@ while [[ "$1" == --* ]]; do
             ENABLE_BF16=true
             shift
             ;;
+        --asan)
+            ENABLE_ASAN=true
+            BUILD_TYPE="RelWithDebInfo"
+            shift
+            ;;
+        --ubsan)
+            ENABLE_UBSAN=true
+            BUILD_TYPE="RelWithDebInfo"
+            shift
+            ;;
+        --sanitize)
+            ENABLE_ASAN=true
+            ENABLE_UBSAN=true
+            BUILD_TYPE="RelWithDebInfo"
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--clean] [--f16] [--bf16]"
+            echo "Usage: $0 [--clean] [--f16] [--bf16] [--asan] [--ubsan] [--sanitize]"
+            echo ""
+            echo "Sanitizer options:"
+            echo "  --asan     Enable Address Sanitizer (ASAN) for memory error detection"
+            echo "  --ubsan    Enable Undefined Behavior Sanitizer (UBSAN)"
+            echo "  --sanitize Enable both ASAN and UBSAN (equivalent to --asan --ubsan)"
+            echo ""
+            echo "Example with sanitizers for debugging:"
+            echo "  ./build-sycl.sh --f16 --asan"
             exit 1
             ;;
     esac
@@ -60,6 +87,7 @@ CMAKE_OPTS=(
     -DLLAMA_CURL=OFF
     -DGGML_SYCL_DNN=OFF
     -DMKL_SYCL_THREADING=intel_thread
+    -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
 )
 
 if [[ "$ENABLE_F16" == true ]]; then
@@ -72,11 +100,35 @@ if [[ "$ENABLE_BF16" == true ]]; then
     echo "Enabling BF16 support..."
 fi
 
+if [[ "$ENABLE_ASAN" == true ]]; then
+    SANITIZER_FLAGS="${SANITIZER_FLAGS} -fsanitize=address -fno-omit-frame-pointer"
+    CMAKE_OPTS+=(-DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g")
+    CMAKE_OPTS+=(-DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address")
+    CMAKE_OPTS+=(-DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g")
+    echo "Enabling Address Sanitizer (ASAN)..."
+    echo ""
+    echo "IMPORTANT: For GPU memory issues, run with device-side ASAN:"
+    echo "  export UR_LAYER_ASAN_OPTIONS=\"quarantine_size_mb:16;redzone:64\""
+    echo "  ./build-sycl/bin/llama-cli -m model.gguf -p 'test'"
+    echo ""
+    echo "Device-side ASAN makes GPU execution sequential and may reduce workgroup size."
+fi
+
+if [[ "$ENABLE_UBSAN" == true ]]; then
+    SANITIZER_FLAGS="${SANITIZER_FLAGS} -fsanitize=undefined"
+    if [[ "$ENABLE_ASAN" != true ]]; then
+        # Only add to CXX_FLAGS if ASAN wasn't already set
+        CMAKE_OPTS+=(-DCMAKE_CXX_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer -g")
+        CMAKE_OPTS+=(-DCMAKE_EXE_LINKER_FLAGS="-fsanitize=undefined")
+    fi
+    echo "Enabling Undefined Behavior Sanitizer (UBSAN)..."
+fi
+
 cmake .. "${CMAKE_OPTS[@]}"
 
 # Build with parallel jobs
 echo "Building (this may take a while)..."
-cmake --build . --config Release -j $(nproc)
+cmake --build . --config ${BUILD_TYPE} -j $(nproc)
 
 echo ""
 echo "Build complete! Binaries are in: build-sycl/bin/"
@@ -90,3 +142,9 @@ echo ""
 echo "Options used:"
 echo "  --f16: Enable FP16 support"
 echo "  --bf16: Enable BF16 support"
+if [[ "$ENABLE_ASAN" == true ]]; then
+    echo "  --asan: Address Sanitizer enabled"
+fi
+if [[ "$ENABLE_UBSAN" == true ]]; then
+    echo "  --ubsan: Undefined Behavior Sanitizer enabled"
+fi

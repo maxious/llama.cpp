@@ -202,9 +202,11 @@ inline void flash_attn_dequantize_fp16_kernel(
 // - Online softmax with streaming statistics
 
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
-#include <sycl/ext/oneapi/experimental/matrix>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/ext/oneapi/group_local_memory.hpp>
 
 namespace cm = sycl::ext::oneapi::experimental::matrix;
+namespace syclex = sycl::ext::oneapi;
 
 // Cooperative matrix dimensions for Intel XMX hardware
 constexpr int GGML_SYCL_CM_M = 16;  // Rows per SG
@@ -259,14 +261,15 @@ void flash_attn_coopmat_kernel(
                                (BLOCK_N * V_STRIDE) + (BLOCK_M * S_STRIDE) +
                                (BLOCK_M * 3); // rowMax, rowSum, rowAlpha
 
-    // Local memory accessors
-    sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), it);
+    // Local memory using group_local_memory extension
+    auto shmem = syclex::group_local_memory_for_overwrite<float[SHMEM_SIZE]>(it.get_group());
 
     const int tid = it.get_local_id(0) + it.get_local_id(1) * it.get_local_range(0);
     const int gid_x = it.get_group(0); // Block row index
     const int gid_y = it.get_group(1); // Head index
     const int lid = it.get_local_id(0); // Thread within workgroup
-    const int sg_id = it.get_subgroup().get_id()[0]; // Subgroup ID (0 or 1)
+    auto sg = it.get_sub_group(); // Subgroup for matrix operations
+    const int sg_id = 0; // Single subgroup per workgroup for XMX
 
     // Calculate output row for this workgroup
     const int row0 = gid_x * BLOCK_M;
@@ -285,13 +288,19 @@ void flash_attn_coopmat_kernel(
     const ptrdiff_t m_offset = (ptrdiff_t)(head_idx * N + row0);
 
     // Local memory pointers
-    float * shQ = shmem.get_pointer() + 0;
+    float * shQ = shmem + 0;
     float * shK = shQ + BLOCK_M * Q_STRIDE;
     float * shV = shK + BLOCK_N * K_STRIDE;
     float * shS = shV + BLOCK_N * V_STRIDE;
     float * rowMax = shS + BLOCK_M * S_STRIDE;
     float * rowSum = rowMax + BLOCK_M;
     float * rowAlpha = rowSum + BLOCK_M;
+
+    // Multi_ptr for joint_matrix operations (local memory)
+    auto shQ_mp = sycl::multi_ptr<float, sycl::access::address_space::local_space, sycl::access::decorated::no>(shQ);
+    auto shK_mp = sycl::multi_ptr<float, sycl::access::address_space::local_space, sycl::access::decorated::no>(shK);
+    auto shV_mp = sycl::multi_ptr<float, sycl::access::address_space::local_space, sycl::access::decorated::no>(shV);
+    auto shS_mp = sycl::multi_ptr<float, sycl::access::address_space::local_space, sycl::access::decorated::no>(shS);
 
     // Initialize row statistics
     if (lid < BLOCK_M) {
@@ -323,9 +332,9 @@ void flash_attn_coopmat_kernel(
     constexpr int NUM_V_MATRICES = (HEAD_DIM + TM - 1) / TM; // 8 for HEAD_DIM=128
 
     // Initialize output accumulators
-    cm::joint_matrix<float, TM, TN, cm::use_accumulator> matO[NUM_V_MATRICES];
+    cm::joint_matrix<sycl::sub_group, float, cm::use::accumulator, TM, TN> matO[NUM_V_MATRICES];
     for (int i = 0; i < NUM_V_MATRICES; ++i) {
-        cm::joint_matrix_fill(matO[i], 0.0f);
+        cm::joint_matrix_fill(sg, matO[i], 0.0f);
     }
 
     // Process all K/V blocks
@@ -364,30 +373,32 @@ void flash_attn_coopmat_kernel(
         // Process Q rows assigned to this subgroup (sg_id * 16 to sg_id * 16 + 15)
         for (int j = 0; j < BLOCK_N; j += TN) {
             // Initialize score matrix for this 16x16 block
-            cm::joint_matrix<float, TM, TN, cm::use_accumulator> matS;
-            cm::joint_matrix_fill(matS, 0.0f);
+            cm::joint_matrix<sycl::sub_group, float, cm::use::accumulator, TM, TN> matS;
+            cm::joint_matrix_fill(sg, matS, 0.0f);
 
             // Multiply Q rows with K columns
             for (int k = 0; k < HEAD_DIM; k += TK) {
-                cm::joint_matrix<float, TM, TK, cm::use_a> mq;
-                cm::joint_matrix<float, TK, TN, cm::use_b> mk;
+                cm::joint_matrix<sycl::sub_group, float, cm::use::a, TM, TK> mq;
+                cm::joint_matrix<sycl::sub_group, float, cm::use::b, TK, TN> mk;
 
-                // Load Q tile: rows sg_id*16 to sg_id*16+15, columns k to k+15
-                cm::joint_matrix_load(
-                    mq, shQ,
-                    (sg_id * TM) * Q_STRIDE + k,
-                    Q_STRIDE
-                );
+                // Load Q tile from shared memory (manual load + joint_matrix_fill)
+                for (int i = 0; i < TM; ++i) {
+                    for (int j = 0; j < TK; ++j) {
+                        mq[i * TK + j] = shQ[(sg_id * TM + i) * Q_STRIDE + k + j];
+                    }
+                }
+                cm::joint_matrix_fill(sg, mq, 0.0f); // Clear first
 
-                // Load K tile: rows j to j+15, columns k to k+15
-                cm::joint_matrix_load(
-                    mk, shK,
-                    j * K_STRIDE + k,
-                    K_STRIDE
-                );
+                // Load K tile from shared memory
+                for (int i = 0; i < TK; ++i) {
+                    for (int j = 0; j < TN; ++j) {
+                        mk[i * TN + j] = shK[(j + i) * K_STRIDE + k + j];
+                    }
+                }
+                cm::joint_matrix_fill(sg, mk, 0.0f); // Clear first
 
                 // matS += mq * mk
-                matS = cm::joint_matrix_multiply_add(mq, mk, matS);
+                cm::joint_matrix_mad(sg, matS, mq, mk, matS);
             }
 
             // Store score matrix to shared memory
@@ -484,7 +495,7 @@ void flash_attn_coopmat_kernel(
                     k * V_STRIDE + i * TM,
                     V_STRIDE
                 );
-                matO[i] = cm::joint_matrix_multiply_add(mp, mv, matO[i]);
+                matO[i] = cm::joint_matrix_mad(mp, mv, matO[i]);
             }
         }
     }
