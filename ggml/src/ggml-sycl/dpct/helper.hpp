@@ -18,6 +18,13 @@
 #include <oneapi/mkl.hpp>
 
 #include <map>
+// Allow to use the same namespace for Intel oneMKL and oneMath
+namespace oneapi {
+    namespace math = mkl;
+}
+#else
+#include <syclcompat/math.hpp>
+#endif
 
 #include "ggml.h"
 
