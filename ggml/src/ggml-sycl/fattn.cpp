@@ -709,8 +709,10 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
     constexpr int V_STRIDE = PADDED_HEAD_DIM + 8;
     constexpr int P_STRIDE = BLOCK_N + 8;
     constexpr int S_STRIDE = BLOCK_N + 8;
-    constexpr size_t BF16_BYTES = (BLOCK_M * Q_STRIDE + BLOCK_N * K_STRIDE + 
-                                    BLOCK_N * V_STRIDE + BLOCK_M * P_STRIDE) * sizeof(sycl::half);
+    constexpr int V_T_STRIDE = BLOCK_N;  // Stride for V^T (stored transposed)
+    constexpr size_t BF16_BYTES = (BLOCK_M * Q_STRIDE + BLOCK_N * K_STRIDE +
+                                    BLOCK_N * V_STRIDE + BLOCK_M * P_STRIDE +
+                                    BLOCK_N * V_T_STRIDE) * sizeof(sycl::half);
     constexpr size_t FLOAT_BYTES = (BLOCK_M * S_STRIDE + BLOCK_M * 3 + BLOCK_M * PADDED_HEAD_DIM) * sizeof(float);
     constexpr size_t SHMEM_SIZE = (BF16_BYTES + FLOAT_BYTES + sizeof(float) - 1) / sizeof(float);
 

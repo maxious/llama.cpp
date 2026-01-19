@@ -288,13 +288,15 @@ inline void flash_attn_coopmat_kernel(
     // [bf16: K (BLOCK_N * K_STRIDE)]
     // [bf16: V (BLOCK_N * V_STRIDE)]
     // [bf16: P (BLOCK_M * P_STRIDE)] - for storing bf16 attention probs
+    // [bf16: VT (HEAD_DIM * BLOCK_N)] - V^T buffer (separate from K to avoid corruption)
     // [float: S (BLOCK_M * S_STRIDE)] - attention scores
     // [float: rowMax (BLOCK_M)]
     // [float: rowSum (BLOCK_M)]
     // [float: rowAlpha (BLOCK_M)]
     // [float: shAcc (BLOCK_M * HEAD_DIM)] - output accumulator
-    constexpr int BF16_SIZE = (BLOCK_M * Q_STRIDE) + (BLOCK_N * K_STRIDE) + 
-                               (BLOCK_N * V_STRIDE) + (BLOCK_M * P_STRIDE);
+    constexpr int BF16_SIZE = (BLOCK_M * Q_STRIDE) + (BLOCK_N * K_STRIDE) +
+                               (BLOCK_N * V_STRIDE) + (BLOCK_M * P_STRIDE) +
+                               (HEAD_DIM * V_T_STRIDE);
     constexpr int FLOAT_SIZE = (BLOCK_M * S_STRIDE) + (BLOCK_M * 3) + (BLOCK_M * HEAD_DIM);
 
     const int lid = it.get_local_id(0);
@@ -323,10 +325,11 @@ inline void flash_attn_coopmat_kernel(
     xmx_bfloat16 * shQ = reinterpret_cast<xmx_bfloat16*>(shmem);
     xmx_bfloat16 * shK = shQ + BLOCK_M * Q_STRIDE;
     xmx_bfloat16 * shV = shK + BLOCK_N * K_STRIDE;
-    xmx_bfloat16 * shP = shV + BLOCK_N * V_STRIDE;  // bf16 attention probs for P@V
+    xmx_bfloat16 * shP = shV + BLOCK_N * V_STRIDE;
+    xmx_bfloat16 * shVT = shP + BLOCK_M * P_STRIDE;  // V^T buffer (separate from K)
 
     // Float shared memory for softmax scores and output accumulator
-    float * shS = reinterpret_cast<float*>(shP + BLOCK_M * P_STRIDE);
+    float * shS = reinterpret_cast<float*>(shVT + HEAD_DIM * V_T_STRIDE);
     float * rowMax = shS + BLOCK_M * S_STRIDE;
     float * rowSum = rowMax + BLOCK_M;
     float * rowAlpha = rowSum + BLOCK_M;
@@ -425,14 +428,14 @@ inline void flash_attn_coopmat_kernel(
         // ============ Transpose V for P@V computation ============
         // V is currently stored as [BLOCK_N x HEAD_DIM] row-major in shV
         // For P@V, we need V^T which is [HEAD_DIM x BLOCK_N] column-major
-        // Write to shK (no longer needed after Q@K^T) to avoid in-place race condition
+        // Write to shVT (separate buffer to avoid corrupting shK)
         // V^T[col, row] = V[row, col], stored col-major with stride BLOCK_N
         for (int i = lid; i < BLOCK_N * HEAD_DIM; i += THREADS) {
             const int row = i / HEAD_DIM;  // 0 to BLOCK_N-1
             const int col = i % HEAD_DIM;  // 0 to HEAD_DIM-1
-            // Read V[row, col] from shV, write V^T[col, row] to shK
+            // Read V[row, col] from shV, write V^T[col, row] to shVT
             // In col-major: element at (col, row) is at offset col * BLOCK_N + row
-            shK[col * BLOCK_N + row] = shV[row * V_STRIDE + col];
+            shVT[col * BLOCK_N + row] = shV[row * V_STRIDE + col];
         }
 
         it.barrier(sycl::access::fence_space::local_space);
@@ -519,12 +522,12 @@ inline void flash_attn_coopmat_kernel(
                     sycl::access::decorated::yes>(&shP[(sg_id * TM) * P_STRIDE + k]);
                 joint_matrix_load(sg, mp, shP_ptr, P_STRIDE);
 
-                // V^T tile: TK x TN stored in shK (col-major with stride BLOCK_N)
+                // V^T tile: TK x TN stored in shVT (col-major with stride BLOCK_N)
                 // V^T[k:k+TK, out_tile*TN:out_tile*TN+TN] at offset k + out_tile*TN*BLOCK_N
                 joint_matrix<sycl::sub_group, xmx_bfloat16, use::b, TK, TN, layout::col_major> mv;
                 auto shV_ptr = sycl::address_space_cast<
                     sycl::access::address_space::local_space,
-                    sycl::access::decorated::yes>(&shK[k + out_tile * TN * V_T_STRIDE]);
+                    sycl::access::decorated::yes>(&shVT[k + out_tile * TN * V_T_STRIDE]);
                 joint_matrix_load(sg, mv, shV_ptr, V_T_STRIDE);
 
                 joint_matrix_mad(sg, matPV, mp, mv, matPV);
@@ -696,9 +699,10 @@ inline void flash_attn_coopmat_kernel_padded(
     xmx_bfloat16 * shK = shQ + BLOCK_M * Q_STRIDE;
     xmx_bfloat16 * shV = shK + BLOCK_N * K_STRIDE;
     xmx_bfloat16 * shP = shV + BLOCK_N * V_STRIDE;
+    xmx_bfloat16 * shVT = shP + BLOCK_M * P_STRIDE;  // V^T buffer (separate from shK to avoid corruption)
 
     // Float shared memory for softmax scores and output accumulator
-    float * shS = reinterpret_cast<float*>(shP + BLOCK_M * P_STRIDE);
+    float * shS = reinterpret_cast<float*>(shVT + BLOCK_N * V_T_STRIDE);
     float * rowMax = shS + BLOCK_M * S_STRIDE;
     float * rowSum = rowMax + BLOCK_M;
     float * rowAlpha = rowSum + BLOCK_M;
@@ -841,7 +845,7 @@ inline void flash_attn_coopmat_kernel_padded(
 
         // ============ Transpose V for P@V computation ============
         // V is stored as [BLOCK_N x PADDED_HEAD_DIM] row-major in shV
-        // Write V^T to shK (no longer needed after Q@K^T) to avoid race condition
+        // Write V^T to shVT (separate buffer to avoid corrupting shK)
         // V^T is [PADDED_HEAD_DIM x BLOCK_N] col-major with stride BLOCK_N
         constexpr int V_T_STRIDE = BLOCK_N;
         for (int i = lid; i < BLOCK_N * PADDED_HEAD_DIM; i += THREADS) {
@@ -849,67 +853,62 @@ inline void flash_attn_coopmat_kernel_padded(
             const int col = i % PADDED_HEAD_DIM;
             // Only copy actual HEAD_DIM data, padding elements are zero
             if (col < HEAD_DIM) {
-                shK[col * BLOCK_N + row] = shV[row * V_STRIDE + col];
+                shVT[col * BLOCK_N + row] = shV[row * V_STRIDE + col];
             } else {
-                shK[col * BLOCK_N + row] = xmx_bfloat16(0.0f);  // Zero for padding
+                shVT[col * BLOCK_N + row] = xmx_bfloat16(0.0f);  // Zero for padding
             }
         }
 
         it.barrier(sycl::access::fence_space::local_space);
 
         // ============ P @ V computation ============
-        // For each K block, compute P@V and write to output positions
-        // corresponding to the K block's sequence positions
-        for (int kv_block = 0; kv_block < num_kv_blocks; ++kv_block) {
-            const int col0 = kv_block * BLOCK_N;
+        // Compute P @ V^T for this KV block and accumulate to output
+        for (int tile_col = 0; tile_col < BLOCK_N; tile_col += TN) {
+            joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN, layout::dynamic> matPV;
+            joint_matrix_fill(sg, matPV, 0.0f);
 
-            for (int tile_col = 0; tile_col < BLOCK_N; tile_col += TN) {
-                joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN, layout::dynamic> matPV;
-                joint_matrix_fill(sg, matPV, 0.0f);
-
-                for (int k = 0; k < BLOCK_N; k += TK) {
-                    joint_matrix<sycl::sub_group, xmx_bfloat16, use::a, TM, TK, layout::row_major> mp;
-                    auto shP_ptr = sycl::address_space_cast<
-                        sycl::access::address_space::local_space,
-                        sycl::access::decorated::yes>(&shP[(sg_id * TM) * P_STRIDE + k]);
-                    joint_matrix_load(sg, mp, shP_ptr, P_STRIDE);
-
-                    joint_matrix<sycl::sub_group, xmx_bfloat16, use::b, TK, TN, layout::col_major> mv;
-                    // V^T is stored in shK with stride V_T_STRIDE (BLOCK_N)
-                    // V^T[row, col] = shK[col * BLOCK_N + row]
-                    // For this tile, read V^T columns [tile_col, tile_col+TN) which is
-                    // shK indices [tile_col*BLOCK_N + k, tile_col*BLOCK_N + k + TK)
-                    auto shV_ptr = sycl::address_space_cast<
-                        sycl::access::address_space::local_space,
-                        sycl::access::decorated::yes>(&shK[k + tile_col * V_T_STRIDE]);
-                    joint_matrix_load(sg, mv, shV_ptr, V_T_STRIDE);
-
-                    joint_matrix_mad(sg, matPV, mp, mv, matPV);
-                }
-
-                // Add PV contribution to output accumulator
-                const int scratch_offset = sg_id * TM * TN;
-                auto scratch_ptr = sycl::address_space_cast<
+            for (int k = 0; k < BLOCK_N; k += TK) {
+                joint_matrix<sycl::sub_group, xmx_bfloat16, use::a, TM, TK, layout::row_major> mp;
+                auto shP_ptr = sycl::address_space_cast<
                     sycl::access::address_space::local_space,
-                    sycl::access::decorated::yes>(&shS[scratch_offset]);
-                joint_matrix_store(sg, matPV, scratch_ptr, TN, layout::row_major);
-                it.barrier(sycl::access::fence_space::local_space);
+                    sycl::access::decorated::yes>(&shP[(sg_id * TM) * P_STRIDE + k]);
+                joint_matrix_load(sg, mp, shP_ptr, P_STRIDE);
 
-                const int sg_lane = sg.get_local_linear_id();
-                const int sg_size = sg.get_local_linear_range();
-                for (int idx = sg_lane; idx < TM * TN; idx += sg_size) {
-                    const int local_row = idx / TN;
-                    const int local_col = idx % TN;
-                    const int global_row = sg_id * TM + local_row;
-                    // Output position: K block start + tile offset + position within tile
-                    const int global_col = col0 + tile_col + local_col;
-                    if (global_row < BLOCK_M && global_col < PADDED_HEAD_DIM) {
-                        shAcc[global_row * PADDED_HEAD_DIM + global_col] += shS[scratch_offset + idx];
-                    }
-                }
+                joint_matrix<sycl::sub_group, xmx_bfloat16, use::b, TK, TN, layout::col_major> mv;
+                // V^T is stored in shVT with stride V_T_STRIDE (BLOCK_N)
+                // V^T[row, col] = shVT[col * BLOCK_N + row]
+                // For this tile, read V^T columns [tile_col, tile_col+TN) which is
+                // shVT indices [tile_col*BLOCK_N + k, tile_col*BLOCK_N + k + TK)
+                auto shV_ptr = sycl::address_space_cast<
+                    sycl::access::address_space::local_space,
+                    sycl::access::decorated::yes>(&shVT[k + tile_col * V_T_STRIDE]);
+                joint_matrix_load(sg, mv, shV_ptr, V_T_STRIDE);
 
-                it.barrier(sycl::access::fence_space::local_space);
+                joint_matrix_mad(sg, matPV, mp, mv, matPV);
             }
+
+            // Add PV contribution to output accumulator
+            const int scratch_offset = sg_id * TM * TN;
+            auto scratch_ptr = sycl::address_space_cast<
+                sycl::access::address_space::local_space,
+                sycl::access::decorated::yes>(&shS[scratch_offset]);
+            joint_matrix_store(sg, matPV, scratch_ptr, TN, layout::row_major);
+            it.barrier(sycl::access::fence_space::local_space);
+
+            const int sg_lane = sg.get_local_linear_id();
+            const int sg_size = sg.get_local_linear_range();
+            for (int idx = sg_lane; idx < TM * TN; idx += sg_size) {
+                const int local_row = idx / TN;
+                const int local_col = idx % TN;
+                const int global_row = sg_id * TM + local_row;
+                // Output position: K block start + tile offset + position within tile
+                const int global_col = col0 + tile_col + local_col;
+                if (global_row < BLOCK_M && global_col < PADDED_HEAD_DIM) {
+                    shAcc[global_row * PADDED_HEAD_DIM + global_col] += shS[scratch_offset + idx];
+                }
+            }
+
+            it.barrier(sycl::access::fence_space::local_space);
         }
     }
 
