@@ -842,60 +842,74 @@ inline void flash_attn_coopmat_kernel_padded(
         // ============ Transpose V for P@V computation ============
         // V is stored as [BLOCK_N x PADDED_HEAD_DIM] row-major in shV
         // Write V^T to shK (no longer needed after Q@K^T) to avoid race condition
-        // V^T is [HEAD_DIM x BLOCK_N] col-major with stride BLOCK_N
+        // V^T is [PADDED_HEAD_DIM x BLOCK_N] col-major with stride BLOCK_N
         constexpr int V_T_STRIDE = BLOCK_N;
-        for (int i = lid; i < BLOCK_N * HEAD_DIM; i += THREADS) {
-            const int row = i / HEAD_DIM;
-            const int col = i % HEAD_DIM;
-            shK[col * BLOCK_N + row] = shV[row * V_STRIDE + col];
+        for (int i = lid; i < BLOCK_N * PADDED_HEAD_DIM; i += THREADS) {
+            const int row = i / PADDED_HEAD_DIM;
+            const int col = i % PADDED_HEAD_DIM;
+            // Only copy actual HEAD_DIM data, padding elements are zero
+            if (col < HEAD_DIM) {
+                shK[col * BLOCK_N + row] = shV[row * V_STRIDE + col];
+            } else {
+                shK[col * BLOCK_N + row] = xmx_bfloat16(0.0f);  // Zero for padding
+            }
         }
 
         it.barrier(sycl::access::fence_space::local_space);
 
         // ============ P @ V computation ============
-        constexpr int NUM_OUT_TILES = PADDED_HEAD_DIM / TN;
-        
-        for (int out_tile = 0; out_tile < NUM_OUT_TILES; ++out_tile) {
-            joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN, layout::dynamic> matPV;
-            joint_matrix_fill(sg, matPV, 0.0f);
+        // For each K block, compute P@V and write to output positions
+        // corresponding to the K block's sequence positions
+        for (int kv_block = 0; kv_block < num_kv_blocks; ++kv_block) {
+            const int col0 = kv_block * BLOCK_N;
 
-            for (int k = 0; k < BLOCK_N; k += TK) {
-                joint_matrix<sycl::sub_group, xmx_bfloat16, use::a, TM, TK, layout::row_major> mp;
-                auto shP_ptr = sycl::address_space_cast<
-                    sycl::access::address_space::local_space,
-                    sycl::access::decorated::yes>(&shP[(sg_id * TM) * P_STRIDE + k]);
-                joint_matrix_load(sg, mp, shP_ptr, P_STRIDE);
+            for (int tile_col = 0; tile_col < BLOCK_N; tile_col += TN) {
+                joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN, layout::dynamic> matPV;
+                joint_matrix_fill(sg, matPV, 0.0f);
 
-                joint_matrix<sycl::sub_group, xmx_bfloat16, use::b, TK, TN, layout::col_major> mv;
-                auto shV_ptr = sycl::address_space_cast<
-                    sycl::access::address_space::local_space,
-                    sycl::access::decorated::yes>(&shK[k + out_tile * TN * V_T_STRIDE]);
-                joint_matrix_load(sg, mv, shV_ptr, V_T_STRIDE);
+                for (int k = 0; k < BLOCK_N; k += TK) {
+                    joint_matrix<sycl::sub_group, xmx_bfloat16, use::a, TM, TK, layout::row_major> mp;
+                    auto shP_ptr = sycl::address_space_cast<
+                        sycl::access::address_space::local_space,
+                        sycl::access::decorated::yes>(&shP[(sg_id * TM) * P_STRIDE + k]);
+                    joint_matrix_load(sg, mp, shP_ptr, P_STRIDE);
 
-                joint_matrix_mad(sg, matPV, mp, mv, matPV);
-            }
+                    joint_matrix<sycl::sub_group, xmx_bfloat16, use::b, TK, TN, layout::col_major> mv;
+                    // V^T is stored in shK with stride V_T_STRIDE (BLOCK_N)
+                    // V^T[row, col] = shK[col * BLOCK_N + row]
+                    // For this tile, read V^T columns [tile_col, tile_col+TN) which is
+                    // shK indices [tile_col*BLOCK_N + k, tile_col*BLOCK_N + k + TK)
+                    auto shV_ptr = sycl::address_space_cast<
+                        sycl::access::address_space::local_space,
+                        sycl::access::decorated::yes>(&shK[k + tile_col * V_T_STRIDE]);
+                    joint_matrix_load(sg, mv, shV_ptr, V_T_STRIDE);
 
-            // Add PV contribution to output accumulator
-            const int scratch_offset = sg_id * TM * TN;
-            auto scratch_ptr = sycl::address_space_cast<
-                sycl::access::address_space::local_space,
-                sycl::access::decorated::yes>(&shS[scratch_offset]);
-            joint_matrix_store(sg, matPV, scratch_ptr, TN, layout::row_major);
-            it.barrier(sycl::access::fence_space::local_space);
-
-            const int sg_lane = sg.get_local_linear_id();
-            const int sg_size = sg.get_local_linear_range();
-            for (int idx = sg_lane; idx < TM * TN; idx += sg_size) {
-                const int local_row = idx / TN;
-                const int local_col = idx % TN;
-                const int global_row = sg_id * TM + local_row;
-                const int global_col = out_tile * TN + local_col;
-                if (global_row < BLOCK_M && global_col < PADDED_HEAD_DIM) {
-                    shAcc[global_row * PADDED_HEAD_DIM + global_col] += shS[scratch_offset + idx];
+                    joint_matrix_mad(sg, matPV, mp, mv, matPV);
                 }
-            }
 
-            it.barrier(sycl::access::fence_space::local_space);
+                // Add PV contribution to output accumulator
+                const int scratch_offset = sg_id * TM * TN;
+                auto scratch_ptr = sycl::address_space_cast<
+                    sycl::access::address_space::local_space,
+                    sycl::access::decorated::yes>(&shS[scratch_offset]);
+                joint_matrix_store(sg, matPV, scratch_ptr, TN, layout::row_major);
+                it.barrier(sycl::access::fence_space::local_space);
+
+                const int sg_lane = sg.get_local_linear_id();
+                const int sg_size = sg.get_local_linear_range();
+                for (int idx = sg_lane; idx < TM * TN; idx += sg_size) {
+                    const int local_row = idx / TN;
+                    const int local_col = idx % TN;
+                    const int global_row = sg_id * TM + local_row;
+                    // Output position: K block start + tile offset + position within tile
+                    const int global_col = col0 + tile_col + local_col;
+                    if (global_row < BLOCK_M && global_col < PADDED_HEAD_DIM) {
+                        shAcc[global_row * PADDED_HEAD_DIM + global_col] += shS[scratch_offset + idx];
+                    }
+                }
+
+                it.barrier(sycl::access::fence_space::local_space);
+            }
         }
     }
 
