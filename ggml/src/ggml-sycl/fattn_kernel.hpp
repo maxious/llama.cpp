@@ -192,16 +192,47 @@ namespace cm = sycl::ext::oneapi::experimental::matrix;
 // but NOT fp32 matrices for joint_matrix A/B operands on some devices (including Arc B60)
 using bfloat16 = sycl::ext::oneapi::bfloat16;
 
+// Tile size enum for different Intel GPU architectures
+// DG2/Arc (Xe2) supports 8x8x16, PVC supports 8x16x16, AMX supports 16x16x32
+enum class xmx_tile_kind { tile_8x8, tile_16x16 };
+
 // Check if device supports cooperative matrices
 inline bool ggml_sycl_has_coopmat_support(sycl::device device) {
     return device.has(sycl::aspect::ext_intel_gpu_eu_simd_width) &&
            device.has(sycl::aspect::ext_intel_matrix);
 }
 
+// Determine tile kind based on device architecture
+// Arc B60/Battlemage (Xe2) actually reports nsize=16 in matrix_combinations,
+// meaning it uses 8x16x16 tiles like PVC, not 8x8x16 like DG2
+inline xmx_tile_kind ggml_sycl_get_tile_kind(sycl::device device) {
+    // Query actual matrix combinations to determine tile kind
+    auto combinations = device.get_info<sycl::ext::oneapi::experimental::info::device::matrix_combinations>();
+    for (const auto& c : combinations) {
+        // Look for bf16 or fp16 combinations (atype 0 or 1)
+        if (c.atype == sycl::ext::oneapi::experimental::matrix::matrix_type::bf16 ||
+            c.atype == sycl::ext::oneapi::experimental::matrix::matrix_type::fp16) {
+            if (c.nsize == 16 || c.max_nsize == 16) {
+                // PVC-like: 8x16x16 tiles
+                return xmx_tile_kind::tile_16x16;  // Use 16 for the N dimension
+            } else if (c.nsize == 8 || c.max_nsize == 8) {
+                // DG2: 8x8x16 tiles
+                return xmx_tile_kind::tile_8x8;
+            }
+        }
+    }
+    // Default to 16x16 if we can't determine
+    return xmx_tile_kind::tile_16x16;
+}
+
 // Intel XMX Flash Attention using cooperative matrices
 // Uses bfloat16 for XMX A/B matrices and float for accumulators
 // Type conversion happens at shared memory boundaries
-template <int64_t HEAD_DIM>
+// 
+// Template parameters:
+// - HEAD_DIM: head dimension (32, 64, 96, 128, 256)
+// - TM, TN, TK: joint matrix tile sizes (8x8x16 for DG2/Arc, 16x16x16 for PVC)
+template <int64_t HEAD_DIM, int TM = 8, int TN = 8, int TK = 16>
 inline void flash_attn_coopmat_kernel(
     sycl::nd_item<2> it,
     const float * Q,
@@ -225,29 +256,43 @@ inline void flash_attn_coopmat_kernel(
     constexpr int BLOCK_N = 32;
     constexpr int THREADS = 64;
 
-    constexpr int TM = 16;
-    constexpr int TN = 16;
-    constexpr int TK = 16;
+    // Number of subgroups covering the M dimension
+    constexpr int NUM_SG_M = BLOCK_M / TM;
 
-    constexpr int Q_STRIDE = HEAD_DIM + 8;
+    constexpr int Q_STRIDE = HEAD_DIM + 8;  // Padding for bank conflict avoidance
     constexpr int K_STRIDE = HEAD_DIM + 8;
     constexpr int V_STRIDE = HEAD_DIM + 8;
     constexpr int S_STRIDE = BLOCK_N + 8;
+    constexpr int P_STRIDE = BLOCK_N + 8;   // P matrix stride (for bf16 P)
 
-    // Number of accumulator matrices needed for output
-    constexpr int NUM_V_MATRICES = (HEAD_DIM + TM - 1) / TM;
+    // Ensure BLOCK_N is divisible by TK for P@V computation
+    static_assert(BLOCK_N % TK == 0, "BLOCK_N must be divisible by TK for P@V matmul");
+    static_assert(HEAD_DIM % TN == 0, "HEAD_DIM must be divisible by TN for output tiles");
 
-    // Shared memory layout:
-    // [bfloat16 tiles: Q, K, V] + [float tiles: S, rowMax, rowSum, rowAlpha, accumulators]
-    constexpr int BF16_TILE_SIZE = (BLOCK_M * Q_STRIDE) + (BLOCK_N * K_STRIDE) + (BLOCK_N * V_STRIDE);
-    constexpr int SHMEM_SIZE = BF16_TILE_SIZE + (BLOCK_M * S_STRIDE) + (BLOCK_M * 3) +
-                               (NUM_V_MATRICES * HEAD_DIM * 2); // For accumulator spills
+    // Shared memory layout (all sizes in floats/bf16 as noted):
+    // [bf16: Q (BLOCK_M * Q_STRIDE)]
+    // [bf16: K (BLOCK_N * K_STRIDE)]
+    // [bf16: V (BLOCK_N * V_STRIDE)]
+    // [bf16: P (BLOCK_M * P_STRIDE)] - for storing bf16 attention probs
+    // [float: S (BLOCK_M * S_STRIDE)] - attention scores
+    // [float: rowMax (BLOCK_M)]
+    // [float: rowSum (BLOCK_M)]
+    // [float: rowAlpha (BLOCK_M)]
+    // [float: shAcc (BLOCK_M * HEAD_DIM)] - output accumulator
+    constexpr int BF16_SIZE = (BLOCK_M * Q_STRIDE) + (BLOCK_N * K_STRIDE) + 
+                               (BLOCK_N * V_STRIDE) + (BLOCK_M * P_STRIDE);
+    constexpr int FLOAT_SIZE = (BLOCK_M * S_STRIDE) + (BLOCK_M * 3) + (BLOCK_M * HEAD_DIM);
 
     const int lid = it.get_local_id(0);
     const int gid_x = it.get_group(0);
     const int gid_y = it.get_group(1);
     auto sg = it.get_sub_group();
-    const int sg_id = 0;
+    
+    // Get actual subgroup ID - critical for correct tiling
+    const int sg_id = sg.get_group_linear_id();
+    
+    // Each subgroup handles TM rows; guard if we have more subgroups than needed
+    if (sg_id >= NUM_SG_M) return;
 
     const int row0 = gid_x * BLOCK_M;
     if (row0 >= N) return;
@@ -259,29 +304,30 @@ inline void flash_attn_coopmat_kernel(
     const ptrdiff_t k_offset = (ptrdiff_t)(kv_head_idx * N) * HEAD_DIM;
     const ptrdiff_t v_offset = (ptrdiff_t)(kv_head_idx * N) * HEAD_DIM;
     const ptrdiff_t o_offset = (ptrdiff_t)(head_idx * N + row0) * HEAD_DIM;
-    const ptrdiff_t l_offset = (ptrdiff_t)(head_idx * N + row0);
-    const ptrdiff_t m_offset = (ptrdiff_t)(head_idx * N + row0);
 
     // Bfloat16 shared memory for XMX tiles
     bfloat16 * shQ = reinterpret_cast<bfloat16*>(shmem);
     bfloat16 * shK = shQ + BLOCK_M * Q_STRIDE;
     bfloat16 * shV = shK + BLOCK_N * K_STRIDE;
+    bfloat16 * shP = shV + BLOCK_N * V_STRIDE;  // bf16 attention probs for P@V
 
-    // Float shared memory for softmax scores and accumulators
-    float * shS = reinterpret_cast<float*>(shK + BLOCK_N * K_STRIDE + BLOCK_N * V_STRIDE);
+    // Float shared memory for softmax scores and output accumulator
+    float * shS = reinterpret_cast<float*>(shP + BLOCK_M * P_STRIDE);
     float * rowMax = shS + BLOCK_M * S_STRIDE;
     float * rowSum = rowMax + BLOCK_M;
     float * rowAlpha = rowSum + BLOCK_M;
+    float * shAcc = rowAlpha + BLOCK_M;  // Output accumulator [BLOCK_M x HEAD_DIM]
 
-    // Accumulator spill buffer (float, since accumulators are float)
-    float * accum_scratch = rowAlpha + BLOCK_M;
-
+    // Initialize per-row stats and output accumulator
     if (lid < BLOCK_M) {
         rowMax[lid] = -1.0e20f;
         rowSum[lid] = 0.0f;
     }
+    for (int i = lid; i < BLOCK_M * HEAD_DIM; i += THREADS) {
+        shAcc[i] = 0.0f;
+    }
 
-    // Load Q tiles with bfloat16 conversion for XMX
+    // Load Q tiles with bfloat16 conversion and scale
     for (int i = lid; i < BLOCK_M * HEAD_DIM; i += THREADS) {
         const int r = i / HEAD_DIM;
         const int c = i % HEAD_DIM;
@@ -298,18 +344,13 @@ inline void flash_attn_coopmat_kernel(
 
     const int num_kv_blocks = (N + BLOCK_N - 1) / BLOCK_N;
 
-    // Output accumulator - stays as float for precision
-    joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN, layout::dynamic> matO[NUM_V_MATRICES];
-    for (int i = 0; i < NUM_V_MATRICES; ++i) {
-        joint_matrix_fill(sg, matO[i], 0.0f);
-    }
-
     for (int kv_block = 0; kv_block < num_kv_blocks; ++kv_block) {
         const int col0 = kv_block * BLOCK_N;
 
+        // Early exit for causal attention
         if (causal == 1 && col0 > row0 + BLOCK_M) continue;
 
-        // Load K and V tiles with bfloat16 conversion for XMX
+        // Load K and V tiles with bfloat16 conversion
         for (int i = lid; i < BLOCK_N * HEAD_DIM; i += THREADS) {
             const int r = i / HEAD_DIM;
             const int c = i % HEAD_DIM;
@@ -330,13 +371,15 @@ inline void flash_attn_coopmat_kernel(
 
         it.barrier(sycl::access::fence_space::local_space);
 
-        // Q @ K^T computation using bfloat16 for XMX A/B matrices
+        // ============ Q @ K^T computation ============
+        // Each subgroup computes TM rows of the BLOCK_M x BLOCK_N score matrix
         for (int j = 0; j < BLOCK_N; j += TN) {
             joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN, layout::dynamic> matS;
             joint_matrix_fill(sg, matS, 0.0f);
 
             for (int k = 0; k < HEAD_DIM; k += TK) {
-                // Use bfloat16 for A and B matrices - REQUIRED for XMX
+                // Q is TM x TK (row-major), K^T is TK x TN
+                // For K^T, we load K columns as rows using col_major layout
                 joint_matrix<sycl::sub_group, bfloat16, use::a, TM, TK, layout::row_major> mq;
                 joint_matrix<sycl::sub_group, bfloat16, use::b, TK, TN, layout::col_major> mk;
 
@@ -350,10 +393,10 @@ inline void flash_attn_coopmat_kernel(
                 joint_matrix_load(sg, mq, mq_ptr, Q_STRIDE);
                 joint_matrix_load(sg, mk, mk_ptr, K_STRIDE);
 
-                // oneAPI 2025.3: joint_matrix_mad takes 5 args (Group, D, A, B, C), returns void
                 joint_matrix_mad(sg, matS, mq, mk, matS);
             }
 
+            // Store score tile to shared memory
             auto shS_ptr = sycl::address_space_cast<
                 sycl::access::address_space::local_space,
                 sycl::access::decorated::yes>(&shS[(sg_id * TM) * S_STRIDE + j]);
@@ -362,18 +405,22 @@ inline void flash_attn_coopmat_kernel(
 
         it.barrier(sycl::access::fence_space::local_space);
 
-        // Softmax on scores - uses float shS
+        // ============ Online Softmax ============
+        // Each thread handles one row of the score matrix
         if (lid < BLOCK_M) {
             const int row = lid;
             float m = -1.0e20f;
 
+            // Find max with masking
             for (int c = 0; c < BLOCK_N; ++c) {
                 float s_val = shS[row * S_STRIDE + c];
 
+                // Causal mask: don't attend to future positions
                 if (causal == 1 && col0 + c > row0 + row) {
                     s_val = -1.0e20f;
                 }
 
+                // Sliding window mask
                 if (window_size > 0 && col0 + c < row0 + row - window_size + 1) {
                     s_val = -1.0e20f;
                 }
@@ -382,12 +429,14 @@ inline void flash_attn_coopmat_kernel(
                 m = sycl::fmax(m, s_val);
             }
 
+            // Online softmax update
             float m_prev = rowMax[row];
             float m_new = sycl::fmax(m_prev, m);
             float alpha = sycl::exp(sycl::fmax(m_prev - m_new, -20.0f));
             rowAlpha[row] = alpha;
             rowMax[row] = m_new;
 
+            // Compute exp and sum
             float s_sum = 0.0f;
             for (int c = 0; c < BLOCK_N; ++c) {
                 float s_val = shS[row * S_STRIDE + c];
@@ -400,89 +449,131 @@ inline void flash_attn_coopmat_kernel(
 
         it.barrier(sycl::access::fence_space::local_space);
 
-        // Store accumulators to scratch buffer (float, matches accumulator type)
-        for (int i = 0; i < NUM_V_MATRICES; ++i) {
-            auto scratch_ptr = sycl::address_space_cast<
-                sycl::access::address_space::local_space,
-                sycl::access::decorated::yes>(&accum_scratch[i * HEAD_DIM]);
-            joint_matrix_store(sg, matO[i], scratch_ptr, HEAD_DIM, layout::row_major);
+        // ============ Scale previous output by alpha ============
+        for (int i = lid; i < BLOCK_M * HEAD_DIM; i += THREADS) {
+            const int row = i / HEAD_DIM;
+            shAcc[i] *= rowAlpha[row];
         }
-        it.barrier(sycl::access::fence_space::local_space);
 
-        // Scale by rowAlpha and convert to bfloat16 for XMX
-        for (int i = lid; i < NUM_V_MATRICES * HEAD_DIM; i += THREADS) {
-            const int mat_idx = i / HEAD_DIM;
-            const int r = i % HEAD_DIM;
-            const int row = sg_id * TM + r;
-            float scaled_val = accum_scratch[i] * rowAlpha[row];
-            // Store back to shK as bfloat16 for XMX load
-            shK[i] = bfloat16(scaled_val);
-        }
-        it.barrier(sycl::access::fence_space::local_space);
-
-        // Load scaled accumulators back
-        for (int i = 0; i < NUM_V_MATRICES; ++i) {
-            auto scratch_ptr = sycl::address_space_cast<
-                sycl::access::address_space::local_space,
-                sycl::access::decorated::yes>(&accum_scratch[i * HEAD_DIM]);
-            joint_matrix_load(sg, matO[i], scratch_ptr, HEAD_DIM);
-        }
-        it.barrier(sycl::access::fence_space::local_space);
-
-        // Convert P (shS, float) to bfloat16 for XMX P @ V computation
-        // Reuse beginning of shK for P_bf16 storage (K tiles are done)
+        // ============ Convert P to bfloat16 for XMX ============
         for (int i = lid; i < BLOCK_M * BLOCK_N; i += THREADS) {
             const int row = i / BLOCK_N;
             const int col = i % BLOCK_N;
-            if (row < BLOCK_M && col < BLOCK_N) {
-                shK[i] = bfloat16(shS[row * S_STRIDE + col]);
-            }
+            shP[row * P_STRIDE + col] = bfloat16(shS[row * S_STRIDE + col]);
         }
+
         it.barrier(sycl::access::fence_space::local_space);
 
-        // P @ V computation - P (shK as bfloat16), V (shV as bfloat16)
-        for (int k = 0; k < BLOCK_N; k += TN) {
-            joint_matrix<sycl::sub_group, bfloat16, use::a, TM, TN, layout::row_major> mp;
-            auto shP_bf16_ptr = sycl::address_space_cast<
-                sycl::access::address_space::local_space,
-                sycl::access::decorated::yes>(&shK[(sg_id * TM) * BLOCK_N + k]);
-            joint_matrix_load(sg, mp, shP_bf16_ptr, BLOCK_N);
+        // ============ P @ V computation ============
+        // For DG2/Arc: use::a requires TM x TK (8x16), use::b requires TK x TN (16x8)
+        // P is [BLOCK_M x BLOCK_N], V is [BLOCK_N x HEAD_DIM]
+        // Output is [BLOCK_M x HEAD_DIM], computed as tiles of [TM x TN]
+        // Inner loop iterates over BLOCK_N in chunks of TK (16)
+        //
+        // Each subgroup computes TM rows of output, for each HEAD_DIM/TN output tiles
+        constexpr int NUM_OUT_TILES = HEAD_DIM / TN;
+        
+        for (int out_tile = 0; out_tile < NUM_OUT_TILES; ++out_tile) {
+            joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN, layout::dynamic> matPV;
+            joint_matrix_fill(sg, matPV, 0.0f);
 
-            for (int i = 0; i < NUM_V_MATRICES; ++i) {
-                joint_matrix<sycl::sub_group, bfloat16, use::b, TM, TN, layout::col_major> mv;
+            // Sum over k dimension (BLOCK_N sequence positions) in chunks of TK
+            for (int k = 0; k < BLOCK_N; k += TK) {
+                // P tile: TM x TK (rows from sg_id * TM, cols from k)
+                // DG2: use::a is 8x16, which is TM=8, TK=16
+                joint_matrix<sycl::sub_group, bfloat16, use::a, TM, TK, layout::row_major> mp;
+                auto shP_ptr = sycl::address_space_cast<
+                    sycl::access::address_space::local_space,
+                    sycl::access::decorated::yes>(&shP[(sg_id * TM) * P_STRIDE + k]);
+                joint_matrix_load(sg, mp, shP_ptr, P_STRIDE);
+
+                // V tile: TK x TN (rows from k, cols from out_tile * TN)
+                // DG2: use::b is 16x8, which is TK=16, TN=8
+                // V is stored row-major as [BLOCK_N x HEAD_DIM]
+                joint_matrix<sycl::sub_group, bfloat16, use::b, TK, TN, layout::row_major> mv;
                 auto shV_ptr = sycl::address_space_cast<
                     sycl::access::address_space::local_space,
-                    sycl::access::decorated::yes>(&shV[k * V_STRIDE + i * TM]);
+                    sycl::access::decorated::yes>(&shV[k * V_STRIDE + out_tile * TN]);
                 joint_matrix_load(sg, mv, shV_ptr, V_STRIDE);
 
-                joint_matrix_mad(sg, matO[i], mp, mv, matO[i]);
+                joint_matrix_mad(sg, matPV, mp, mv, matPV);
             }
+
+            // Add PV contribution to output accumulator
+            // Store matPV to a temp location in shS (which is free after softmax)
+            auto scratch_ptr = sycl::address_space_cast<
+                sycl::access::address_space::local_space,
+                sycl::access::decorated::yes>(&shS[0]);
+            joint_matrix_store(sg, matPV, scratch_ptr, TN, layout::row_major);
+            it.barrier(sycl::access::fence_space::local_space);
+
+            // Add to output accumulator
+            // matPV is TM x TN, stored row-major with stride TN
+            const int sg_lane = sg.get_local_linear_id();
+            const int sg_size = sg.get_local_linear_range();
+            for (int idx = sg_lane; idx < TM * TN; idx += sg_size) {
+                const int local_row = idx / TN;
+                const int local_col = idx % TN;
+                const int global_row = sg_id * TM + local_row;
+                const int global_col = out_tile * TN + local_col;
+                if (global_row < BLOCK_M && global_col < HEAD_DIM) {
+                    shAcc[global_row * HEAD_DIM + global_col] += shS[idx];
+                }
+            }
+
+            it.barrier(sycl::access::fence_space::local_space);
         }
     }
 
-    // Final store and normalize
-    for (int i = 0; i < NUM_V_MATRICES; ++i) {
-        auto scratch_ptr = sycl::address_space_cast<
-            sycl::access::address_space::local_space,
-            sycl::access::decorated::yes>(&accum_scratch[i * HEAD_DIM]);
-        joint_matrix_store(sg, matO[i], scratch_ptr, HEAD_DIM, layout::row_major);
-    }
     it.barrier(sycl::access::fence_space::local_space);
 
-    // Normalize by rowSum and store to output
-    for (int i = lid; i < NUM_V_MATRICES * HEAD_DIM; i += THREADS) {
-        const int mat_idx = i / HEAD_DIM;
-        const int r = i % HEAD_DIM;
-        const int row = sg_id * TM + r;
-        float s = rowSum[row];
-        float normalized = accum_scratch[i] / (s > 1e-10f ? s : 1.0f);
-
-        // Store to output
+    // ============ Final normalize and store ============
+    for (int i = lid; i < BLOCK_M * HEAD_DIM; i += THREADS) {
+        const int row = i / HEAD_DIM;
+        const int col = i % HEAD_DIM;
         const int q_row = row0 + row;
+
         if (q_row < N) {
-            O[o_offset + (ptrdiff_t)row * HEAD_DIM + r] = normalized;
+            float s = rowSum[row];
+            float normalized = shAcc[i] / (s > 1e-10f ? s : 1.0f);
+            O[o_offset + (ptrdiff_t)row * HEAD_DIM + col] = normalized;
         }
     }
+}
+
+// Wrapper for Arc B60/Battlemage (8x16x16 tiles - msize=8, nsize=16, ksize=16)
+// Based on runtime query showing nsize=16 for bf16/fp16 on Arc B60
+template <int64_t HEAD_DIM>
+inline void flash_attn_coopmat_kernel_dg2(
+    sycl::nd_item<2> it,
+    const float * Q, const float * K, const float * V,
+    float * O, float * l_d, float * m_d,
+    const int64_t N, const int n_heads, const int n_kv_heads,
+    const int gqa_ratio, const float scale,
+    const int causal, const int window_size, float * shmem
+) {
+    // Arc B60 uses 8x16x16 tiles (TM=8, TN=16, TK=16)
+    flash_attn_coopmat_kernel<HEAD_DIM, 8, 16, 16>(
+        it, Q, K, V, O, l_d, m_d, N, n_heads, n_kv_heads,
+        gqa_ratio, scale, causal, window_size, shmem
+    );
+}
+
+// Wrapper for PVC (8x16x16 tiles - same as Arc B60)
+template <int64_t HEAD_DIM>
+inline void flash_attn_coopmat_kernel_pvc(
+    sycl::nd_item<2> it,
+    const float * Q, const float * K, const float * V,
+    float * O, float * l_d, float * m_d,
+    const int64_t N, const int n_heads, const int n_kv_heads,
+    const int gqa_ratio, const float scale,
+    const int causal, const int window_size, float * shmem
+) {
+    // PVC also uses 8x16x16 tiles
+    flash_attn_coopmat_kernel<HEAD_DIM, 8, 16, 16>(
+        it, Q, K, V, O, l_d, m_d, N, n_heads, n_kv_heads,
+        gqa_ratio, scale, causal, window_size, shmem
+    );
 }
 
 #endif // SYCL_EXT_COOPERATIVE_MATRICES

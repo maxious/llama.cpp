@@ -55,47 +55,51 @@ void flash_attn_coopmat_kernel(...) {
 
 #### TODO-001: Enable Cooperative Matrix Flash Attention
 
-**Status**: ✅ **COMPLETED** (with fallback for Arc B60)
+**Status**: ⚠️ **IN PROGRESS** (XMX kernel implemented but has correctness issues)
 
 **File**: `ggml/src/ggml-sycl/fattn.cpp`, `ggml/src/ggml-sycl/fattn_kernel.hpp`
 
-**Changes Made** (2026-01-19):
-1. Added XMX detection and dispatch in `ggml_sycl_op_flash_attn()`
-2. Implemented `flash_attn_coopmat_kernel` with bfloat16 matrices for XMX
-3. Added proper exception handling for graceful fallback to non-XMX path
-4. Fixed multiple type compatibility issues in the kernel
-5. Added oneMKL BLAS-based flash attention path for Arc B60 (Xe2/Battlemage)
-6. Added device detection (`ggml_sycl_flash_attn_use_mkl`) for Arc B60 routing
+**Changes Made** (2026-01-20):
+1. Added XMX detection with runtime query of `matrix_combinations`
+2. Implemented templated `flash_attn_coopmat_kernel<HEAD_DIM, TM, TN, TK>` with bfloat16 matrices
+3. Added architecture-specific wrappers for 8x16x16 tiles
+4. Fixed subgroup ID mapping (`sg_id = sg.get_group_linear_id()`)
+5. Fixed work-group launch configuration for uniform sizes
+6. Added proper exception handling for graceful fallback
+7. XMX kernel disabled by default; enable with `GGML_SYCL_FLASH_ATTN_XMX=1`
+
+**Key Discovery** (from runtime query on Arc B60):
+Arc B60 (Xe2/Battlemage) reports **nsize=16** in matrix_combinations, meaning:
+- Tile size: **8x16x16** (TM=8, TN=16, TK=16), NOT 8x8x16 as DG2 documentation suggests
+- A/B types: **bfloat16** or **half** (NOT float32)
+- Accumulator type: **float** (supported!)
+
+The Arc B60 actually has PVC-like matrix combinations, not DG2-like!
 
 **Current Behavior**:
-- XMX detection passes (Arc B60 reports `has_xmx=1`)
-- Arc B60 is routed to oneMKL path due to hardware limitations:
-  - Float32 matrices for use::a/use::b are not supported on XMX
-  - Bfloat16 cooperative matrices have SPIR-V compilation issues
-- oneMKL path provides reliable flash attention via 2 GEMM calls + softmax kernel
-- Flash attention works correctly (~10.7 tokens/sec on Arc B60)
+- XMX kernel compiles and launches without exceptions
+- Kernel produces incorrect results (ERR ~1.0 vs expected <0.0005)
+- Non-XMX fallback path works correctly
+- oneMKL BLAS path available as alternative fallback
 
-**Technical Challenges Discovered** (Xe2/Battlemage specific):
-1. Intel Arc B60 XMX does NOT support 16x16 float matrices for `use::a` or `use::b`
-2. XMX requires bfloat16 or fp16 for matrix A/B operands
-3. Mixed precision (float accumulators + bf16 A/B) has limited support in oneAPI 2025.3
-4. The online softmax algorithm doesn't map well to current XMX constraints
+**Remaining Issues**:
+1. Correctness bug in XMX kernel (likely shared memory indexing or joint matrix stride issues)
+2. Needs extensive debugging of:
+   - Subgroup coordination for Q@K^T computation
+   - V tile layout for P@V computation  
+   - Accumulator store/add logic
 
-**Solution Implemented**:
-- For Arc B60/Battlemage: Use oneMKL BLAS `gemm()` for QK^T and PV, custom kernel for softmax
-- For other Intel GPUs: XMX path is available but requires further testing
-
-**Test Command**:
+**Test Command** (to enable experimental XMX):
 ```bash
 source /opt/intel/oneapi/setvars.sh
-./build-sycl/bin/llama-cli -m model.gguf -p "test" -n 5 -fa on -t 4
+GGML_SYCL_FLASH_ATTN_XMX=1 ./build-sycl/bin/test-backend-ops -b SYCL0 -o FLASH_ATTN
 ```
 
-**Expected Output** (Arc B60):
+**Expected Output** (Arc B60, experimental mode):
 ```
-ggml_sycl: XMX detection: device=Intel(R) Arc(TM) Pro B60 Graphics, has_xmx=0
-ggml_sycl: Using oneMKL BLAS for flash attention (device=Intel(R) Arc(TM) Pro B60 Graphics)
-ggml_sycl: oneMKL path: head_dim=128
+ggml_sycl: XMX flash attention ENABLED (experimental)
+ggml_sycl: XMX detection: device=Intel(R) Arc(TM) Pro B60 Graphics, has_xmx=1, tile_kind=16x16x16 (PVC)
+ggml_sycl: Using XMX (cooperative matrix) for flash attention with 16x16x16 (PVC) tiles
 ```
 
 ---
