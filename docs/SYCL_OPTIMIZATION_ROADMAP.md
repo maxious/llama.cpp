@@ -82,12 +82,30 @@ The Arc B60 actually has PVC-like matrix combinations, not DG2-like!
 - Non-XMX fallback path works correctly
 - oneMKL BLAS path available as alternative fallback
 
-**Remaining Issues**:
-1. Correctness bug in XMX kernel (likely shared memory indexing or joint matrix stride issues)
-2. Needs extensive debugging of:
-   - Subgroup coordination for Q@K^T computation
-   - V tile layout for P@V computation  
-   - Accumulator store/add logic
+**Bug Fixes Applied** (2026-01-20):
+1. ✅ **Fixed race condition in P@V computation** (lines 502-525 of `fattn_kernel.hpp`)
+   - **Root cause**: All subgroups were writing `matPV` results to same scratch space `&shS[0]`
+   - **Fix**: Each subgroup gets dedicated scratch region: `scratch_offset = sg_id * TM * TN`
+   - **Impact**: Last subgroup was overwriting all others' P@V results → complete data corruption
+
+2. ⚠️ **Added head size padding support** to `fattn.cpp`
+   - Supports non-standard head sizes (e.g., 40 → 64)
+   - Infrastructure ready for XMX kernel with padding
+
+3. ❌ **Removed oneMKL padded implementation** (per user request)
+   - oneMKL GEMM had row-major/column-major layout issues
+   - Focus now on fixing native XMX implementation
+
+**Next Steps** (Priority: Fix XMX kernel):
+1. Debug remaining XMX correctness issues (ERR ~1.0 persists)
+2. Add head size padding directly to XMX kernel (not oneMKL)
+3. Test with head size 40 via XMX padding path
+
+**Current Status**:
+- XMX kernel: Race condition fixed, but other correctness issues remain
+- oneMKL fallback: Works for native head sizes only
+- Head size padding: Infrastructure in place, needs XMX integration
+- Test suite: Only head size 40 tests exist (requires padding support)
 
 **Test Command** (to enable experimental XMX):
 ```bash
