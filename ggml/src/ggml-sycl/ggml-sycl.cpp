@@ -270,7 +270,11 @@ static void ggml_check_sycl() try {
         // P2P access disabled - causes device lost errors on some systems
         // Using host-mediated copies for cross-device data transfer instead
         if (g_all_sycl_device_count > 1) {
-            GGML_LOG_INFO("Multi-GPU detected (%d devices): using host-mediated cross-device copies\n", g_all_sycl_device_count);
+            if (ggml_sycl_use_shared_usm()) {
+                GGML_LOG_INFO("Multi-GPU detected (%d devices): using shared USM\n", g_all_sycl_device_count);
+            } else {
+                GGML_LOG_INFO("Multi-GPU detected (%d devices): using host-mediated copies (GGML_SYCL_SHARED_USM=0)\n", g_all_sycl_device_count);
+            }
         }
 
         initialized = true;
@@ -469,6 +473,12 @@ static void dev2dev_memcpy(sycl::queue &q_dst, sycl::queue &q_src, void *ptr_dst
         return;
     }
 
+    // With shared USM, the runtime handles page migration - use direct memcpy
+    if (ggml_sycl_use_shared_usm()) {
+        q_dst.memcpy(ptr_dst, ptr_src, size).wait();
+        return;
+    }
+
     // Cross-device copy using host-mediated path
     // P2P direct copies can cause device timeouts on some systems (including Intel Arc B60)
     // This is slower but reliable
@@ -492,6 +502,13 @@ static void dev2dev_memcpy_2d(sycl::queue &q_dst, sycl::queue &q_src,
         dpct::async_dpct_memcpy(ptr_dst, dst_pitch, ptr_src, src_pitch,
                                 width, height, dpct::device_to_device, q_dst);
         // Don't wait here - let final sync handle it
+        return;
+    }
+
+    // With shared USM, the runtime handles page migration - use direct memcpy
+    if (ggml_sycl_use_shared_usm()) {
+        dpct::async_dpct_memcpy(ptr_dst, dst_pitch, ptr_src, src_pitch,
+                                width, height, dpct::device_to_device, q_dst);
         return;
     }
 
@@ -951,7 +968,13 @@ ggml_backend_sycl_split_buffer_init_tensor(ggml_backend_buffer_t buffer,
         error codes. The original code was commented out and a warning string
         was inserted. You need to rewrite this code.
         */
-        SYCL_CHECK(CHECK_TRY_ERROR(buf = (char *)ggml_sycl_aligned_malloc_device(size, stream)));
+        // Use shared USM for split buffers when enabled - allows runtime to handle
+        // cross-device page migration automatically instead of host-mediated copies
+        if (ggml_sycl_use_shared_usm()) {
+            SYCL_CHECK(CHECK_TRY_ERROR(buf = (char *)ggml_sycl_aligned_malloc_shared(size, stream)));
+        } else {
+            SYCL_CHECK(CHECK_TRY_ERROR(buf = (char *)ggml_sycl_aligned_malloc_device(size, stream)));
+        }
         if (!buf) {
             char err_buf[1024];
             snprintf(err_buf, 1023, "%s: can't allocate %lu Bytes of memory on device\n", __func__, size);

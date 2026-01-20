@@ -261,6 +261,30 @@ inline void * ggml_sycl_aligned_malloc_device(size_t size, sycl::queue * q) {
     return sycl::aligned_alloc_device(SYCL_DEVICE_MEM_ALIGNMENT, size, *q);
 }
 
+// Shared USM allocation - accessible from host and all devices
+// Runtime handles page migration automatically, avoiding explicit cross-device copies
+// Use for multi-GPU split tensors and KV cache
+inline void * ggml_sycl_aligned_malloc_shared(size_t size, sycl::queue & q) {
+    return sycl::aligned_alloc_shared(SYCL_DEVICE_MEM_ALIGNMENT, size, q);
+}
+
+inline void * ggml_sycl_aligned_malloc_shared(size_t size, sycl::queue * q) {
+    return sycl::aligned_alloc_shared(SYCL_DEVICE_MEM_ALIGNMENT, size, *q);
+}
+
+// Shared USM for multi-GPU - enabled by default
+// Runtime handles cross-device page migration automatically
+// Set GGML_SYCL_SHARED_USM=0 to disable and use host-mediated copies instead
+inline bool ggml_sycl_use_shared_usm() {
+    static int use_shared = -1;
+    if (use_shared < 0) {
+        const char* env = getenv("GGML_SYCL_SHARED_USM");
+        // Default ON; only disable if explicitly set to "0"
+        use_shared = (env != nullptr && strcmp(env, "0") == 0) ? 0 : 1;
+    }
+    return use_shared == 1;
+}
+
 static int g_all_sycl_device_count = -1;
 static bool g_ggml_backend_sycl_buffer_type_initialized = false;
 
