@@ -310,18 +310,38 @@ Optimal: Fused kernel
 
 ---
 
-### TODO-013: Performance Profiling Infrastructure
+### Closed: Performance Profiling Infrastructure (TODO-013)
 
-```cpp
-class ggml_sycl_profiler {
-public:
-    void start_timer(const char * name);
-    void stop_timer(const char * name);
-    void print_report();  // kernel_name, time, bandwidth, FLOPs
-private:
-    std::map<std::string, std::vector<sycl::event>> events;
-};
+**Status**: ✅ **COMPLETE** (2026-01-20) - Use external PTI tools
+
+**Approach**: Use Intel PTI-GPU tools instead of built-in profiling. This is more maintainable and provides richer data.
+
+**Setup** (one-time):
+```bash
+cd ~/pti-gpu/tools/unitrace
+mkdir build && cd build
+source /opt/intel/oneapi/setvars.sh
+cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_MPI=0 ..
+make -j$(nproc)
 ```
+
+**Usage**:
+```bash
+# Kernel timing summary (sorted by GPU time)
+unitrace -d -h -v ./llama-cli -m model.gguf -p "Hello" -n 32
+
+# Chrome trace for timeline visualization (open in chrome://tracing or perfetto.dev)
+unitrace --chrome-kernel-logging --chrome-device-logging -o trace.json ./llama-cli ...
+
+# Hardware metrics (EU stalls, occupancy)
+unitrace --metric-sampling -g ComputeBasic ./llama-cli ...
+```
+
+**Key metrics to look for**:
+- Kernel execution time breakdown
+- Memory transfer overhead (M2D, D2M, D2D)
+- Register spills (indicates kernel complexity)
+- SLM usage per workgroup
 
 ---
 
@@ -395,11 +415,11 @@ export SYCL_PI_LEVEL_ZERO_DEBUG=1
 | P2 | Async prefetching | Pending | common.cpp |
 | P2 | Memory alignment (64-byte) | ✅ Complete | common.hpp, ggml-sycl.cpp |
 | P3 | Kernel fusion | Pending | Multiple files |
-| P3 | Profiling infrastructure | Pending | New file |
+| P3 | Profiling infrastructure | ✅ Complete | Use PTI unitrace |
 
-**Completed**: Flash attention XMX (3-4x speedup), dead code cleanup, debug logging gated, SLM normalization, bank conflict avoidance, 64-byte memory alignment, shared USM for multi-GPU
+**Completed**: Flash attention XMX (3-4x speedup), dead code cleanup, debug logging gated, SLM normalization, bank conflict avoidance, 64-byte memory alignment, shared USM for multi-GPU, profiling with PTI unitrace
 **Blocked**: Row split mode blocked by driver issue (use `--split-mode layer` as workaround)
-**Next Priority**: Async prefetching, shared USM for KV cache
+**Next Priority**: Async prefetching, kernel fusion
 
 ---
 
