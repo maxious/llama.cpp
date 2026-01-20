@@ -161,21 +161,30 @@ The non-XMX fallback kernel allocates SLM but doesn't actually use it for comput
 
 ## Priority P2: Memory Optimizations
 
-### TODO-007: Shared USM for KV Cache
+### Closed: Shared USM for Multi-GPU (TODO-007 & TODO-011)
 
-**File**: `ggml/src/ggml-sycl/ggml-sycl.cpp`
+**Status**: ✅ **COMPLETE** (2026-01-20)
 
-**Current**: Device-only allocations.
+**Files**: `ggml/src/ggml-sycl/common.hpp`, `ggml/src/ggml-sycl/ggml-sycl.cpp`
 
-**Desired**: Shared USM with explicit prefetching for KV cache.
+**Implementation**: Added optional shared USM allocation for split buffers, controlled by environment variable. When enabled, the runtime handles cross-device page migration automatically instead of using host-mediated copies.
 
-```cpp
-// Shared USM for KV cache - can be accessed by both CPU and GPU
-void * kv_cache = sycl::malloc_shared(kv_size, queue);
-
-// Prefetch to device before attention computation
-queue.prefetch(kv_cache, kv_size);
+```bash
+# Shared USM is enabled by default for multi-GPU
+# To disable and use host-mediated copies instead:
+GGML_SYCL_SHARED_USM=0
 ```
+
+**Changes**:
+- Added `ggml_sycl_aligned_malloc_shared()` helper in `common.hpp`
+- Added `ggml_sycl_use_shared_usm()` to check environment variable
+- Split buffer allocator uses shared USM when enabled
+- Cross-device copy functions skip host-mediated path with shared USM
+
+**Trade-offs**:
+- Slightly higher latency than device-only memory for single-device access
+- Runtime handles page migration (may have overhead on first access)
+- Avoids explicit malloc/memcpy/free for cross-device transfers
 
 ---
 
@@ -281,39 +290,6 @@ This pattern suggests the kernel is dereferencing a corrupted or null pointer in
 
 ---
 
-### TODO-011: Shared USM for Multi-XPU Efficiency
-
-**File**: `ggml/src/ggml-sycl/ggml-sycl.cpp`
-
-**Current**: Each device has separate device memory allocations. Cross-device copies go through host fallback.
-
-**Desired**: Use shared USM for tensors accessed by multiple XPUs to avoid explicit copies.
-
-**Implementation**:
-```cpp
-// Shared USM - accessible from all devices and host
-// Ideal for KV cache and split tensors
-void * shared_alloc(size_t size, sycl::queue & q) {
-    return sycl::malloc_shared(size, q);
-}
-
-// Device USM with prefetch hint
-void * device_alloc_with_prefetch(size_t size, sycl::queue & q) {
-    void * ptr = sycl::malloc_device(size, q);
-    q.prefetch(ptr, size);  // Hint to migrate pages to device
-    return ptr;
-}
-```
-
-**Benefits for Multi-XPU**:
-- No explicit host-mediated copies needed
-- Runtime handles page migration automatically
-- Reduces latency for cross-device tensor access
-
-**Trade-offs**:
-- Slightly higher latency than device-only memory for single-device access
-- Requires USM support (all Intel GPUs support this)
-
 ---
 
 ## Priority P3: Additional Optimizations
@@ -415,13 +391,13 @@ export SYCL_PI_LEVEL_ZERO_DEBUG=1
 | P1 | SLM for normalization | ✅ Complete | norm.cpp |
 | P1 | Bank conflict avoidance | ✅ Complete | fattn_kernel.hpp (XMX path) |
 | P2 | Fix multi-XPU row split | ⚠️ Blocked | Driver/runtime issue on Intel Arc |
-| P2 | Shared USM for multi-XPU | Pending | ggml-sycl.cpp |
+| P2 | Shared USM for multi-XPU | ✅ Complete | Default ON (GGML_SYCL_SHARED_USM=0 to disable) |
 | P2 | Async prefetching | Pending | common.cpp |
 | P2 | Memory alignment (64-byte) | ✅ Complete | common.hpp, ggml-sycl.cpp |
 | P3 | Kernel fusion | Pending | Multiple files |
 | P3 | Profiling infrastructure | Pending | New file |
 
-**Completed**: Flash attention XMX (3-4x speedup), dead code cleanup, debug logging gated, SLM normalization, bank conflict avoidance, 64-byte memory alignment
+**Completed**: Flash attention XMX (3-4x speedup), dead code cleanup, debug logging gated, SLM normalization, bank conflict avoidance, 64-byte memory alignment, shared USM for multi-GPU
 **Blocked**: Row split mode blocked by driver issue (use `--split-mode layer` as workaround)
 **Next Priority**: Async prefetching, shared USM for KV cache
 
