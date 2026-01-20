@@ -135,6 +135,8 @@ target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_DNNL=${GGML_SYCL_DNNL})
 
 if (GGML_SYCL_F16)
     add_compile_definitions(GGML_SYCL_F16)
+else()
+    message(STATUS "GGML_SYCL_F16: OFF (using FP32 for dequantize/compute)")
 endif()
 
 if (GGML_SYCL_BF16)
