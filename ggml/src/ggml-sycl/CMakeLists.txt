@@ -135,9 +135,12 @@ target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_DNNL=${GGML_SYCL_DNNL})
 
 if (GGML_SYCL_F16)
     if (GGML_SYCL_TARGET STREQUAL "AMD")
-        message(WARNING "AMD target does not entirely support FP16 in the SYCL backend.")
+        message(WARNING "AMD target does not entirely support FP16 in the SYCL backend. Use -DGGML_SYCL_F16=OFF if you encounter issues.")
     endif()
+    message(STATUS "GGML_SYCL_F16: ON (using FP16 for dequantize/compute - faster on Intel Arc)")
     add_compile_definitions(GGML_SYCL_F16)
+else()
+    message(STATUS "GGML_SYCL_F16: OFF (using FP32 for dequantize/compute)")
 endif()
 
 if (GGML_SYCL_BF16)
