@@ -2,6 +2,70 @@
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/presets.hpp"
 
+// SLM-cached LayerNorm kernel for rows that fit in shared local memory
+// This avoids re-reading input data from global memory for the normalization pass
+template <int NCOLS>
+static void norm_f32_slm(const float* x, float* dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
+        const int64_t stride_sample, const float eps, const sycl::nd_item<3>& item_ct1, 
+        sycl::float2* s_sum, float* s_row, int block_size) {
+
+    const int nrows = item_ct1.get_group_range(2);
+    const int nchannels = item_ct1.get_group_range(1);
+
+    const int sample  = item_ct1.get_group(0);
+    const int channel = item_ct1.get_group(1);
+    const int row     = item_ct1.get_group(2);
+
+    const int tid = item_ct1.get_local_id(2);
+    const int nwarps = block_size / WARP_SIZE;
+
+    const auto strided_offset = calculate_offset<3>({stride_sample, stride_channel, stride_row}, {sample, channel, row});
+    const auto packed_offset = calculate_offset<3>({nchannels * nrows * ncols, nrows * ncols, ncols}, {sample, channel, row});
+
+    x += strided_offset;
+    dst += packed_offset;
+
+    sycl::float2 mean_var = sycl::float2(0.f, 0.f);
+
+    // First pass: load into SLM and compute sum and sum of squares
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        s_row[col] = xi;  // Cache in SLM
+        mean_var.x() += xi;
+        mean_var.y() += xi * xi;
+    }
+
+    // Warp-level reduction
+    mean_var = warp_reduce_sum(mean_var, item_ct1);
+    if (block_size > WARP_SIZE) {
+        const auto sub_group = item_ct1.get_sub_group();
+        const auto sg_id = sub_group.get_group_linear_id();
+        const auto wi_in_sg = sub_group.get_local_linear_id();
+        if (wi_in_sg == 0) {
+            s_sum[sg_id] = mean_var;
+        }
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+        mean_var = 0.f;
+        const size_t nreduce = ceil_div(nwarps, WARP_SIZE);
+        for (size_t i = 0; i < nreduce; i += 1) {
+            mean_var += s_sum[wi_in_sg + i * WARP_SIZE];
+        }
+        mean_var = warp_reduce_sum(mean_var, item_ct1);
+    }
+
+    // Ensure all threads have finished writing to s_row before reading
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+
+    const float mean = mean_var.x() / ncols;
+    const float var = mean_var.y() / ncols - mean * mean;
+    const float inv_std = sycl::rsqrt(var + eps);
+
+    // Second pass: read from SLM instead of global memory
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = (s_row[col] - mean) * inv_std;
+    }
+}
+
 static void norm_f32(const float* x, float* dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
         const int64_t stride_sample, const float eps, const sycl::nd_item<3>& item_ct1, sycl::float2* s_sum, int block_size) {
 
@@ -145,6 +209,69 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
     }
 }
 
+// SLM-cached RMSNorm kernel for rows that fit in shared local memory
+// This avoids re-reading input data from global memory for the normalization pass
+template <int NCOLS>
+static void rms_norm_f32_slm(const float* x, float* dst, const int ncols,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const float eps, const sycl::nd_item<3>& item_ct1, float* s_sum, float* s_row, int block_size) {
+
+    const int nrows = item_ct1.get_group_range(2);
+    const int nchannels = item_ct1.get_group_range(1);
+
+    const int sample  = item_ct1.get_group(0);
+    const int channel = item_ct1.get_group(1);
+    const int row     = item_ct1.get_group(2);
+
+    const int tid = item_ct1.get_local_id(2);
+    const int nwarps = block_size / WARP_SIZE;
+
+    const auto strided_offset = calculate_offset<3>({stride_sample, stride_channel, stride_row}, {sample, channel, row});
+    const auto packed_offset = calculate_offset<3>({nchannels * nrows * ncols, nrows * ncols, ncols}, {sample, channel, row});
+
+    x   += strided_offset;
+    dst += packed_offset;
+
+    float tmp = 0.0f;
+
+    // First pass: load into SLM and compute sum of squares
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        s_row[col] = xi;  // Cache in SLM
+        tmp += xi * xi;
+    }
+
+    // Warp-level reduction
+    tmp = warp_reduce_sum(tmp, item_ct1);
+    if (block_size > WARP_SIZE) {
+        const auto sub_group = item_ct1.get_sub_group();
+        const auto sg_id = sub_group.get_group_linear_id();
+        const auto wi_in_sg = sub_group.get_local_linear_id();
+        if (wi_in_sg == 0) {
+            s_sum[sg_id] = tmp;
+        }
+
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+        const size_t nreduce = ceil_div(nwarps, WARP_SIZE);
+        tmp = 0.f;
+        for (size_t i = 0; i < nreduce; i += 1) {
+            tmp += s_sum[wi_in_sg + i * WARP_SIZE];
+        }
+        tmp = warp_reduce_sum(tmp, item_ct1);
+    }
+
+    // Ensure all threads have finished writing to s_row before reading
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+
+    const float mean = tmp / ncols;
+    const float scale = sycl::rsqrt(mean + eps);
+
+    // Second pass: read from SLM instead of global memory
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale * s_row[col];
+    }
+}
+
 static void rms_norm_f32(const float* x, float* dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
         const int64_t stride_sample, const float eps, const sycl::nd_item<3>& item_ct1, float* s_sum, int block_size) {
 
@@ -251,7 +378,33 @@ static void norm_f32_sycl(const float * x, float * dst, const int ncols, const i
         const float eps, queue_ptr stream, int device) {
 
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
-    if (ncols < 1024) {
+    GGML_ASSERT(ncols % WARP_SIZE == 0);
+    
+    // Use SLM-cached kernel for rows that fit in shared local memory (up to 4096 floats = 16KB)
+    // This avoids re-reading input data from global memory
+    constexpr int SLM_CACHE_THRESHOLD = 4096;
+    
+    if (ncols <= SLM_CACHE_THRESHOLD && ncols >= 256) {
+        // Use larger work-group with SLM caching
+        const int work_group_size = std::min(ncols, 256);
+        const sycl::range<3> block_dims(1, 1, work_group_size);
+        
+        stream->submit([&](sycl::handler& cgh) {
+            // SLM for partial sums (one float2 per warp)
+            sycl::local_accessor<sycl::float2, 1> s_sum_acc(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
+            // SLM for caching the input row
+            sycl::local_accessor<float, 1> s_row_acc(sycl::range<1>(ncols), cgh);
+            
+            cgh.parallel_for(
+                sycl::nd_range<3>(global_dims * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    norm_f32_slm<SLM_CACHE_THRESHOLD>(x, dst, ncols, stride_row, stride_channel, stride_sample,
+                        eps, item_ct1, get_pointer(s_sum_acc), get_pointer(s_row_acc), work_group_size);
+                });
+        });
+    }
+    else if (ncols < 1024) {
         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
         stream->submit([&](sycl::handler& cgh) {
             cgh.parallel_for(
@@ -336,7 +489,32 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
     // printf("%s ncols=%d, nrows=%d, WARP_SIZE=%d\n", __func__, ncols, nrows, WARP_SIZE);
 
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
-    if (ncols < 1024) {
+
+    // Use SLM-cached kernel for small rows (up to 4096 floats = 16KB fits comfortably in 64KB SLM)
+    // This avoids re-reading input data from global memory
+    constexpr int SLM_CACHE_THRESHOLD = 4096;
+
+    if (ncols <= SLM_CACHE_THRESHOLD && ncols >= 256) {
+        // Use larger work-group with SLM caching
+        const int work_group_size = std::min(ncols, 256);  // Up to 256 threads
+        const sycl::range<3> block_dims(1, 1, work_group_size);
+
+        stream->submit([&](sycl::handler& cgh) {
+            // SLM for partial sums (one per warp)
+            sycl::local_accessor<float, 1> s_sum_acc(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
+            // SLM for caching the input row
+            sycl::local_accessor<float, 1> s_row_acc(sycl::range<1>(ncols), cgh);
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(global_dims * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    rms_norm_f32_slm<SLM_CACHE_THRESHOLD>(x, dst, ncols, stride_row, stride_channel, stride_sample,
+                        eps, item_ct1, get_pointer(s_sum_acc), get_pointer(s_row_acc), work_group_size);
+                });
+        });
+    }
+    else if (ncols < 1024) {
         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
         stream->submit([&](sycl::handler& cgh) {
             cgh.parallel_for(
