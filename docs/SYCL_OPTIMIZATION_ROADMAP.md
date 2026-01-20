@@ -232,28 +232,63 @@ inline void * sycl_aligned_alloc(size_t size, sycl::queue & q) {
 
 **File**: `ggml/src/ggml-sycl/ggml-sycl.cpp`
 
-**Current**: Row split causes GPU memory fault during inference.
+**Current**: Row split causes GPU page faults during inference.
 
-**Root Cause Analysis**:
-The `dev2dev_memcpy()` function (lines 457-484) attempts direct P2P copy but falls back to host-mediated copy on failure. Issues may arise from:
-1. Split tensor synchronization timing
-2. Row rounding alignment issues in `get_row_split()` (lines 797-809)
-3. Missing barriers before cross-device access
+**Status**: ⚠️ Blocked by driver/runtime issue (2026-01-20)
 
-**Debugging Steps**:
-```bash
-# Enable verbose SYCL debugging
-export SYCL_PI_LEVEL_ZERO_DEBUG=1
-export SYCL_PI_TRACE=2
+**Symptoms**:
+- GPU page faults at low virtual addresses (~0x200bb000) on compute shader engine
+- dmesg shows `Fault response: Unsuccessful -ENOENT` indicating unmapped memory access
+- Faults occur on device 0 (xe 0000:03:00.0) ccs (compute shader) engine
+- Kernel submissions succeed but kernel execution fails with invalid memory access
+- The faulted addresses are far from valid device allocations (0xffffeaab... range)
+- Layer split mode works fine; only row split mode fails
 
-# Run with row split
-./llama-cli -m model.gguf --split-mode row -ngl 99
-```
+**Root Cause Analysis (Updated 2026-01-20)**:
+Extensive debugging with fprintf tracing revealed:
+
+1. **Kernel submission succeeds** - quantize_row_q8_1_sycl and mul_mat kernels are submitted to both devices
+2. **Kernel execution fails on device 0** - page faults at ~500MB address range while valid pointers are at ~0xffffeaab...
+3. **Cross-device sync works intermittently** - some layers complete successfully before crash
+4. **The issue is in kernel execution, not SYCL API usage** - all pointers verified valid via `sycl::get_pointer_type()`
+
+**Technical Details**:
+The GPU page faults show:
+- `ASID: 260` - Address Space ID for the process
+- `Faulted Address: 0x00000000200bb000` - Very low VA, not in USM range
+- `EngineClass: 5 ccs` - Compute shader engine
+- `FaultLevel: 1` - Page table lookup failure
+
+This pattern suggests the kernel is dereferencing a corrupted or null pointer internally, likely:
+- A stack/register corruption from multi-device context switching
+- Level Zero runtime bug with USM allocations across multiple devices
+- Xe driver bug with compute queue management across GPUs
+
+**Fixes Applied**:
+- Disabled P2P enablement (caused device lost errors)
+- Removed cross-device event barriers (use direct queue waits)
+- Added host-mediated copies for all cross-device transfers
+- Verified pointer types and stream devices
+- Removed synchronous waits inside compute loop (caused deadlocks)
+
+**Workaround**: Use `--split-mode layer` instead of `--split-mode row`
+
+**Next Steps**:
+1. File Intel driver bug report with dmesg output and reproduction steps
+2. Test with newer Intel GPU drivers (currently using 1.14.36711+4)
+3. Test with compute-runtime 25.x when available
+4. Consider allocating split buffers with explicit device placement
 
 **Key Code Locations**:
-- `get_row_split()` (line 797) - row boundary calculation
-- `ggml_backend_sycl_split_buffer_init_tensor()` (line 850) - split buffer allocation
-- `dev2dev_memcpy()` (line 457) - cross-device copy
+- `ggml_backend_sycl_split_buffer_init_tensor()` (line 892) - split buffer allocation
+- `ggml_sycl_op_mul_mat()` (line 2408) - main mul_mat function
+- `quantize_row_q8_1_sycl()` (quantize.hpp:121) - one of the failing kernels
+- `dev2dev_memcpy_2d()` (line 485) - host-mediated cross-device copy
+
+**Driver Info**:
+- Intel compute-runtime: 1.14.36711+4
+- Kernel xe driver: Ubuntu 25.10
+- Hardware: Intel Arc Pro B60 (Xe2/Battlemage) x2
 
 ---
 
@@ -390,14 +425,15 @@ export SYCL_PI_LEVEL_ZERO_DEBUG=1
 | P1 | SLM for non-quantized GEMM | Pending | gemm.hpp |
 | P1 | SLM for normalization | ✅ Complete | norm.cpp |
 | P1 | Bank conflict avoidance | Pending | All SLM files |
-| P2 | Fix multi-XPU row split | Pending | ggml-sycl.cpp line 797 |
+| P2 | Fix multi-XPU row split | ⚠️ Blocked | Driver/runtime issue on Intel Arc |
 | P2 | Shared USM for multi-XPU | Pending | ggml-sycl.cpp |
 | P2 | Async prefetching | Pending | common.cpp |
 | P3 | Kernel fusion | Pending | Multiple files |
 | P3 | Profiling infrastructure | Pending | New file |
 
 **Completed**: Flash attention XMX (3-4x speedup), dead code cleanup, debug logging gated, SLM normalization
-**Next Priority**: Fix row split for multi-XPU, then SLM for GEMM
+**Blocked**: Row split mode blocked by driver issue (use `--split-mode layer` as workaround)
+**Next Priority**: SLM for GEMM, async prefetching
 
 ---
 

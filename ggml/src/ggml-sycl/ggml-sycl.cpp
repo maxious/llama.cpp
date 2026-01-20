@@ -267,6 +267,12 @@ static void ggml_check_sycl() try {
         }
         GGML_ASSERT(g_all_sycl_device_count <= GGML_SYCL_MAX_DEVICES);
 
+        // P2P access disabled - causes device lost errors on some systems
+        // Using host-mediated copies for cross-device data transfer instead
+        if (g_all_sycl_device_count > 1) {
+            GGML_LOG_INFO("Multi-GPU detected (%d devices): using host-mediated cross-device copies\n", g_all_sycl_device_count);
+        }
+
         initialized = true;
         g_sycl_loaded = true;
         ggml_backend_sycl_print_sycl_devices();
@@ -457,31 +463,72 @@ catch (sycl::exception const &exc) {
 
 static void dev2dev_memcpy(sycl::queue &q_dst, sycl::queue &q_src, void *ptr_dst,
                     const void *ptr_src, size_t size) {
-    // Try direct peer-to-peer copy first using USM pointer-based access
-    // This is much faster than host-mediated copy (~200 GB/s vs ~10 GB/s)
-
-    // Get the context from the destination queue
-    sycl::context ctx = q_dst.get_context();
-
-    // Check if both pointers are accessible from the destination context
-    // (this happens automatically when peer access is enabled)
-    try {
-        // Direct copy attempt - this works when:
-        // 1. Same device, or
-        // 2. Peer access is enabled between devices
-        // 3. Pointers are in shared USM or accessible from both devices
-
-        // For now, use the simple approach that works in most cases
-        // The oneAPI runtime handles P2P transparently when possible
+    // Check if same device - simple case
+    if (q_dst.get_device() == q_src.get_device()) {
         q_dst.memcpy(ptr_dst, ptr_src, size).wait();
-    } catch (const sycl::exception &e) {
-        // Fallback to host-mediated copy if direct copy fails
-        // This is slower but more compatible
-        char *host_buf = (char *)malloc(size);
-        q_src.memcpy(host_buf, (const char *)ptr_src, size).wait();
-        q_dst.memcpy((char *)ptr_dst, host_buf, size).wait();
-        free(host_buf);
+        return;
     }
+
+    // Cross-device copy using host-mediated path
+    // P2P direct copies can cause device timeouts on some systems (including Intel Arc B60)
+    // This is slower but reliable
+    char *host_buf = (char *)malloc(size);
+    if (!host_buf) {
+        throw std::runtime_error("Failed to allocate host buffer for cross-device copy");
+    }
+    q_src.memcpy(host_buf, ptr_src, size).wait();
+    q_dst.memcpy(ptr_dst, host_buf, size).wait();
+    free(host_buf);
+}
+
+// 2D strided copy between devices using P2P access
+// Copies 'width' bytes per row, 'height' rows total, with strides
+static void dev2dev_memcpy_2d(sycl::queue &q_dst, sycl::queue &q_src,
+                              void *ptr_dst, size_t dst_pitch,
+                              const void *ptr_src, size_t src_pitch,
+                              size_t width, size_t height) {
+    // Check if same device - simple case
+    if (q_dst.get_device() == q_src.get_device()) {
+        dpct::async_dpct_memcpy(ptr_dst, dst_pitch, ptr_src, src_pitch,
+                                width, height, dpct::device_to_device, q_dst);
+        // Don't wait here - let final sync handle it
+        return;
+    }
+
+    // For cross-device copy, wait for source kernel to complete first
+    // This is required before we can read from the source buffer
+    q_src.wait();
+
+    // For cross-device copy, use host-mediated copy for reliability
+    // 2D P2P copies are more prone to issues, so we don't attempt P2P here
+    size_t buf_size = width * height;
+    char *host_buf = (char *)malloc(buf_size);
+    if (!host_buf) {
+        throw std::runtime_error("Failed to allocate host buffer for 2D P2P fallback");
+    }
+
+    // Copy from source to host (row by row due to stride)
+    const char *src_ptr = (const char *)ptr_src;
+    char *host_ptr = host_buf;
+    for (size_t row = 0; row < height; ++row) {
+        q_src.memcpy(host_ptr, src_ptr, width);
+        src_ptr += src_pitch;
+        host_ptr += width;
+    }
+    q_src.wait();
+
+    // Copy from host to destination (row by row due to stride)
+    char *dst_ptr = (char *)ptr_dst;
+    host_ptr = host_buf;
+    for (size_t row = 0; row < height; ++row) {
+        q_dst.memcpy(dst_ptr, host_ptr, width);
+        dst_ptr += dst_pitch;
+        host_ptr += width;
+    }
+    // Must wait before freeing host buffer
+    q_dst.wait();
+
+    free(host_buf);
 }
 
 static bool
@@ -862,7 +909,15 @@ ggml_backend_sycl_split_buffer_init_tensor(ggml_backend_buffer_t buffer,
     ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
 
     ctx->tensor_extras.push_back(extra);
-    ctx->streams.push_back(&(dpct::get_current_device().default_queue()));
+
+    // Initialize streams for all devices BEFORE the allocation loop
+    // This fixes the out-of-bounds access bug where ctx->streams[i] was accessed
+    // but only one stream was pushed
+    if (ctx->streams.empty()) {
+        for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
+            ctx->streams.push_back(&(dpct::dev_mgr::instance().get_device(i).default_queue()));
+        }
+    }
 
     for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
         int64_t row_low, row_high;
@@ -885,6 +940,12 @@ ggml_backend_sycl_split_buffer_init_tensor(ggml_backend_buffer_t buffer,
         // currently, init_tensor cannot fail, it needs to be fixed in ggml-backend first
         ggml_sycl_set_device(i);
         const queue_ptr stream = ctx->streams[i];
+        
+        // Verify we're allocating on the correct device
+        sycl::device alloc_device = stream->get_device();
+        int alloc_device_id = dpct::dev_mgr::instance().get_device_id(alloc_device);
+        GGML_SYCL_DEBUG("[SYCL] split_buffer_init_tensor: allocating on device %d (stream device=%d)\n", i, alloc_device_id);
+        
         char * buf;
         /*
         DPCT1009:208: SYCL uses exceptions to report errors and does not use the
@@ -912,6 +973,8 @@ ggml_backend_sycl_split_buffer_init_tensor(ggml_backend_buffer_t buffer,
         }
 
         extra->data_device[i] = buf;
+        GGML_SYCL_DEBUG("[SYCL] split_buffer_init_tensor: device %d allocated %zu bytes at %p for tensor '%s' rows %ld-%ld\n",
+            i, size, buf, tensor->name, (long)row_low, (long)row_high);
 
         for (int64_t is = 0; is < GGML_SYCL_MAX_STREAMS; ++is) {
             /*
@@ -1130,12 +1193,7 @@ static ggml_backend_buffer_type_i ggml_backend_sycl_split_buffer_type_interface 
     /* .is_host          = */ ggml_backend_sycl_split_buffer_type_is_host,
 };
 
-ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(const float * tensor_split) {
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
-
-    GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_split_buffer_type\n");
-    ggml_check_sycl();
+static ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type_impl(const float * tensor_split) {
     // FIXME: this is not thread safe
     static std::map<std::array<float, GGML_SYCL_MAX_DEVICES>, struct ggml_backend_buffer_type> buft_map;
 
@@ -1144,6 +1202,11 @@ ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(const float * ten
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + GGML_SYCL_MAX_DEVICES, [](float x) { return x == 0.0f; });
     if (all_zero) {
         tensor_split_arr = ggml_sycl_info().default_tensor_split;
+        GGML_SYCL_DEBUG("[SYCL] split_buffer_type using default_tensor_split: ");
+        for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
+            GGML_SYCL_DEBUG("[%d]=%.4f ", i, tensor_split_arr[i]);
+        }
+        GGML_SYCL_DEBUG("\n");
     } else {
         float split_sum = 0.0f;
         for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
@@ -1153,6 +1216,11 @@ ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(const float * ten
         for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
             tensor_split_arr[i] /= split_sum;
         }
+        GGML_SYCL_DEBUG("[SYCL] split_buffer_type computed cumulative tensor_split: ");
+        for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
+            GGML_SYCL_DEBUG("[%d]=%.4f ", i, tensor_split_arr[i]);
+        }
+        GGML_SYCL_DEBUG("\n");
     }
 
     auto it = buft_map.find(tensor_split_arr);
@@ -1168,6 +1236,19 @@ ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(const float * ten
 
     auto result = buft_map.emplace(tensor_split_arr, buft);
     return &result.first->second;
+}
+
+// Wrapper function with correct signature matching ggml_backend_split_buffer_type_t
+// The main_device parameter is not used in SYCL backend (all devices get a split)
+ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(int main_device, const float * tensor_split) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_split_buffer_type main_device=%d\n", main_device);
+    ggml_check_sycl();
+
+    GGML_UNUSED(main_device);
+    return ggml_backend_sycl_split_buffer_type_impl(tensor_split);
 }
 
 // host buffer type
@@ -2524,73 +2605,19 @@ inline bool ggml_sycl_can_access_peer(int device_id, int peer_device_id) {
 }
 
 static void ggml_sycl_set_peer_access(const int n_tokens, int main_device) {
-    static bool peer_access_enabled = false;
-    static std::vector<std::vector<bool>> peer_access_matrix;
-    static std::vector<std::vector<bool>> peer_access_enabled_matrix;
-
-    const bool enable_peer_access = n_tokens <= GGML_SYCL_PEER_MAX_BATCH_SIZE;
-
-    if (peer_access_enabled == enable_peer_access) {
-        return;
-    }
-
-#ifdef NDEBUG
-    if (peer_access_matrix.empty()) {
-        peer_access_matrix.resize(ggml_sycl_info().device_count,
-                                   std::vector<bool>(ggml_sycl_info().device_count, false));
-        peer_access_enabled_matrix.resize(ggml_sycl_info().device_count,
-                                           std::vector<bool>(ggml_sycl_info().device_count, false));
-
-        for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
-            for (int j = 0; j < ggml_sycl_info().device_count; ++j) {
-                peer_access_matrix[i][j] = ggml_sycl_can_access_peer(i, j);
-            }
-        }
-    }
-
-    // Enable/disable peer access between main device and others
-    for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
-        if (i == main_device) continue;
-
-        if (peer_access_matrix[main_device][i]) {
-            auto &dev = dpct::dev_mgr::instance().get_device(main_device);
-            auto &peer_dev = dpct::dev_mgr::instance().get_device(i);
-
-            if (enable_peer_access && !peer_access_enabled_matrix[main_device][i]) {
-                // Enable peer access using SYCL extension
-                // In SYCL 2024+, this is done via ext_oneapi_enable_peer_access
-                // For dpct compatibility, we rely on the runtime to handle this
-                peer_access_enabled_matrix[main_device][i] = true;
-                GGML_SYCL_DEBUG("[SYCL] Enabled P2P: Device %d <-> Device %d\n", main_device, i);
-            } else if (!enable_peer_access && peer_access_enabled_matrix[main_device][i]) {
-                // Disable peer access
-                peer_access_enabled_matrix[main_device][i] = false;
-                GGML_SYCL_DEBUG("[SYCL] Disabled P2P: Device %d <-> Device %d\n", main_device, i);
-            }
-        }
-    }
-
-    for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
-        for (int j = 0; j < ggml_sycl_info().device_count; ++j) {
-            if (i != j && (i == main_device || j == main_device)) {
-                GGML_SYCL_DEBUG("[SYCL] P2P %d <-> %d: %s, %s\n",
-                    i, j,
-                    peer_access_matrix[i][j] ? "supported" : "not supported",
-                    peer_access_matrix[i][j] ?
-                        (peer_access_enabled_matrix[main_device][std::max(i,j)] ? "enabled" : "disabled")
-                        : "N/A");
-            }
-        }
-    }
-#endif
-
-    peer_access_enabled = enable_peer_access;
+    // P2P access management disabled - causes device lost errors on Intel Arc
+    // Using host-mediated cross-device copies instead
+    GGML_UNUSED(n_tokens);
+    GGML_UNUSED(main_device);
 }
 
 template <template <int> typename quantize_f>
 static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
                                  const ggml_tensor *src1, ggml_tensor *dst,
                                  ggml_sycl_op_mul_mat_t op) try {
+    
+    GGML_SYCL_DEBUG("[SYCL] mul_mat entry: tensor='%s' split=%d device_count=%d\n", 
+        src0->name, ggml_backend_buffer_is_sycl_split(src0->buffer), ggml_sycl_info().device_count);
 
     GGML_TENSOR_LOCALS(int64_t, ne0, src0, ne);
 
@@ -2637,6 +2664,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         // GGML_ASSERT(src0->buffer != nullptr && src0->buffer->buft == ...);
         ggml_backend_sycl_split_buffer_type_context * buft_ctx = (ggml_backend_sycl_split_buffer_type_context *) src0->buffer->buft->context;
         tensor_split = buft_ctx->tensor_split;
+        GGML_SYCL_DEBUG("[SYCL] mul_mat: tensor_split loaded: [0]=%.4f [1]=%.4f\n", tensor_split[0], tensor_split[1]);
     }
 
     struct dev_data {
@@ -2682,6 +2710,8 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                     dev[i].row_high -= dev[i].row_high % rounding;
                 }
             }
+            GGML_SYCL_DEBUG("[SYCL] mul_mat split device %d: tensor_split[%d]=%.4f row_low=%ld row_high=%ld ne01=%ld rounding=%ld ctx.device=%d\n",
+                i, i, tensor_split[i], (long)dev[i].row_low, (long)dev[i].row_high, (long)ne01, (long)rounding, ctx.device);
         }
     }
 
@@ -2701,7 +2731,18 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         queue_ptr stream = ctx.stream(i, 0);
 
         if (src0_is_contiguous) {
-            dev[i].src0_dd = (char *) src0->data;
+            // For split tensors, each device has its own copy in extra->data_device[i]
+            // For non-split tensors, use src0->data (which is on the current device)
+            if (split) {
+                dev[i].src0_dd = (char *) src0_extra->data_device[i];
+                GGML_SYCL_DEBUG("[SYCL] mul_mat device %d: using split src0 ptr=%p (extra->data_device[%d])\n",
+                    i, dev[i].src0_dd, i);
+                if (dev[i].src0_dd == nullptr) {
+                    fprintf(stderr, "[SYCL] ERROR: src0_extra->data_device[%d] is NULL!\n", i);
+                }
+            } else {
+                dev[i].src0_dd = (char *) src0->data;
+            }
         } else {
             dev[i].src0_dd = dev[i].src0_dd_alloc.alloc(ctx.pool(i), ggml_nbytes(src0));
         }
@@ -2713,13 +2754,59 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         }
 
         if constexpr(quantize_enabled) {
-            dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
+            size_t alloc_size = nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs;
+            GGML_SYCL_DEBUG("[SYCL] allocating src1_ddq on device %d: size=%zu bytes ctx.device=%d stream=%p\n",
+                i, alloc_size, ctx.device, stream);
+            
+            // Verify stream device matches expected device before allocation
+            sycl::device stream_dev = stream->get_device();
+            GGML_SYCL_DEBUG("[SYCL] stream device: %s\n", stream_dev.get_info<sycl::info::device::name>().c_str());
+            
+            dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), alloc_size);
+            GGML_SYCL_DEBUG("[SYCL] allocated src1_ddq on device %d: ptr=%p\n", i, dev[i].src1_ddq);
+            
+            // Test: Verify the allocation is accessible from this stream
+            auto alloc_type = sycl::get_pointer_type(dev[i].src1_ddq, stream->get_context());
+            auto alloc_dev = sycl::get_pointer_device(dev[i].src1_ddq, stream->get_context());
+            unsigned int alloc_dev_id = dpct::dev_mgr::instance().get_device_id(alloc_dev);
+            unsigned int stream_dev_id_chk = dpct::dev_mgr::instance().get_device_id(stream->get_device());
+            GGML_SYCL_DEBUG("[SYCL] src1_ddq alloc type=%d (0=unknown,1=device,2=host,3=shared) alloc_dev_id=%u stream_dev_id=%u\n",
+                (int)alloc_type, alloc_dev_id, stream_dev_id_chk);
+            
+            // Also check src1_ddf (the input)
+            auto src1_type = sycl::get_pointer_type(dev[i].src1_ddf, stream->get_context());
+            auto src1_dev = sycl::get_pointer_device(dev[i].src1_ddf, stream->get_context());
+            unsigned int src1_dev_id = dpct::dev_mgr::instance().get_device_id(src1_dev);
+            GGML_SYCL_DEBUG("[SYCL] src1_ddf type=%d src1_dev_id=%u\n", (int)src1_type, src1_dev_id);
 
             if (src1_on_device && src1_is_contiguous) {
                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
                                                      /*num_src=*/2, " : converting src1 to Q8_1");
+                // Verify pointer types for debugging
+                auto src1_ptr_type = sycl::get_pointer_type(dev[i].src1_ddf, stream->get_context());
+                auto dst_ptr_type = sycl::get_pointer_type(dev[i].src1_ddq, stream->get_context());
+                const char* src1_type_str = (src1_ptr_type == sycl::usm::alloc::device) ? "device" :
+                                            (src1_ptr_type == sycl::usm::alloc::shared) ? "shared" :
+                                            (src1_ptr_type == sycl::usm::alloc::host) ? "host" : "unknown";
+                const char* dst_type_str = (dst_ptr_type == sycl::usm::alloc::device) ? "device" :
+                                           (dst_ptr_type == sycl::usm::alloc::shared) ? "shared" :
+                                           (dst_ptr_type == sycl::usm::alloc::host) ? "host" : "unknown";
+                GGML_SYCL_DEBUG("[SYCL] quantize on device %d: src1_ddf=%p (%s) src1_ddq=%p (%s) ne10=%ld nrows1=%ld src1_padded_col_size=%ld stream_device=%s\n",
+                    i, dev[i].src1_ddf, src1_type_str, dev[i].src1_ddq, dst_type_str,
+                    (long)ne10, (long)nrows1, (long)src1_padded_col_size,
+                    stream->get_device().get_info<sycl::info::device::name>().c_str());
+
+                // Additional check: verify the stream's device matches expected device
+                auto stream_dev_id = dpct::dev_mgr::instance().get_device_id(stream->get_device());
+                if ((int)stream_dev_id != i) {
+                    fprintf(stderr, "[SYCL] ERROR: stream device id %u != expected device %d!\n", stream_dev_id, i);
+                }
+
                 try {
+                    GGML_SYCL_DEBUG("[SYCL] quantize on device %d: submitting kernel\n", i);
                     quantize_row_q8_1_sycl<quantize_f>(dev[i].src1_ddf, dev[i].src1_ddq, ne10, nrows1, src1_padded_col_size, stream);
+                    GGML_SYCL_DEBUG("[SYCL] quantize on device %d: kernel submitted\n", i);
+                    // Don't sync here - let the stream flow naturally and sync only at the end
                 } catch (sycl::exception const &exc) {
                     std::cerr << "Quantize_row_q8_1_sycl error" << exc.what() << "Exception caught at file:" << __FILE__
                               << ", line:" << __LINE__ << std::endl;
@@ -2732,23 +2819,29 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
             dev[i].dst_dd = (float *) dst->data;
         } else {
             const size_t size_dst_ddf = split ? (dev[i].row_high - dev[i].row_low)*ne1 : ggml_nelements(dst);
+            GGML_SYCL_DEBUG("[SYCL] allocating dst_dd for device %d: size=%zu\n", i, size_dst_ddf);
             dev[i].dst_dd = dev[i].dst_dd_alloc.alloc(ctx.pool(i), size_dst_ddf);
+            GGML_SYCL_DEBUG("[SYCL] allocated dst_dd for device %d: ptr=%p\n", i, dev[i].dst_dd);
         }
     }
+    GGML_SYCL_DEBUG("[SYCL] mul_mat: all device setup complete, used_devices=%d\n", used_devices);
 
     // if multiple devices are used they need to wait for the main device
-    // here an event is recorded that signals that the main device has finished calculating the input data
+    // Sync the main device queue so secondary devices know the data is ready
+    // (We use direct queue waits instead of cross-device events to avoid device lost errors)
     if (split && used_devices > 1) {
+        GGML_SYCL_DEBUG("[SYCL] mul_mat: syncing main device %d before multi-device compute\n", ctx.device);
         ggml_sycl_set_device(ctx.device);
-        SYCL_CHECK(CHECK_TRY_ERROR(
-            *src0_extra->events[ctx.device][0] =
-                ctx.stream()->ext_oneapi_submit_barrier()));
+        ctx.stream()->wait();
+        GGML_SYCL_DEBUG("[SYCL] mul_mat: main device sync done\n");
     }
 
     const int64_t src1_col_stride = split && used_devices > 1 ? MUL_MAT_SRC1_COL_STRIDE : ne11;
+    GGML_SYCL_DEBUG("[SYCL] mul_mat: entering compute loop ne11=%ld src1_col_stride=%ld\n", (long)ne11, (long)src1_col_stride);
     for (int64_t src1_col_0 = 0; src1_col_0 < ne11; src1_col_0 += src1_col_stride) {
         const int64_t is = split ? (src1_col_0/src1_col_stride) % GGML_SYCL_MAX_STREAMS : 0;
         const int64_t src1_ncols = src1_col_0 + src1_col_stride > ne11 ? ne11 - src1_col_0 : src1_col_stride;
+        GGML_SYCL_DEBUG("[SYCL] mul_mat: src1_col_0=%ld is=%ld src1_ncols=%ld\n", (long)src1_col_0, (long)is, (long)src1_ncols);
         for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
             if ((!split && i != ctx.device) || dev[i].row_low == dev[i].row_high) {
                 continue;
@@ -2758,13 +2851,17 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
             const bool  dst_on_device = i == ctx.device;
             const int64_t row_diff = dev[i].row_high - dev[i].row_low;
 
+            GGML_SYCL_DEBUG("[SYCL] mul_mat: compute device %d row_diff=%ld src1_on_device=%d dst_on_device=%d\n",
+                i, (long)row_diff, src1_on_device, dst_on_device);
             ggml_sycl_set_device(i);
             queue_ptr stream = ctx.stream(i, is);
 
             // wait for main GPU data if necessary
-            if (split && (i != ctx.device || is != 0)) {
-                SYCL_CHECK(CHECK_TRY_ERROR(stream->ext_oneapi_submit_barrier(
-                    {*src0_extra->events[ctx.device][0]})));
+            // For cross-device sync, we already synced main device before entering this loop
+            // For same-device different stream, we need to wait on the main stream
+            if (split && is != 0 && i == ctx.device) {
+                // Same device, different stream - wait on main stream
+                ctx.stream(i, 0)->wait();
             }
 
             for (int64_t i0 = 0; i0 < ne13*ne12; ++i0) {
@@ -2774,7 +2871,9 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                 const size_t src1_ddq_i_offset = (i0*ne11 + src1_col_0) * src1_padded_col_size*q8_1_ts/q8_1_bs;
 
                 // for split tensors the data begins at i0 == i0_offset_low
-                char  *  src0_dd_i =  dev[i].src0_dd + (i0/i02_divisor) * (ne01*ne00*src0_ts)/src0_bs;
+                // For split tensors, use row_diff (the number of rows on this device) instead of ne01
+                const int64_t nrows_device = split ? row_diff : ne01;
+                char  *  src0_dd_i =  dev[i].src0_dd + (i0/i02_divisor) * (nrows_device*ne00*src0_ts)/src0_bs;
                 float * src1_ddf_i = dev[i].src1_ddf + (i0*ne11 + src1_col_0) * ne10;
                 char  * src1_ddq_i = dev[i].src1_ddq +  src1_ddq_i_offset;
                 float *   dst_dd_i =   dev[i].dst_dd + (i0*ne1  + src1_col_0) * (dst_on_device ? ne0 : row_diff);
@@ -2790,18 +2889,18 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                     if (i != ctx.device) {
                         if constexpr (quantize_enabled) {
                             char * src1_ddq_i_source = dev[ctx.device].src1_ddq + src1_ddq_i_offset;
-                            SYCL_CHECK(
-                                CHECK_TRY_ERROR(stream
-                                                    ->memcpy(src1_ddq_i, src1_ddq_i_source,
-                                                             src1_ncols * src1_padded_col_size * q8_1_ts / q8_1_bs)
-                                                    .wait()));
+                            size_t copy_size = src1_ncols * src1_padded_col_size * q8_1_ts / q8_1_bs;
+                            GGML_SYCL_DEBUG("[SYCL] mul_mat: cross-device copy src1_ddq device %d->%d size=%zu src=%p dst=%p\n",
+                                ctx.device, i, copy_size, src1_ddq_i_source, src1_ddq_i);
+                            // Use dev2dev_memcpy for cross-device copy (host-mediated for reliability)
+                            dev2dev_memcpy(*stream, *main_stream, src1_ddq_i, src1_ddq_i_source, copy_size);
+                            GGML_SYCL_DEBUG("[SYCL] mul_mat: cross-device copy complete\n");
                         } else {
                             float * src1_ddf_i_source = (float *) src1_extra->data_device[ctx.device];
                             src1_ddf_i_source += (i0 * ne11 + src1_col_0) * ne10;
 
-                            SYCL_CHECK(
-                                CHECK_TRY_ERROR(dev2dev_memcpy(*stream, *main_stream, src1_ddf_i, src1_ddf_i_source,
-                                                               src1_ncols * ne10 * sizeof(float))));
+                            dev2dev_memcpy(*stream, *main_stream, src1_ddf_i, src1_ddf_i_source,
+                                           src1_ncols * ne10 * sizeof(float));
                         }
                     }
                 } else {
@@ -2833,11 +2932,17 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                     src1_padded_col_size = (i0 * ne11 + src1_col_0) * ne10;
                 }
                 // do the computation
+                GGML_SYCL_DEBUG("[SYCL] mul_mat: device %d row_low=%ld row_high=%ld src0_dd_i=%p dst_dd_i=%p\n",
+                    i, (long)dev[i].row_low, (long)dev[i].row_high, src0_dd_i, dst_dd_i);
+                
                 SYCL_CHECK(CHECK_TRY_ERROR(op(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
                     dev[i].row_low, dev[i].row_high, src1_ncols, src1_padded_col_size, stream)));
+                
+                GGML_SYCL_DEBUG("[SYCL] mul_mat: device %d kernel submitted\n", i);
 
                 // copy dst to host or other device if necessary
                 if (!dst_on_device) {
+                    GGML_SYCL_DEBUG("[SYCL] mul_mat: device %d copying result, split=%d\n", i, split);
                     void * dst_off_device = dst->data;
                     if (split) {
                         // src0 = weight matrix is saved as a transposed matrix for better memory layout.
@@ -2849,10 +2954,13 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                         GGML_ASSERT(dst->nb[1] == ne0*sizeof(float));
                         dhf_dst_i += src1_col_0*ne0 + dev[i].row_low;
 
-                        SYCL_CHECK(CHECK_TRY_ERROR(dpct::async_dpct_memcpy(
-                            dhf_dst_i, ne0 * sizeof(float), dst_dd_i,
-                            row_diff * sizeof(float), row_diff * sizeof(float),
-                            src1_ncols, dpct::device_to_device, *stream)));
+                        GGML_SYCL_DEBUG("[SYCL] mul_mat: device %d calling dev2dev_memcpy_2d\n", i);
+                        // Use cross-device 2D copy with fallback for multi-GPU
+                        dev2dev_memcpy_2d(*main_stream, *stream,
+                            dhf_dst_i, ne0 * sizeof(float),
+                            dst_dd_i, row_diff * sizeof(float),
+                            row_diff * sizeof(float), src1_ncols);
+                        GGML_SYCL_DEBUG("[SYCL] mul_mat: device %d dev2dev_memcpy_2d done\n", i);
                     } else {
                         float * dhf_dst_i = (float *) ((char *) dst_off_device + i02*nb2 + i03*nb3);
                         GGML_ASSERT(dst->nb[1] == ne0*sizeof(float));
@@ -2863,12 +2971,9 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                     }
                 }
 
-                // add event for the main device to wait on until other device is done
-                if (split && (i != ctx.device || is != 0)) {
-                    SYCL_CHECK(CHECK_TRY_ERROR(
-                        *src0_extra->events[i][is] =
-                            stream->ext_oneapi_submit_barrier()));
-                }
+                // Note: We no longer use cross-device event barriers as they cause
+                // device lost errors on some systems. Final synchronization is done
+                // by waiting on each device's queue directly at the end of the function.
             }
         }
     }
@@ -2878,17 +2983,24 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         int64_t is_max = (ne11 + MUL_MAT_SRC1_COL_STRIDE - 1) / MUL_MAT_SRC1_COL_STRIDE;
         is_max = is_max <= GGML_SYCL_MAX_STREAMS ? is_max : GGML_SYCL_MAX_STREAMS;
 
-        ggml_sycl_set_device(ctx.device);
+        // Wait on all device queues directly instead of using cross-device event barriers
+        // Cross-device event barriers can cause device lost errors on some systems
+        GGML_SYCL_DEBUG("[SYCL] mul_mat: final sync is_max=%ld\n", (long)is_max);
         for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
             if (dev[i].row_low == dev[i].row_high) {
                 continue;
             }
+            // Wait on each device's streams directly
             for (int64_t is = 0; is < is_max; ++is) {
-                SYCL_CHECK(CHECK_TRY_ERROR(
-                    ctx.stream()->ext_oneapi_submit_barrier(
-                        {*src0_extra->events[i][is]})));
+                GGML_SYCL_DEBUG("[SYCL] mul_mat: waiting on device %d stream %ld\n", i, (long)is);
+                ggml_sycl_set_device(i);
+                ctx.stream(i, is)->wait();
+                GGML_SYCL_DEBUG("[SYCL] mul_mat: device %d stream %ld done\n", i, (long)is);
             }
         }
+        // Switch back to main device
+        ggml_sycl_set_device(ctx.device);
+        GGML_SYCL_DEBUG("[SYCL] mul_mat: final sync complete\n");
     }
 }
 catch (sycl::exception const &exc) {
@@ -4973,12 +5085,24 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
 }
 
 static bool ggml_backend_sycl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    if (buft->iface.get_name != ggml_backend_sycl_buffer_type_get_name) {
-        return false;
+    // Regular device buffer
+    if (buft->iface.get_name == ggml_backend_sycl_buffer_type_get_name) {
+        ggml_backend_sycl_buffer_type_context * buft_ctx = (ggml_backend_sycl_buffer_type_context *)buft->context;
+        ggml_backend_sycl_device_context * sycl_ctx = (ggml_backend_sycl_device_context *)dev->context;
+        return buft_ctx->device == sycl_ctx->device;
     }
-    ggml_backend_sycl_buffer_type_context * buft_ctx = (ggml_backend_sycl_buffer_type_context *)buft->context;
-    ggml_backend_sycl_device_context * sycl_ctx = (ggml_backend_sycl_device_context *)dev->context;
-    return buft_ctx->device == sycl_ctx->device;
+
+    // Split buffer (row split mode) - supported by all SYCL devices
+    if (buft->iface.get_name == ggml_backend_sycl_split_buffer_type_get_name) {
+        return true;
+    }
+
+    // Host buffer - supported by all SYCL devices
+    if (buft->iface.get_name == ggml_backend_sycl_host_buffer_type_name) {
+        return true;
+    }
+
+    return false;
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
