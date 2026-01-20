@@ -105,10 +105,6 @@ inline bool ggml_sycl_flash_attn_use_mkl(sycl::device device) {
 
 
 bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
-    static FILE *dbg = fopen("/tmp/llama_sycl_support.txt", "a");
-    fprintf(dbg, "ggml_sycl_flash_attn_ext_supported: called\n");
-    fflush(dbg);
-    
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -120,23 +116,17 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     std::memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     std::memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
-    if( max_bias != 0.0f || logit_softcap != 0.0f){
-        fprintf(dbg, "  rejected: max_bias=%f or logit_softcap=%f\n", max_bias, logit_softcap);
-        fflush(dbg);
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
         return false;
     }
 
     if (Q == nullptr || K == nullptr || V == nullptr) {
-        fprintf(dbg, "  rejected: null tensor\n");
-        fflush(dbg);
         return false;
     }
 
     // Causal masking support: check if mask is present but not custom
     // For custom masks, we still need to check if we support the specific type
     if (mask != nullptr && mask->type != GGML_TYPE_F32 && mask->type != GGML_TYPE_F16) {
-        fprintf(dbg, "  rejected: mask present and not F32/F16, type=%d, ne[0]=%ld\n", mask->type, mask->ne[0]);
-        fflush(dbg);
         return false;
     }
     
@@ -146,27 +136,17 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     const bool is_all_f16 = (Q->type == GGML_TYPE_F16 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
     const bool is_mixed_f32_q = (Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
     if (!is_all_f32 && !is_all_f16 && !is_mixed_f32_q) {
-        fprintf(stderr, "ggml_sycl_flash_attn_ext_supported: rejected, type not F32/F16 (Q=%d, K=%d, V=%d)\n",
-                Q->type, K->type, V->type);
-        fprintf(dbg, "  rejected: type not F32/F16 (Q=%d, K=%d, V=%d)\n", Q->type, K->type, V->type);
-        fflush(dbg);
         return false;
     }
 
     int64_t DQK = Q->ne[0];
     int64_t DV  = V->ne[0];
 
-    if (DQK != DV){
-        fprintf(stderr, "ggml_sycl_flash_attn_ext_supported: rejected, DQK != DV (%ld != %ld)\n", DQK, DV);
-        fprintf(dbg, "  rejected: DQK != DV (%ld != %ld)\n", DQK, DV);
-        fflush(dbg);
+    if (DQK != DV) {
         return false;
     }
 
-    if (!is_head_size_supported(DV)){
-        fprintf(stderr, "ggml_sycl_flash_attn_ext_supported: rejected, unsupported head size %ld (not paddable)\n", DV);
-        fprintf(dbg, "  rejected: unsupported head size %ld\n", DV);
-        fflush(dbg);
+    if (!is_head_size_supported(DV)) {
         return false;
     }
 
@@ -641,7 +621,7 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
     constexpr int THREADS_PER_WG = 64;
     
     static bool first_call = true;
-    if (first_call) {
+    if (first_call && getenv("GGML_SYCL_FLASH_ATTN_DEBUG")) {
         fprintf(stderr, "ggml_sycl: XMX flash_attn_coopmat N=%ld N_kv=%ld n_heads=%ld n_kv_heads=%ld DQK=%ld scale=%f\n",
                 N, N_kv, n_heads, n_kv_heads, DQK, scale);
         fprintf(stderr, "ggml_sycl: types: Q=%d K=%d V=%d (q_f16=%d k_f16=%d v_f16=%d)\n",
@@ -726,7 +706,7 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
     }
     
     static bool mask_debug = true;
-    if (mask_debug && mask_d != nullptr) {
+    if (mask_debug && mask_d != nullptr && getenv("GGML_SYCL_FLASH_ATTN_DEBUG")) {
         fprintf(stderr, "ggml_sycl: Using mask tensor: ne=[%ld, %ld, %ld], stride=%ld, type=%d\n",
                 mask->ne[0], mask->ne[1], mask->ne[2], mask_stride, mask->type);
         // Debug: print first few mask values

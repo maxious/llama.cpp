@@ -13,11 +13,6 @@
 #include "mmq.hpp"
 #include "vecdotq.hpp"
 
-#ifdef SYCL_EXT_COOPERATIVE_MATRICES
-#include <sycl/ext/oneapi/matrix/matrix-intel.hpp>
-namespace cm = sycl::ext::oneapi::experimental::matrix;
-#endif
-
 typedef void (*allocate_tiles_sycl_t)(
     int** x_ql,
     sycl::half2** x_dm,
@@ -1345,15 +1340,9 @@ mul_mat_q(const void *__restrict__ vx, const void *__restrict__ vy,
 #define  MMQ_X_Q4_0_RDNA1  64
 #define  MMQ_Y_Q4_0_RDNA1  64
 #define NWARPS_Q4_0_RDNA1  8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q4_0_AMPERE 4
-#define  MMQ_Y_Q4_0_AMPERE 32
-#define NWARPS_Q4_0_AMPERE 4
-#else
 #define  MMQ_X_Q4_0_AMPERE 64
 #define  MMQ_Y_Q4_0_AMPERE 128
 #define NWARPS_Q4_0_AMPERE 4
-#endif
 #define  MMQ_X_Q4_0_PASCAL 64
 #define  MMQ_Y_Q4_0_PASCAL 64
 #define NWARPS_Q4_0_PASCAL 8
@@ -1389,15 +1378,9 @@ template <bool need_check> static void
 #define  MMQ_X_Q4_1_RDNA1  64
 #define  MMQ_Y_Q4_1_RDNA1  64
 #define NWARPS_Q4_1_RDNA1  8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q4_1_AMPERE 4
-#define  MMQ_Y_Q4_1_AMPERE 32
-#define NWARPS_Q4_1_AMPERE 4
-#else
 #define  MMQ_X_Q4_1_AMPERE 64
 #define  MMQ_Y_Q4_1_AMPERE 128
 #define NWARPS_Q4_1_AMPERE 4
-#endif
 #define  MMQ_X_Q4_1_PASCAL 64
 #define  MMQ_Y_Q4_1_PASCAL 64
 #define NWARPS_Q4_1_PASCAL 8
@@ -1432,15 +1415,9 @@ template <bool need_check> static void
 #define  MMQ_X_Q5_0_RDNA1  64
 #define  MMQ_Y_Q5_0_RDNA1  64
 #define NWARPS_Q5_0_RDNA1  8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q5_0_AMPERE 4
-#define  MMQ_Y_Q5_0_AMPERE 32
-#define NWARPS_Q5_0_AMPERE 4
-#else
 #define  MMQ_X_Q5_0_AMPERE 128
 #define  MMQ_Y_Q5_0_AMPERE 64
 #define NWARPS_Q5_0_AMPERE 4
-#endif
 #define  MMQ_X_Q5_0_PASCAL 64
 #define  MMQ_Y_Q5_0_PASCAL 64
 #define NWARPS_Q5_0_PASCAL 8
@@ -1475,15 +1452,9 @@ template <bool need_check> static void
 #define  MMQ_X_Q5_1_RDNA1  64
 #define  MMQ_Y_Q5_1_RDNA1  64
 #define NWARPS_Q5_1_RDNA1  8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q5_1_AMPERE 4
-#define  MMQ_Y_Q5_1_AMPERE 32
-#define NWARPS_Q5_1_AMPERE 4
-#else
 #define  MMQ_X_Q5_1_AMPERE 128
 #define  MMQ_Y_Q5_1_AMPERE 64
 #define NWARPS_Q5_1_AMPERE 4
-#endif
 #define  MMQ_X_Q5_1_PASCAL 64
 #define  MMQ_Y_Q5_1_PASCAL 64
 #define NWARPS_Q5_1_PASCAL 8
@@ -1518,15 +1489,9 @@ mul_mat_q5_1(
 #define  MMQ_X_Q8_0_RDNA1  64
 #define  MMQ_Y_Q8_0_RDNA1  64
 #define NWARPS_Q8_0_RDNA1  8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q8_0_AMPERE 4
-#define  MMQ_Y_Q8_0_AMPERE 32
-#define NWARPS_Q8_0_AMPERE 4
-#else
 #define  MMQ_X_Q8_0_AMPERE 128
 #define  MMQ_Y_Q8_0_AMPERE 64
 #define NWARPS_Q8_0_AMPERE 4
-#endif
 #define  MMQ_X_Q8_0_PASCAL 64
 #define  MMQ_Y_Q8_0_PASCAL 64
 #define NWARPS_Q8_0_PASCAL 8
@@ -1561,15 +1526,9 @@ template <bool need_check> static void
 #define  MMQ_X_Q2_K_RDNA1  128
 #define  MMQ_Y_Q2_K_RDNA1  32
 #define NWARPS_Q2_K_RDNA1  8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q2_K_AMPERE 4
-#define  MMQ_Y_Q2_K_AMPERE 32
-#define NWARPS_Q2_K_AMPERE 4
-#else
 #define  MMQ_X_Q2_K_AMPERE 64
 #define  MMQ_Y_Q2_K_AMPERE 128
 #define NWARPS_Q2_K_AMPERE 4
-#endif
 #define  MMQ_X_Q2_K_PASCAL 64
 #define  MMQ_Y_Q2_K_PASCAL 64
 #define NWARPS_Q2_K_PASCAL 8
@@ -1605,15 +1564,9 @@ mul_mat_q2_K(
 #define  MMQ_X_Q3_K_RDNA1  32
 #define  MMQ_Y_Q3_K_RDNA1  128
 #define NWARPS_Q3_K_RDNA1  8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q3_K_AMPERE 4
-#define  MMQ_Y_Q3_K_AMPERE 32
-#define NWARPS_Q3_K_AMPERE 4
-#else
 #define  MMQ_X_Q3_K_AMPERE 128
 #define  MMQ_Y_Q3_K_AMPERE 128
 #define NWARPS_Q3_K_AMPERE 4
-#endif
 #define  MMQ_X_Q3_K_PASCAL 64
 #define  MMQ_Y_Q3_K_PASCAL 64
 #define NWARPS_Q3_K_PASCAL 8
@@ -1650,15 +1603,9 @@ mul_mat_q3_K(
 #define  MMQ_X_Q4_K_RDNA1  32
 #define  MMQ_Y_Q4_K_RDNA1  64
 #define NWARPS_Q4_K_RDNA1  8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q4_K_AMPERE 4
-#define  MMQ_Y_Q4_K_AMPERE 32
-#define NWARPS_Q4_K_AMPERE 4
-#else
 #define  MMQ_X_Q4_K_AMPERE 64
 #define  MMQ_Y_Q4_K_AMPERE 128
 #define NWARPS_Q4_K_AMPERE 4
-#endif
 #define  MMQ_X_Q4_K_PASCAL 64
 #define  MMQ_Y_Q4_K_PASCAL 64
 #define NWARPS_Q4_K_PASCAL 8
@@ -1694,15 +1641,9 @@ template <bool need_check> static void
 #define  MMQ_X_Q5_K_RDNA1  32
 #define  MMQ_Y_Q5_K_RDNA1  64
 #define NWARPS_Q5_K_RDNA1  8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q5_K_AMPERE 4
-#define  MMQ_Y_Q5_K_AMPERE 32
-#define NWARPS_Q5_K_AMPERE 4
-#else
 #define  MMQ_X_Q5_K_AMPERE 64
 #define  MMQ_Y_Q5_K_AMPERE 128
 #define NWARPS_Q5_K_AMPERE 4
-#endif
 #define  MMQ_X_Q5_K_PASCAL 64
 #define  MMQ_Y_Q5_K_PASCAL 64
 #define NWARPS_Q5_K_PASCAL 8
@@ -1738,15 +1679,9 @@ mul_mat_q5_K(
 #define  MMQ_X_Q6_K_RDNA1  32
 #define  MMQ_Y_Q6_K_RDNA1  64
 #define NWARPS_Q6_K_RDNA1  8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q6_K_AMPERE 4
-#define  MMQ_Y_Q6_K_AMPERE 32
-#define NWARPS_Q6_K_AMPERE 4
-#else
 #define  MMQ_X_Q6_K_AMPERE 64
 #define  MMQ_Y_Q6_K_AMPERE 64
 #define NWARPS_Q6_K_AMPERE 4
-#endif
 #define  MMQ_X_Q6_K_PASCAL 64
 #define  MMQ_Y_Q6_K_PASCAL 64
 #define NWARPS_Q6_K_PASCAL 8
@@ -2964,21 +2899,6 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-#ifdef SYCL_EXT_COOPERATIVE_MATRICES
-// Forward declarations for XMX kernels
-static bool ggml_sycl_q4_has_xmx_support(sycl::device device);
-static void ggml_mul_mat_q4_0_q8_1_xmx_sycl(
-    const void * __restrict__ vx, const void * __restrict__ vy,
-    float * __restrict__ dst, const int ncols_x, const int nrows_x,
-    const int ncols_y, const int nrows_y, const int nrows_dst,
-    dpct::queue_ptr stream);
-static void ggml_mul_mat_q2_K_q8_1_xmx_sycl(
-    const void * __restrict__ vx, const void * __restrict__ vy,
-    float * __restrict__ dst, const int ncols_x, const int nrows_x,
-    const int ncols_y, const int nrows_y, const int nrows_dst,
-    dpct::queue_ptr stream);
-#endif
-
 void ggml_sycl_op_mul_mat_q(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -3005,21 +2925,12 @@ void ggml_sycl_op_mul_mat_q(
     const int64_t nrows_dst = device_id == ctx.device ? ne0 : row_diff;
 
     switch (src0->type) {
-        case GGML_TYPE_Q4_0: {
-#ifdef SYCL_EXT_COOPERATIVE_MATRICES
-            // Try XMX path first if device supports it
-            sycl::device device = stream->get_device();
-            if (ggml_sycl_q4_has_xmx_support(device)) {
-                fprintf(stderr, "ggml_sycl: Q4_0 using FP16 XMX path\n");
-                ggml_mul_mat_q4_0_q8_1_xmx_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
-            } else {
-                ggml_mul_mat_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
-            }
-#else
+        case GGML_TYPE_Q4_0:
+            // dp4a path is optimal for decode (batch=1) and small batches
+            // XMX could potentially help for large prompt batches (ncols_y >= 32) but
+            // the dequantization overhead typically negates benefits for quantized matmul
             ggml_mul_mat_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
-#endif
             break;
-        }
         case GGML_TYPE_Q4_1:
             ggml_mul_mat_q4_1_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
@@ -3033,12 +2944,9 @@ void ggml_sycl_op_mul_mat_q(
             ggml_mul_mat_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
         case GGML_TYPE_Q2_K:
-#ifdef SYCL_EXT_COOPERATIVE_MATRICES
-            fprintf(stderr, "ggml_sycl: Dispatching Q2_K to XMX path\n");
-            ggml_mul_mat_q2_K_q8_1_xmx_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
-#else
+            // K-quants have complex scale/min handling that doesn't map well to XMX
+            // dp4a with per-block scaling is more efficient for these formats
             ggml_mul_mat_q2_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
-#endif
             break;
         case GGML_TYPE_Q3_K:
             ggml_mul_mat_q3_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
@@ -3066,355 +2974,16 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-#ifdef SYCL_EXT_COOPERATIVE_MATRICES
+// Note: XMX (cooperative matrix) acceleration for quantized matmul was evaluated but
+// the dp4a (int8 dot product) path is generally more efficient because:
+// 1. XMX requires dequantizing to bf16/fp16 which adds overhead
+// 2. For decode (batch=1), XMX tiles can't be filled efficiently
+// 3. K-quants have complex per-block scale/min that doesn't map well to GEMM
+//
+// XMX is used successfully in flash attention where inputs are already fp16/fp32.
+// For quantized weights, the dp4a path with per-block scaling remains optimal.
+//
+// Future consideration: XMX could help for very large prompt batches (ncols_y >= 64)
+// with simple quants (Q4_0/Q4_1) if dequantization is done efficiently in shared memory.
 
-#include <sycl/ext/oneapi/matrix/matrix-intel.hpp>
-#include <sycl/ext/oneapi/group_local_memory.hpp>
 
-namespace cm = sycl::ext::oneapi::experimental::matrix;
-using sycl::ext::oneapi::group_local_memory;
-
-// Check if device supports XMX for quantized matmul
-bool ggml_sycl_q4_has_xmx_support(sycl::device device) {
-    return device.has(sycl::aspect::ext_intel_matrix) &&
-           device.has(sycl::aspect::ext_intel_gpu_eu_simd_width);
-}
-
-// XMX-accelerated Q4_0 x Q8_1 matmul kernel for Intel Arc B60 (Xe2/Battlemage)
-// Uses FP16 joint matrices for A/B operands (required on Xe2 - float32 not supported)
-void ggml_mul_mat_q4_0_q8_1_xmx_sycl(
-    const void * __restrict__ vx,      // Q4_0 blocks [n_blocks, 18 bytes]
-    const void * __restrict__ vy,      // Q8_1 blocks [n_blocks, 36 bytes]
-    float * __restrict__ dst,           // Output [nrows_x, ncols_y]
-    const int ncols_x,                  // Columns in X (should be multiple of 32)
-    const int nrows_x,                  // Rows in X
-    const int ncols_y,                  // Columns in Y
-    const int nrows_y,                  // Rows in Y (should be 32)
-    const int nrows_dst,
-    dpct::queue_ptr stream) try {
-
-    sycl::device device = stream->get_device();
-
-    if (!device.has(sycl::aspect::ext_intel_matrix) ||
-        !device.has(sycl::aspect::ext_intel_gpu_eu_simd_width)) {
-        fprintf(stderr, "ggml_sycl: XMX not supported for Q4_0, falling back\n");
-        return;
-    }
-
-    fprintf(stderr, "ggml_sycl: Using FP16 XMX Q4_0 kernel (Xe2/Battlemage)\n");
-
-    constexpr int BLOCK_M = 32;
-    constexpr int BLOCK_N = 32;
-    constexpr int THREADS = 64;
-
-    // Q4_0 block: d (2B) + qs (16B) = 18 bytes, 32 elements
-    constexpr int Q4_BLOCK_SIZE = 32;
-    constexpr int Q4_BYTES_PER_BLOCK = 18;
-
-    // Q8_1 block: d (2B) + qs (32B) = 34 bytes, 32 elements
-    constexpr int Q8_BLOCK_SIZE = 32;
-    constexpr int Q8_BYTES_PER_BLOCK = 34;
-
-    const int64_t nblocks_x = nrows_x / Q4_BLOCK_SIZE;
-
-    // Grid: (ncols_y / BLOCK_N) workgroups, each processing BLOCK_M rows
-    const sycl::range<2> global(
-        (ncols_y + BLOCK_N - 1) / BLOCK_N * BLOCK_N,
-        (nrows_x + BLOCK_M - 1) / BLOCK_M * BLOCK_M
-    );
-    const sycl::range<2> local(BLOCK_N, THREADS / 2);
-
-    // Shared memory layout: [BLOCK_M*32 FP16 for Q][BLOCK_N*32 FP16 for K][BLOCK_M*32 FP32 for Acc]
-    constexpr int SHMEM_Q_FP16 = BLOCK_M * 32;
-    constexpr int SHMEM_K_FP16 = BLOCK_N * 32;
-    constexpr int SHMEM_ACC_FP32 = BLOCK_M * 32;
-    constexpr int TOTAL_SHMEM = SHMEM_Q_FP16 + SHMEM_K_FP16 + SHMEM_ACC_FP32;
-
-    stream->submit([&](sycl::handler &cgh) {
-        cgh.parallel_for(sycl::nd_range<2>(global, local),
-            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                using namespace sycl::ext::oneapi::experimental::matrix;
-
-                // Allocate shared memory as bytes
-                auto shmem = sycl::ext::oneapi::group_local_memory_for_overwrite<
-                    unsigned char[TOTAL_SHMEM]>(it.get_group());
-
-                // Get typed pointers into shared memory
-                sycl::half* shQ = reinterpret_cast<sycl::half*>(shmem.get());
-                sycl::half* shK = shQ + SHMEM_Q_FP16;
-                float* shAcc = reinterpret_cast<float*>(shK + SHMEM_K_FP16);
-
-                const int lid = it.get_local_id(0);
-                const int sg_id = it.get_sub_group().get_group_id()[0];
-                const int gid_x = it.get_group(0);
-                const int gid_y = it.get_group(1);
-
-                if (gid_x >= ncols_y || gid_y * BLOCK_M >= nrows_x) return;
-
-                // Process all blocks
-                for (int block = 0; block < nblocks_x; ++block) {
-                    const int q_block_offset = block * Q4_BYTES_PER_BLOCK;
-                    const uint8_t *q_block = (const uint8_t *)vx + q_block_offset;
-
-                    // Load scale as FP16
-                    uint16_t d_bits = q_block[0] | (q_block[1] << 8);
-                    sycl::half d = *reinterpret_cast<const sycl::half *>(&d_bits);
-
-                    // Dequantize Q4_0 into shared memory as FP16
-                    for (int i = lid; i < Q4_BLOCK_SIZE; i += BLOCK_N) {
-                        int row_in_tile = i % 16;
-                        int col_in_tile = i / 16;
-                        int tile_row = gid_y * BLOCK_M + row_in_tile;
-                        int tile_col = col_in_tile * 16;
-
-                        if (tile_row < nrows_x && gid_x * BLOCK_N + tile_col < ncols_y) {
-                            uint8_t qs_byte = q_block[2 + i];
-                            int q0 = (qs_byte & 0x0F);
-                            int q1 = (qs_byte >> 4);
-                            // Dequantize: q * d - 8*d
-                            shQ[row_in_tile * 32 + i] = sycl::half(d * (float(q0) - 8.0f));
-                            shQ[(row_in_tile + 16) * 32 + i] = sycl::half(d * (float(q1) - 8.0f));
-                        }
-                    }
-
-                    const int k_block_offset = gid_x * Q8_BYTES_PER_BLOCK;
-                    const uint8_t *k_block = (const uint8_t *)vy + k_block_offset;
-
-                    // Dequantize Q8_1 into shared memory as FP16
-                    for (int i = lid; i < Q8_BLOCK_SIZE; i += BLOCK_N) {
-                        int row_in_tile = i % 16;
-                        int col_in_tile = i / 16;
-                        int tile_row = row_in_tile;
-                        int tile_col = gid_x * BLOCK_N + col_in_tile * 16;
-
-                        if (gid_y * BLOCK_M + tile_row < nrows_x && tile_col < ncols_y) {
-                            int8_t q_val = k_block[2 + i];
-                            shK[i * 32 + row_in_tile * 32] = sycl::half((float)q_val);
-                            shK[i * 32 + row_in_tile * 32 + 16] = sycl::half((float)(int8_t)k_block[2 + i + 16]);
-                        }
-                    }
-
-                    it.barrier(sycl::access::fence_space::local_space);
-
-                    // Compute with cooperative matrices using sub_group
-                    auto sg = it.get_sub_group();
-
-                    for (int j = 0; j < BLOCK_N; j += 16) {
-                        // Accumulator is always float32
-                        joint_matrix<sycl::sub_group, float, use::accumulator, 16, 16, layout::dynamic> matAcc;
-                        joint_matrix_fill(sg, matAcc, 0.0f);
-
-                        for (int k = 0; k < 32; k += 16) {
-                            // A and B matrices are FP16 (REQUIRED on Xe2/Battlemage)
-                            joint_matrix<sycl::sub_group, sycl::half, use::a, 16, 16, layout::row_major> mq;
-                            joint_matrix<sycl::sub_group, sycl::half, use::b, 16, 16, layout::col_major> mk;
-
-                            auto mq_ptr = sycl::address_space_cast<
-                                sycl::access::address_space::local_space,
-                                sycl::access::decorated::yes>(&shQ[(sg_id * 16) * 32 + k]);
-                            auto mk_ptr = sycl::address_space_cast<
-                                sycl::access::address_space::local_space,
-                                sycl::access::decorated::yes>(&shK[j * 32 + k]);
-
-                            joint_matrix_load(sg, mq, mq_ptr, 32);
-                            joint_matrix_load(sg, mk, mk_ptr, 32);
-
-                            // oneAPI 2025.3: joint_matrix_mad
-                            joint_matrix_mad(sg, matAcc, mq, mk, matAcc);
-                        }
-
-                        auto acc_ptr = sycl::address_space_cast<
-                            sycl::access::address_space::local_space,
-                            sycl::access::decorated::yes>(&shAcc[(sg_id * 16) * 32 + j]);
-                        joint_matrix_store(sg, matAcc, acc_ptr, 32, layout::row_major);
-                    }
-
-                    it.barrier(sycl::access::fence_space::local_space);
-
-                    // Store results
-                    for (int i = 0; i < 16; ++i) {
-                        int row = gid_y * BLOCK_M + sg_id * 16 + i;
-                        int col = gid_x * BLOCK_N + lid;
-
-                        if (row < nrows_x && col < ncols_y) {
-                            dst[row * nrows_dst + col] = shAcc[i * 32 + lid];
-                        }
-                    }
-
-                    it.barrier(sycl::access::fence_space::local_space);
-                }
-            });
-    });
-}
-catch (sycl::exception const &exc) {
-    std::cerr << "XMX Q4_0 kernel: " << exc.what() << std::endl;
-}
-
-// Q2_K XMX-accelerated matmul kernel for Intel Arc B60 (Xe2/Battlemage)
-// Uses FP16 joint matrices for A/B operands (required on Xe2 - float32 not supported)
-// Q2_K format: d (2B) + dmin (2B) + scales (4B) + qs (32B) = 40 bytes per 256-element block
-void ggml_mul_mat_q2_K_q8_1_xmx_sycl(
-    const void * __restrict__ vx,
-    const void * __restrict__ vy,
-    float * __restrict__ dst,
-    const int ncols_x,
-    const int nrows_x,
-    const int ncols_y,
-    const int nrows_y,
-    const int nrows_dst,
-    dpct::queue_ptr stream) try {
-
-    sycl::device device = stream->get_device();
-    if (!device.has(sycl::aspect::ext_intel_matrix) ||
-        !device.has(sycl::aspect::ext_intel_gpu_eu_simd_width)) {
-        fprintf(stderr, "ggml_sycl: XMX not supported for Q2_K, falling back\n");
-        return;
-    }
-
-    fprintf(stderr, "ggml_sycl: Using FP16 XMX Q2_K kernel (Xe2/Battlemage)\n");
-
-    constexpr int BLOCK_M = 32;
-    constexpr int BLOCK_N = 32;
-    constexpr int THREADS = 64;
-    constexpr int Q2_BLOCK_SIZE = 256;
-    constexpr int Q2_BYTES_PER_BLOCK = 40;
-    constexpr int Q8_BLOCK_SIZE = 32;
-    constexpr int Q8_BYTES_PER_BLOCK = 34;
-
-    const int64_t nblocks_x = nrows_x / Q2_BLOCK_SIZE;
-
-    const sycl::range<2> global(
-        (ncols_y + BLOCK_N - 1) / BLOCK_N * BLOCK_N,
-        (nrows_x + BLOCK_M - 1) / BLOCK_M * BLOCK_M
-    );
-    const sycl::range<2> local(BLOCK_N, THREADS / 2);
-
-    // Shared memory layout: [BLOCK_M*32 FP16 for Q][BLOCK_N*32 FP16 for K][BLOCK_M*32 FP32 for Acc]
-    constexpr int SHMEM_Q_FP16 = BLOCK_M * 32;
-    constexpr int SHMEM_K_FP16 = BLOCK_N * 32;
-    constexpr int SHMEM_ACC_FP32 = BLOCK_M * 32;
-    constexpr int TOTAL_SHMEM = SHMEM_Q_FP16 + SHMEM_K_FP16 + SHMEM_ACC_FP32;
-
-    stream->submit([&](sycl::handler &cgh) {
-        cgh.parallel_for(sycl::nd_range<2>(global, local),
-            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                using namespace sycl::ext::oneapi::experimental::matrix;
-
-                // Allocate shared memory as bytes
-                auto shmem = sycl::ext::oneapi::group_local_memory_for_overwrite<
-                    unsigned char[TOTAL_SHMEM]>(it.get_group());
-
-                // Get typed pointers into shared memory
-                sycl::half* shQ = reinterpret_cast<sycl::half*>(shmem.get());
-                sycl::half* shK = shQ + SHMEM_Q_FP16;
-                float* shAcc = reinterpret_cast<float*>(shK + SHMEM_K_FP16);
-
-                const int lid = it.get_local_id(0);
-                const int sg_id = it.get_sub_group().get_group_id()[0];
-                const int gid_x = it.get_group(0);
-                const int gid_y = it.get_group(1);
-
-                if (gid_x >= ncols_y || gid_y * BLOCK_M >= nrows_x) return;
-
-                for (int block = 0; block < nblocks_x; ++block) {
-                    // Q2_K block layout: d(2) + dmin(2) + scales(4) + qs(32)
-                    const uint8_t *q_block = (const uint8_t *)vx + block * Q2_BYTES_PER_BLOCK;
-
-                    // Load d and dmin as FP16
-                    uint16_t d_bits = q_block[0] | (q_block[1] << 8);
-                    uint16_t dmin_bits = q_block[2] | (q_block[3] << 8);
-                    sycl::half d = *reinterpret_cast<const sycl::half *>(&d_bits);
-                    sycl::half dmin = *reinterpret_cast<const sycl::half *>(&dmin_bits);
-
-                    // Load scales as FP16 (pre-computed)
-                    sycl::half scales[4];
-                    for (int s = 0; s < 4; ++s) {
-                        scales[s] = sycl::half((float)(q_block[4 + s] & 0x3F) / 64.0f);
-                    }
-
-                    // Dequantize Q2_K into shared memory as FP16
-                    for (int i = lid; i < Q2_BLOCK_SIZE; i += BLOCK_N) {
-                        int sub_block = (i / 64) % 4;
-                        int row_in_tile = i / 32;
-                        int col_in_tile = i % 32;
-                        int tile_row = gid_y * BLOCK_M + row_in_tile;
-
-                        if (tile_row < nrows_x && gid_x * BLOCK_N + col_in_tile < ncols_y) {
-                            uint8_t qs_byte = q_block[8 + i / 4];
-                            int shift = (i % 4) * 2;
-                            int q_val = (qs_byte >> shift) & 0x03;
-                            shQ[row_in_tile * 32 + col_in_tile] = d * scales[sub_block] * sycl::half((float)q_val) - dmin;
-                        }
-                    }
-
-                    // Load K tile as FP16
-                    const uint8_t *k_block = (const uint8_t *)vy + gid_x * Q8_BYTES_PER_BLOCK;
-                    for (int i = lid; i < Q8_BLOCK_SIZE; i += BLOCK_N) {
-                        int row_in_tile = i % 16;
-                        int col_in_tile = i / 16;
-                        int tile_row = row_in_tile;
-                        int tile_col = gid_x * BLOCK_N + col_in_tile * 16;
-
-                        if (gid_y * BLOCK_M + tile_row < nrows_x && tile_col < ncols_y) {
-                            int8_t q_val = k_block[2 + i];
-                            shK[i * 32 + tile_row * 32] = sycl::half((float)q_val);
-                            shK[i * 32 + tile_row * 32 + 16] = sycl::half((float)(int8_t)k_block[2 + i + 16]);
-                        }
-                    }
-
-                    it.barrier(sycl::access::fence_space::local_space);
-
-                    // Compute with cooperative matrices
-                    auto sg = it.get_sub_group();
-
-                    for (int j = 0; j < BLOCK_N; j += 16) {
-                        // Accumulator is always float32
-                        joint_matrix<sycl::sub_group, float, use::accumulator, 16, 16, layout::dynamic> matAcc;
-                        joint_matrix_fill(sg, matAcc, 0.0f);
-
-                        for (int k = 0; k < 32; k += 16) {
-                            // A and B matrices are FP16 (REQUIRED on Xe2/Battlemage)
-                            joint_matrix<sycl::sub_group, sycl::half, use::a, 16, 16, layout::row_major> mq;
-                            joint_matrix<sycl::sub_group, sycl::half, use::b, 16, 16, layout::col_major> mk;
-
-                            auto mq_ptr = sycl::address_space_cast<
-                                sycl::access::address_space::local_space,
-                                sycl::access::decorated::yes>(&shQ[(sg_id * 16) * 32 + k]);
-                            auto mk_ptr = sycl::address_space_cast<
-                                sycl::access::address_space::local_space,
-                                sycl::access::decorated::yes>(&shK[j * 32 + k]);
-
-                            joint_matrix_load(sg, mq, mq_ptr, 32);
-                            joint_matrix_load(sg, mk, mk_ptr, 32);
-
-                            joint_matrix_mad(sg, matAcc, mq, mk, matAcc);
-                        }
-
-                        auto acc_ptr = sycl::address_space_cast<
-                            sycl::access::address_space::local_space,
-                            sycl::access::decorated::yes>(&shAcc[(sg_id * 16) * 32 + j]);
-                        joint_matrix_store(sg, matAcc, acc_ptr, 32, layout::row_major);
-                    }
-
-                    it.barrier(sycl::access::fence_space::local_space);
-
-                    // Store results
-                    for (int i = 0; i < 16; ++i) {
-                        int row = gid_y * BLOCK_M + sg_id * 16 + i;
-                        int col = gid_x * BLOCK_N + lid;
-
-                        if (row < nrows_x && col < ncols_y) {
-                            dst[row * nrows_dst + col] = shAcc[i * 32 + lid];
-                        }
-                    }
-
-                    it.barrier(sycl::access::fence_space::local_space);
-                }
-            });
-    });
-}
-catch (sycl::exception const &exc) {
-    std::cerr << "XMX Q2_K kernel: " << exc.what() << std::endl;
-}
-
-#endif // SYCL_EXT_COOPERATIVE_MATRICES
