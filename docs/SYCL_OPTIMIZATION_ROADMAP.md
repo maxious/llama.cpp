@@ -134,11 +134,30 @@ constexpr int SLM_TILE_N = 32;  // B block width
 
 ### TODO-005: SLM for Layer Normalization
 
+**Status**: ✅ **COMPLETE**
+
 **File**: `ggml/src/ggml-sycl/norm.cpp`
 
-**Current**: Processes in registers, multiple passes over global memory.
+**Implementation**: Added `norm_f32_slm` and `rms_norm_f32_slm` kernels that cache input rows in shared local memory (SLM) during the first pass, avoiding a second global memory read.
 
-**Desired**: Load row into SLM, compute mean/variance in one pass.
+**Applies to**: Rows with 256-4096 elements (typical transformer hidden sizes: 768, 1024, 2048, 4096)
+
+**Benefit**: 50% reduction in global memory reads for LayerNorm and RMSNorm operations.
+
+**Technical Details**:
+```cpp
+// First pass: load into SLM and compute statistics
+for (int col = tid; col < ncols; col += block_size) {
+    const float xi = x[col];
+    s_row[col] = xi;  // Cache in SLM (16KB for 4096 floats)
+    tmp += xi * xi;   // Compute sum of squares
+}
+// ... reduction ...
+// Second pass: read from SLM instead of global memory
+for (int col = tid; col < ncols; col += block_size) {
+    dst[col] = scale * s_row[col];
+}
+```
 
 ---
 
@@ -369,7 +388,7 @@ export SYCL_PI_LEVEL_ZERO_DEBUG=1
 | P0 | Hardware detection | ✅ Complete | In fattn.cpp |
 | P0 | Dead code cleanup | ✅ Complete | Removed XMX from mmq.cpp |
 | P1 | SLM for non-quantized GEMM | Pending | gemm.hpp |
-| P1 | SLM for normalization | Pending | norm.cpp |
+| P1 | SLM for normalization | ✅ Complete | norm.cpp |
 | P1 | Bank conflict avoidance | Pending | All SLM files |
 | P2 | Fix multi-XPU row split | Pending | ggml-sycl.cpp line 797 |
 | P2 | Shared USM for multi-XPU | Pending | ggml-sycl.cpp |
@@ -377,8 +396,8 @@ export SYCL_PI_LEVEL_ZERO_DEBUG=1
 | P3 | Kernel fusion | Pending | Multiple files |
 | P3 | Profiling infrastructure | Pending | New file |
 
-**Completed**: Flash attention XMX (3-4x speedup), dead code cleanup, debug logging gated
-**Next Priority**: Fix row split for multi-XPU, then SLM optimizations
+**Completed**: Flash attention XMX (3-4x speedup), dead code cleanup, debug logging gated, SLM normalization
+**Next Priority**: Fix row split for multi-XPU, then SLM for GEMM
 
 ---
 
