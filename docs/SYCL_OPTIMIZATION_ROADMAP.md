@@ -102,33 +102,11 @@ The `sycl_hw.cpp/hpp` files remain as stubs for future expansion.
 
 Currently, SLM is only used in flash attention. Other operations could benefit significantly.
 
-### TODO-004: SLM Tiling for Non-Quantized MatMul
+### Closed: SLM Tiling for Non-Quantized MatMul (TODO-004)
 
-**Files**: `ggml/src/ggml-sycl/gemm.hpp`
+**Status**: ❌ **REMOVED** (2026-01-20)
 
-**Current**: Uses oneDNN GEMM wrapper.
-
-**Opportunity**: For F16/F32 matmul, custom SLM-tiled kernels could reduce memory bandwidth.
-
-**Technical Approach** (from Intel papers):
-```
-For MatMul (M x K) x (K x N):
-1. Load block of A into SLM (blocking by M x TILE_K)
-2. Load block of B into SLM (blocking by TILE_K x N)
-3. Compute block multiply using registers
-4. Fused operations: MatMul → Add → GELU → MatMul
-```
-
-**SLM Size Calculation**:
-```cpp
-// For Intel Arc (64KB SLM per EU)
-constexpr size_t MAX_SLM = 64 * 1024;
-
-// Block sizes for different operations
-constexpr int SLM_TILE_M = 32;  // A block height
-constexpr int SLM_TILE_K = 64;  // Inner dimension
-constexpr int SLM_TILE_N = 32;  // B block width
-```
+**Rationale**: The `gemm.hpp` file is a thin wrapper around oneDNN, which already implements SLM-tiled GEMM internally. Writing a custom kernel would be substantial effort with marginal gains. oneDNN's implementation is already optimized for Intel hardware.
 
 ---
 
@@ -161,16 +139,23 @@ for (int col = tid; col < ncols; col += block_size) {
 
 ---
 
-### TODO-006: Bank Conflict Avoidance
+### Closed: Bank Conflict Avoidance (TODO-006)
 
-**Files**: All SLM-using files
+**Status**: ✅ **COMPLETE** (already implemented in XMX kernel)
 
-**Add padding** to shared memory arrays to avoid bank conflicts:
+**File**: `ggml/src/ggml-sycl/fattn_kernel.hpp`
+
+The XMX flash attention kernel already has bank conflict padding on all SLM arrays:
 ```cpp
-// Padding to avoid bank conflicts (32 banks, 4 bytes each)
-constexpr int SLM_PADDING = 1;  // One extra element per row
-sycl::local_accessor<float, 2> slm({TILE_M, TILE_K + SLM_PADDING}, cgh);
+constexpr int Q_STRIDE = HEAD_DIM + 8;  // Padding for bank conflict avoidance
+constexpr int K_STRIDE = HEAD_DIM + 8;
+constexpr int V_STRIDE = HEAD_DIM + 8;
+constexpr int V_T_STRIDE = BLOCK_N + 8;
+constexpr int S_STRIDE = BLOCK_N + 8;
+constexpr int P_STRIDE = BLOCK_N + 8;
 ```
+
+The non-XMX fallback kernel allocates SLM but doesn't actually use it for computation (reads from global memory), so adding padding there would have no effect.
 
 ---
 
@@ -209,18 +194,22 @@ queue.wait();                      // Sync
 
 ---
 
-### TODO-009: Memory Alignment
+### Closed: Memory Alignment (TODO-009)
 
-**File**: `ggml/src/ggml-sycl/common.cpp`
+**Status**: ✅ **COMPLETE** (2026-01-20)
 
-**Current**: Basic device allocation.
+**File**: `ggml/src/ggml-sycl/common.hpp`, `ggml/src/ggml-sycl/ggml-sycl.cpp`
 
-**Desired**: 64-byte alignment for cache line optimization.
+**Implementation**: Added `ggml_sycl_aligned_malloc_device()` helper with 64-byte alignment. Updated the three main allocation sites in `ggml-sycl.cpp`:
+- `ggml_backend_sycl_buffer_type_alloc_buffer()` - main buffer allocator
+- `ggml_backend_sycl_split_buffer_init_tensor()` - split buffer allocator
+- Memory pool allocator
 
 ```cpp
-inline void * sycl_aligned_alloc(size_t size, sycl::queue & q) {
-    constexpr size_t ALIGNMENT = 64;
-    return sycl::aligned_alloc(ALIGNMENT, size, q, sycl::usm::alloc::device);
+constexpr size_t SYCL_DEVICE_MEM_ALIGNMENT = 64;
+
+inline void * ggml_sycl_aligned_malloc_device(size_t size, sycl::queue * q) {
+    return sycl::aligned_alloc_device(SYCL_DEVICE_MEM_ALIGNMENT, size, *q);
 }
 ```
 
@@ -422,18 +411,19 @@ export SYCL_PI_LEVEL_ZERO_DEBUG=1
 | P0 | XMX quantized MatMul | ❌ Removed | dp4a is optimal |
 | P0 | Hardware detection | ✅ Complete | In fattn.cpp |
 | P0 | Dead code cleanup | ✅ Complete | Removed XMX from mmq.cpp |
-| P1 | SLM for non-quantized GEMM | Pending | gemm.hpp |
+| P1 | SLM for non-quantized GEMM | ❌ Removed | oneDNN handles internally |
 | P1 | SLM for normalization | ✅ Complete | norm.cpp |
-| P1 | Bank conflict avoidance | Pending | All SLM files |
+| P1 | Bank conflict avoidance | ✅ Complete | fattn_kernel.hpp (XMX path) |
 | P2 | Fix multi-XPU row split | ⚠️ Blocked | Driver/runtime issue on Intel Arc |
 | P2 | Shared USM for multi-XPU | Pending | ggml-sycl.cpp |
 | P2 | Async prefetching | Pending | common.cpp |
+| P2 | Memory alignment (64-byte) | ✅ Complete | common.hpp, ggml-sycl.cpp |
 | P3 | Kernel fusion | Pending | Multiple files |
 | P3 | Profiling infrastructure | Pending | New file |
 
-**Completed**: Flash attention XMX (3-4x speedup), dead code cleanup, debug logging gated, SLM normalization
+**Completed**: Flash attention XMX (3-4x speedup), dead code cleanup, debug logging gated, SLM normalization, bank conflict avoidance, 64-byte memory alignment
 **Blocked**: Row split mode blocked by driver issue (use `--split-mode layer` as workaround)
-**Next Priority**: SLM for GEMM, async prefetching
+**Next Priority**: Async prefetching, shared USM for KV cache
 
 ---
 
