@@ -686,8 +686,7 @@ ggml_backend_sycl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
     size = std::max(size, (size_t)1); // syclMalloc returns null for size 0
 
     void * dev_ptr;
-    SYCL_CHECK(CHECK_TRY_ERROR(dev_ptr = (void *)sycl::malloc_device(
-                                    size, *stream)));
+    SYCL_CHECK(CHECK_TRY_ERROR(dev_ptr = ggml_sycl_aligned_malloc_device(size, stream)));
     if (!dev_ptr) {
       GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device\n", __func__, size);
       return nullptr;
@@ -952,8 +951,7 @@ ggml_backend_sycl_split_buffer_init_tensor(ggml_backend_buffer_t buffer,
         error codes. The original code was commented out and a warning string
         was inserted. You need to rewrite this code.
         */
-        SYCL_CHECK(CHECK_TRY_ERROR(buf = (char *)sycl::malloc_device(
-                                        size, *stream)));
+        SYCL_CHECK(CHECK_TRY_ERROR(buf = (char *)ggml_sycl_aligned_malloc_device(size, stream)));
         if (!buf) {
             char err_buf[1024];
             snprintf(err_buf, 1023, "%s: can't allocate %lu Bytes of memory on device\n", __func__, size);
@@ -1381,8 +1379,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
 
         SYCL_CHECK(
-            CHECK_TRY_ERROR(ptr = (void *)sycl::malloc_device(
-                                look_ahead_size, *qptr)));
+            CHECK_TRY_ERROR(ptr = ggml_sycl_aligned_malloc_device(look_ahead_size, qptr)));
         if (!ptr) {
             GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device/GPU\n", __func__, look_ahead_size);
             return nullptr;

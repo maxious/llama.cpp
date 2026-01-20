@@ -249,6 +249,18 @@ struct sycl_float_type<bfloat16> {
 
 #define MMVQ_MAX_BATCH_SIZE  8
 
+// Cache-line aligned device memory allocation (64 bytes for Intel GPUs)
+// Improves memory access patterns and reduces cache line splits
+constexpr size_t SYCL_DEVICE_MEM_ALIGNMENT = 64;
+
+inline void * ggml_sycl_aligned_malloc_device(size_t size, sycl::queue & q) {
+    return sycl::aligned_alloc_device(SYCL_DEVICE_MEM_ALIGNMENT, size, q);
+}
+
+inline void * ggml_sycl_aligned_malloc_device(size_t size, sycl::queue * q) {
+    return sycl::aligned_alloc_device(SYCL_DEVICE_MEM_ALIGNMENT, size, *q);
+}
+
 static int g_all_sycl_device_count = -1;
 static bool g_ggml_backend_sycl_buffer_type_initialized = false;
 
