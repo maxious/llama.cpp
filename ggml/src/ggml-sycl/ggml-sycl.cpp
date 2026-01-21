@@ -2776,7 +2776,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         if constexpr(quantize_enabled) {
             size_t alloc_size = nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs;
             GGML_SYCL_DEBUG("[SYCL] allocating src1_ddq on device %d: size=%zu bytes ctx.device=%d stream=%p\n",
-                i, alloc_size, ctx.device, stream);
+                i, alloc_size, ctx.device, (void *)stream);
             
             // Verify stream device matches expected device before allocation
             sycl::device stream_dev = stream->get_device();
@@ -2812,7 +2812,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                                            (dst_ptr_type == sycl::usm::alloc::shared) ? "shared" :
                                            (dst_ptr_type == sycl::usm::alloc::host) ? "host" : "unknown";
                 GGML_SYCL_DEBUG("[SYCL] quantize on device %d: src1_ddf=%p (%s) src1_ddq=%p (%s) ne10=%ld nrows1=%ld src1_padded_col_size=%ld stream_device=%s\n",
-                    i, dev[i].src1_ddf, src1_type_str, dev[i].src1_ddq, dst_type_str,
+                    i, (void *)dev[i].src1_ddf, src1_type_str, (void *)dev[i].src1_ddq, dst_type_str,
                     (long)ne10, (long)nrows1, (long)src1_padded_col_size,
                     stream->get_device().get_info<sycl::info::device::name>().c_str());
 
@@ -2841,7 +2841,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
             const size_t size_dst_ddf = split ? (dev[i].row_high - dev[i].row_low)*ne1 : ggml_nelements(dst);
             GGML_SYCL_DEBUG("[SYCL] allocating dst_dd for device %d: size=%zu\n", i, size_dst_ddf);
             dev[i].dst_dd = dev[i].dst_dd_alloc.alloc(ctx.pool(i), size_dst_ddf);
-            GGML_SYCL_DEBUG("[SYCL] allocated dst_dd for device %d: ptr=%p\n", i, dev[i].dst_dd);
+            GGML_SYCL_DEBUG("[SYCL] allocated dst_dd for device %d: ptr=%p\n", i, (void *)dev[i].dst_dd);
         }
     }
     GGML_SYCL_DEBUG("[SYCL] mul_mat: all device setup complete, used_devices=%d\n", used_devices);
@@ -2953,7 +2953,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                 }
                 // do the computation
                 GGML_SYCL_DEBUG("[SYCL] mul_mat: device %d row_low=%ld row_high=%ld src0_dd_i=%p dst_dd_i=%p\n",
-                    i, (long)dev[i].row_low, (long)dev[i].row_high, src0_dd_i, dst_dd_i);
+                    i, (long)dev[i].row_low, (long)dev[i].row_high, (void *)src0_dd_i, (void *)dst_dd_i);
                 
                 SYCL_CHECK(CHECK_TRY_ERROR(op(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
                     dev[i].row_low, dev[i].row_high, src1_ncols, src1_padded_col_size, stream)));
@@ -3182,7 +3182,6 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
     float *            dst_ddf  = static_cast<float *>(dst->data);
 
     const sycl::half * src1_f16       = static_cast<const sycl::half *>(src1->data);
-    const size_t       type_size_src0 = ggml_type_size(src0->type);
     const size_t       type_size_src1 = ggml_type_size(src1->type);
 
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
@@ -3200,9 +3199,9 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
                                                 " : converting src1 to fp16");
 
         // iterate tensor dims and find the slowest moving dim and stride
-        int last_dim=0;
-        int last_str=0;
-        size_t largest_str=0;
+        int last_dim = 0;
+        int last_str = 0;
+        size_t largest_str = 0;
         for(int i = 0; i< 4; i++){
             // last stride is always the largest
             if(src1->nb[i] == largest_str){

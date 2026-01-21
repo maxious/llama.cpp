@@ -395,12 +395,8 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const size_t nbytes = ggml_nbytes(src0);
     float * src0_f32 = nullptr;
     float * dst_f32 = nullptr;
-    bool need_tempBuffers = false;
 
     if (is_f16 || is_bf16) {
-        src0_f32 = (float *)sycl::malloc_device(nbytes, *stream);
-        dst_f32 = (float *)sycl::malloc_device(nbytes, *stream);
-        need_tempBuffers = true;
 
         // Dequantize src0 to F32
         const int64_t n_elements = ggml_nelements(src0);
