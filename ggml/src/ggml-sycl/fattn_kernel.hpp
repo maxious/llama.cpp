@@ -42,6 +42,8 @@ inline void flash_attn_softmax_kernel(
     const int row_offset,  // Global row offset for this block
     const int window_size  // Sliding window size (0 = no window limit)
 ) {
+    (void)row_offset; // suppress unused parameter warning
+
     const int li  = it.get_local_id(0);
     const int gi  = it.get_group(0);
     const int gj  = it.get_group(1);  // Block column index
@@ -297,10 +299,11 @@ inline void flash_attn_coopmat_kernel(
     // [float: rowSum (BLOCK_M)]
     // [float: rowAlpha (BLOCK_M)]
     // [float: shAcc (BLOCK_M * HEAD_DIM)] - output accumulator
-    constexpr int BF16_SIZE = (BLOCK_M * Q_STRIDE) + (BLOCK_N * K_STRIDE) +
-                               (BLOCK_N * V_STRIDE) + (BLOCK_M * P_STRIDE) +
-                               (HEAD_DIM * V_T_STRIDE);
-    constexpr int FLOAT_SIZE = (BLOCK_M * S_STRIDE) + (BLOCK_M * 3) + (BLOCK_M * HEAD_DIM);
+
+    (void)l_d; // suppress unused parameter warning
+    (void)m_d; // suppress unused parameter warning
+    (void)n_heads; // suppress unused parameter warning
+    (void)n_kv_heads; // suppress unused parameter warning
 
     const int lid = it.get_local_id(0);
     const int gid_x = it.get_group(0);
@@ -676,10 +679,11 @@ inline void flash_attn_coopmat_kernel_padded(
 
     // Shared memory layout (sized for PADDED_HEAD_DIM)
     // shVT is [BLOCK_N rows x PADDED_HEAD_DIM cols] col-major, size = PADDED_HEAD_DIM * V_T_STRIDE
-    constexpr int BF16_SIZE = (BLOCK_M * Q_STRIDE) + (BLOCK_N * K_STRIDE) + 
-                               (BLOCK_N * V_STRIDE) + (BLOCK_M * P_STRIDE) +
-                               (PADDED_HEAD_DIM * V_T_STRIDE);
-    constexpr int FLOAT_SIZE = (BLOCK_M * S_STRIDE) + (BLOCK_M * 3) + (BLOCK_M * PADDED_HEAD_DIM);
+
+    (void)l_d; // suppress unused parameter warning
+    (void)m_d; // suppress unused parameter warning
+    (void)n_heads; // suppress unused parameter warning
+    (void)n_kv_heads; // suppress unused parameter warning
 
     const int lid = it.get_local_id(0);
     const int gid_x = it.get_group(0);

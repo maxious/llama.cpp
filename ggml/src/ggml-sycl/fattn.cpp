@@ -139,6 +139,11 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
         return false;
     }
 
+    // Require contiguous tensors - permuted KV cache views are not supported
+    if (!ggml_is_contiguous(Q) || !ggml_is_contiguous(K) || !ggml_is_contiguous(V)) {
+        return false;
+    }
+
     int64_t DQK = Q->ne[0];
     int64_t DV  = V->ne[0];
 
@@ -419,8 +424,7 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
     const bool q_is_f16 = (Q->type == GGML_TYPE_F16);
     const bool k_is_f16 = (K->type == GGML_TYPE_F16);
     const bool v_is_f16 = (V->type == GGML_TYPE_F16);
-    const bool need_dequant = q_is_f16 || k_is_f16 || v_is_f16;
-    
+
     const float * Q_d_f32;
     const float * K_d_f32;
     const float * V_d_f32;
@@ -610,7 +614,6 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
     constexpr int BLOCK_N = 32;
 
     const int Tr = (N + BLOCK_M - 1) / BLOCK_M;
-    const int Tc = (N + BLOCK_N - 1) / BLOCK_N;
 
     float * l_d = (float *) sycl::malloc_device(N * n_heads * sizeof(float), *stream);
     float * m_d = (float *) sycl::malloc_device(N * n_heads * sizeof(float), *stream);
@@ -1164,15 +1167,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
     float * K_d_f32_alloc = nullptr;
     float * V_d_f32_alloc = nullptr;
 
-    // Get strides for FP16/F32 access
-    const ptrdiff_t q_row_stride = Q->nb[1] / (q_is_f16 ? sizeof(sycl::half) : sizeof(float));
-    const ptrdiff_t k_row_stride = K->nb[1] / (k_is_f16 ? sizeof(sycl::half) : sizeof(float));
-    const ptrdiff_t v_row_stride = V->nb[1] / (v_is_f16 ? sizeof(sycl::half) : sizeof(float));
-    const ptrdiff_t q_head_stride = Q->nb[2] / (q_is_f16 ? sizeof(sycl::half) : sizeof(float));
-    const ptrdiff_t k_head_stride = K->nb[2] / (k_is_f16 ? sizeof(sycl::half) : sizeof(float));
-    const ptrdiff_t v_head_stride = V->nb[2] / (v_is_f16 ? sizeof(sycl::half) : sizeof(float));
-
-    // Tensor layouts (from debug output):
+    // Dequantize Q (F32 or F16) into per-head row-major [N x DQK] layout
     // Q: [head_dim=64, N=2, n_heads=32, batch=1], nb=[4, n_heads*DQK*4, DQK*4, ...]
     //    Q[d, n, h] = Q[d + h*DQK + n*n_heads*DQK]
     // K/V: [head_dim=64, N_kv=256, n_kv_heads=8, batch=1], nb=[2, n_kv_heads*DQK*2, DQK*2, ...]
