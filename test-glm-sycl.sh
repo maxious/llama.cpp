@@ -9,8 +9,5 @@ export ZES_ENABLE_SYSMAN=1
 export ONEAPI_DEVICE_SELECTOR=level_zero:0
 
 ./build-sycl/bin/llama-cli \
-    --model koboldcpp/GLM-4.7-Flash-SynthLabs-REAP-25-Q4_K_M.gguf \
-    --prompt "Hello, how are you?" \
-    --n-predict 32 \
-    --fit on \
-    --temp 0.7 --top-p 1.0 --min-p 0.01
+    --model ~/koboldcpp/GLM-4.7-Flash-SynthLabs-REAP-25-Q4_K_M.gguf \
+    --prompt "Hello" --n-predict 32 --ctx-size 4096 --flash-attn on --temp 0.7 --single-turn
