@@ -2785,63 +2785,24 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
 
         if constexpr(quantize_enabled) {
             size_t alloc_size = nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs;
-            GGML_SYCL_DEBUG("[SYCL] allocating src1_ddq on device %d: size=%zu bytes ctx.device=%d stream=%p\n",
-                i, alloc_size, ctx.device, (void *)stream);
-            
-            // Verify stream device matches expected device before allocation
-            sycl::device stream_dev = stream->get_device();
-            GGML_SYCL_DEBUG("[SYCL] stream device: %s\n", stream_dev.get_info<sycl::info::device::name>().c_str());
-            
             dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), alloc_size);
-            GGML_SYCL_DEBUG("[SYCL] allocated src1_ddq on device %d: ptr=%p\n", i, dev[i].src1_ddq);
-            
-            // Test: Verify the allocation is accessible from this stream
-            auto alloc_type = sycl::get_pointer_type(dev[i].src1_ddq, stream->get_context());
-            auto alloc_dev = sycl::get_pointer_device(dev[i].src1_ddq, stream->get_context());
-            unsigned int alloc_dev_id = dpct::dev_mgr::instance().get_device_id(alloc_dev);
-            unsigned int stream_dev_id_chk = dpct::dev_mgr::instance().get_device_id(stream->get_device());
-            GGML_SYCL_DEBUG("[SYCL] src1_ddq alloc type=%d (0=unknown,1=device,2=host,3=shared) alloc_dev_id=%u stream_dev_id=%u\n",
-                (int)alloc_type, alloc_dev_id, stream_dev_id_chk);
-            
-            // Also check src1_ddf (the input)
-            auto src1_type = sycl::get_pointer_type(dev[i].src1_ddf, stream->get_context());
-            auto src1_dev = sycl::get_pointer_device(dev[i].src1_ddf, stream->get_context());
-            unsigned int src1_dev_id = dpct::dev_mgr::instance().get_device_id(src1_dev);
-            GGML_SYCL_DEBUG("[SYCL] src1_ddf type=%d src1_dev_id=%u\n", (int)src1_type, src1_dev_id);
 
-            if (src1_on_device && src1_is_contiguous) {
-                scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
-                                                     /*num_src=*/2, " : converting src1 to Q8_1");
-                // Verify pointer types for debugging
-                auto src1_ptr_type = sycl::get_pointer_type(dev[i].src1_ddf, stream->get_context());
-                auto dst_ptr_type = sycl::get_pointer_type(dev[i].src1_ddq, stream->get_context());
-                const char* src1_type_str = (src1_ptr_type == sycl::usm::alloc::device) ? "device" :
-                                            (src1_ptr_type == sycl::usm::alloc::shared) ? "shared" :
-                                            (src1_ptr_type == sycl::usm::alloc::host) ? "host" : "unknown";
-                const char* dst_type_str = (dst_ptr_type == sycl::usm::alloc::device) ? "device" :
-                                           (dst_ptr_type == sycl::usm::alloc::shared) ? "shared" :
-                                           (dst_ptr_type == sycl::usm::alloc::host) ? "host" : "unknown";
-                GGML_SYCL_DEBUG("[SYCL] quantize on device %d: src1_ddf=%p (%s) src1_ddq=%p (%s) ne10=%ld nrows1=%ld src1_padded_col_size=%ld stream_device=%s\n",
-                    i, (void *)dev[i].src1_ddf, src1_type_str, (void *)dev[i].src1_ddq, dst_type_str,
-                    (long)ne10, (long)nrows1, (long)src1_padded_col_size,
-                    stream->get_device().get_info<sycl::info::device::name>().c_str());
+            if (!src1_on_device || !src1_is_contiguous) {
+                // If src1 is already on device and contiguous, we can use it directly
+                // Otherwise we need to copy it to the current device first
+                SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(dev[i].src1_ddf, (const float *)src1->data, ggml_nelements(src1)*sizeof(float))));
+            }
 
-                // Additional check: verify the stream's device matches expected device
-                auto stream_dev_id = dpct::dev_mgr::instance().get_device_id(stream->get_device());
-                if ((int)stream_dev_id != i) {
-                    fprintf(stderr, "[SYCL] ERROR: stream device id %u != expected device %d!\n", stream_dev_id, i);
-                }
-
-                try {
-                    GGML_SYCL_DEBUG("[SYCL] quantize on device %d: submitting kernel\n", i);
-                    quantize_row_q8_1_sycl<quantize_f>(dev[i].src1_ddf, dev[i].src1_ddq, ne10, nrows1, src1_padded_col_size, stream);
-                    GGML_SYCL_DEBUG("[SYCL] quantize on device %d: kernel submitted\n", i);
-                    // Don't sync here - let the stream flow naturally and sync only at the end
-                } catch (sycl::exception const &exc) {
-                    std::cerr << "Quantize_row_q8_1_sycl error" << exc.what() << "Exception caught at file:" << __FILE__
-                              << ", line:" << __LINE__ << std::endl;
-                    std::exit(1);
-                }
+            scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
+                                                 /*num_src=*/2, " : converting src1 to Q8_1");
+            try {
+                GGML_SYCL_DEBUG("[SYCL] quantize on device %d: submitting kernel\n", i);
+                quantize_row_q8_1_sycl<quantize_f>(dev[i].src1_ddf, dev[i].src1_ddq, ne10, nrows1, src1_padded_col_size, stream);
+                GGML_SYCL_DEBUG("[SYCL] quantize on device %d: kernel submitted\n", i);
+            } catch (sycl::exception const &exc) {
+                std::cerr << "Quantize_row_q8_1_sycl error" << exc.what() << "Exception caught at file:" << __FILE__
+                           << ", line:" << __LINE__ << std::endl;
+                std::exit(1);
             }
         }
 
@@ -2849,9 +2810,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
             dev[i].dst_dd = (float *) dst->data;
         } else {
             const size_t size_dst_ddf = split ? (dev[i].row_high - dev[i].row_low)*ne1 : ggml_nelements(dst);
-            GGML_SYCL_DEBUG("[SYCL] allocating dst_dd for device %d: size=%zu\n", i, size_dst_ddf);
             dev[i].dst_dd = dev[i].dst_dd_alloc.alloc(ctx.pool(i), size_dst_ddf);
-            GGML_SYCL_DEBUG("[SYCL] allocated dst_dd for device %d: ptr=%p\n", i, (void *)dev[i].dst_dd);
         }
     }
     GGML_SYCL_DEBUG("[SYCL] mul_mat: all device setup complete, used_devices=%d\n", used_devices);
@@ -4863,20 +4822,23 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                 }
                 ggml_type src0_type = op->src[0]->type;
-#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
-                // F16 and BF16 are supported when build flags are enabled
-                if (src0_type == GGML_TYPE_F16 || src0_type == GGML_TYPE_BF16) {
+                if (src0_type == GGML_TYPE_F16) {
+#if defined(GGML_SYCL_F16)
                     return true;
+#else
+                    return false;
+#endif
+                }
+                if (src0_type == GGML_TYPE_BF16) {
+#if defined(GGML_SYCL_BF16)
+                    return true;
+#else
+                    return false;
+#endif
                 }
                 if (src0_type == GGML_TYPE_MXFP4) {
                     return false; // MXFP4 not yet supported
                 }
-#else
-                // Only F32 supported without F16/BF16 build flags
-                if (src0_type == GGML_TYPE_BF16 || src0_type == GGML_TYPE_MXFP4) {
-                    return false;
-                }
-#endif
                 // TODO: The configuration below needs more work to be supported with oneDNN
                 if (ggml_is_permuted(a) && !ggml_is_contiguous(a) &&
                     a->ne[2] > 1 && a->ne[3] > 1 && src0_type == GGML_TYPE_F16) {

@@ -100,6 +100,46 @@ static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict_
     }
 }
 
+// Specialized version for K-quant types that need 32-wide sub-groups
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
+static void mul_mat_vec_q_K(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+                           const int ncols, const int nrows, const sycl::nd_item<3> & item_ct1) {
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int     blocks_per_row  = ncols / qk;
+    constexpr int blocks_per_warp = (vdr * QK_WARP_SIZE + qi - 1) / qi;
+
+    assert(blocks_per_warp > 0);
+
+    float tmp = 0.0f;
+
+    const block_q_t *  x = (const block_q_t *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
+        const int ibx = row * blocks_per_row + i;
+        const int iby = i * (qk / QK8_1);
+
+        for (size_t elem = 0; elem < qi / vdr; elem += QK_WARP_SIZE) {
+            const int iqs = elem + vdr * (item_ct1.get_local_id(2) % (qi / vdr));
+            tmp += vec_dot_q_sycl(&x[ibx], &y[iby], iqs);
+        }
+    }
+
+#pragma unroll
+    for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        tmp += dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+    }
+
+    if (item_ct1.get_local_id(2) == 0) {
+        dst[row] = tmp;
+    }
+}
+
 template <int qk, int qi, typename block_q_t, int vdr>
 static void mul_mat_vec_q_iq2_xxs_q8_1(const void *__restrict__ vx,
                                        const void *__restrict__ vy,
@@ -546,7 +586,7 @@ static void reorder_mul_mat_vec_q4_0_q8_1_sycl(const void * vx, const void * vy,
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(global_size, workgroup_size),
-                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                              mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0>>(vx, vy, dst, ncols, nrows,
                                                                                            nd_item);
                          });
@@ -558,12 +598,12 @@ static void mul_mat_vec_q4_0_q8_1_sycl(const void * vx, const void * vy, float *
     GGML_ASSERT(ncols % QK4_0 == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
 
     {
         stream->submit([&](sycl::handler & cgh) {
             cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                                  mul_mat_vec_q<QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>(
                                      vx, vy, dst, ncols, nrows, item_ct1);
                              });
@@ -578,7 +618,7 @@ static void mul_mat_vec_q4_1_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK4_1 == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
 
         stream->submit([&](sycl::handler &cgh) {
@@ -586,7 +626,7 @@ static void mul_mat_vec_q4_1_q8_1_sycl(const void *vx, const void *vy,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                         mul_mat_vec_q<QK4_0, QI4_1, block_q4_1,
                                       VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
@@ -600,12 +640,12 @@ static void mul_mat_vec_mxfp4_q8_1_sycl(const void * vx, const void * vy, float 
     GGML_ASSERT(ncols % QK_MXFP4 == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
 
     {
         stream->submit([&](sycl::handler & cgh) {
             cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                                  mul_mat_vec_q<QK_MXFP4, QI_MXFP4, block_mxfp4, VDR_MXFP4_Q8_1_MMVQ, vec_dot_mxfp4_q8_1>(
                                      vx, vy, dst, ncols, nrows, item_ct1);
                              });
@@ -621,7 +661,7 @@ static void mul_mat_vec_q5_0_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK5_0 == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
 
         stream->submit([&](sycl::handler &cgh) {
@@ -629,7 +669,7 @@ static void mul_mat_vec_q5_0_q8_1_sycl(const void *vx, const void *vy,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                         mul_mat_vec_q<QK5_0, QI5_0, block_q5_0,
                                       VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
@@ -645,7 +685,7 @@ static void mul_mat_vec_q5_1_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK5_1 == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
 
         stream->submit([&](sycl::handler &cgh) {
@@ -653,7 +693,7 @@ static void mul_mat_vec_q5_1_q8_1_sycl(const void *vx, const void *vy,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                         mul_mat_vec_q<QK5_1, QI5_1, block_q5_1,
                                       VDR_Q5_1_Q8_1_MMVQ, vec_dot_q5_1_q8_1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
@@ -669,7 +709,7 @@ static void mul_mat_vec_q8_0_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK8_0 == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
 
         stream->submit([&](sycl::handler &cgh) {
@@ -677,7 +717,7 @@ static void mul_mat_vec_q8_0_q8_1_sycl(const void *vx, const void *vy,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                         mul_mat_vec_q<QK8_0, QI8_0, block_q8_0,
                                       VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
@@ -687,13 +727,13 @@ static void mul_mat_vec_q8_0_q8_1_sycl(const void *vx, const void *vy,
 }
 
 static void mul_mat_vec_q2_K_q8_1_sycl(const void *vx, const void *vy,
-                                       float *dst, const int ncols,
-                                       const int nrows,
-                                       dpct::queue_ptr stream) {
+                                        float *dst, const int ncols,
+                                        const int nrows,
+                                        dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
 
         stream->submit([&](sycl::handler &cgh) {
@@ -701,8 +741,8 @@ static void mul_mat_vec_q2_K_q8_1_sycl(const void *vx, const void *vy,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                        mul_mat_vec_q<QK_K, QI2_K, block_q2_K,
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
+                        mul_mat_vec_q_K<QK_K, QI2_K, block_q2_K,
                                       VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
                     });
@@ -717,7 +757,7 @@ static void mul_mat_vec_q3_K_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK_K == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
 
         stream->submit([&](sycl::handler &cgh) {
@@ -725,8 +765,8 @@ static void mul_mat_vec_q3_K_q8_1_sycl(const void *vx, const void *vy,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                        mul_mat_vec_q<QK_K, QI3_K, block_q3_K,
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
+                        mul_mat_vec_q_K<QK_K, QI3_K, block_q3_K,
                                       VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
                     });
@@ -741,7 +781,7 @@ static void mul_mat_vec_q4_K_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK_K == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
 
         stream->submit([&](sycl::handler &cgh) {
@@ -749,8 +789,8 @@ static void mul_mat_vec_q4_K_q8_1_sycl(const void *vx, const void *vy,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                        mul_mat_vec_q<QK_K, QI4_K, block_q4_K,
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
+                        mul_mat_vec_q_K<QK_K, QI4_K, block_q4_K,
                                       VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
                     });
@@ -771,7 +811,7 @@ static void reorder_mul_mat_vec_q4_k_q8_1_sycl(const void * vx, const void * vy,
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(global_size, workgroup_size),
-                            [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                            [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                                 mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(vx, vy, dst, ncols,
                                                                                             nrows, nd_item);
                             });
@@ -786,7 +826,7 @@ static void mul_mat_vec_q5_K_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK_K == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
 
         stream->submit([&](sycl::handler &cgh) {
@@ -794,8 +834,8 @@ static void mul_mat_vec_q5_K_q8_1_sycl(const void *vx, const void *vy,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                        mul_mat_vec_q<QK_K, QI5_K, block_q5_K,
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
+                        mul_mat_vec_q_K<QK_K, QI5_K, block_q5_K,
                                       VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
                     });
@@ -815,7 +855,7 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void * vx, const void * vy,
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(global_size, workgroup_size),
-                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                              mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>>(vx, vy, dst, ncols, nrows,
                                                                                            nd_item);
                          });
@@ -828,7 +868,7 @@ static void mul_mat_vec_q6_K_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK_K == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
 
         stream->submit([&](sycl::handler &cgh) {
@@ -836,8 +876,8 @@ static void mul_mat_vec_q6_K_q8_1_sycl(const void *vx, const void *vy,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                        mul_mat_vec_q<QK_K, QI6_K, block_q6_K,
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
+                        mul_mat_vec_q_K<QK_K, QI6_K, block_q6_K,
                                       VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
                     });
@@ -853,13 +893,13 @@ static void mul_mat_vec_iq2_xxs_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK_K == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
         stream->submit([&](sycl::handler &cgh) {
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                         mul_mat_vec_q_iq2_xxs_q8_1<QK_K, QI2_XXS/2, block_iq2_xxs, 1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
                     });
@@ -874,13 +914,13 @@ static void mul_mat_vec_iq2_xs_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK_K == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
         stream->submit([&](sycl::handler & cgh) {
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                         mul_mat_vec_q_iq2_xs_q8_1<QK_K, QI2_XS/2, block_iq2_xs, 1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
                     });
@@ -895,14 +935,14 @@ static void mul_mat_vec_iq2_s_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK_K == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
 
         stream->submit([&](sycl::handler &cgh) {
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                         mul_mat_vec_q_iq2_s_q8_1<QK_K, QI2_S/2, block_iq2_s, 1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
                     });
@@ -917,14 +957,14 @@ static void mul_mat_vec_iq3_xxs_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK_K == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
 
         stream->submit([&](sycl::handler &cgh) {
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                         mul_mat_vec_q_iq3_xxs_q8_1<QK_K, QI3_XXS/2, block_iq3_xxs, 1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
                     });
@@ -939,14 +979,14 @@ static void mul_mat_vec_iq3_s_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK_K == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
 
         stream->submit([&](sycl::handler &cgh) {
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                         mul_mat_vec_q_iq3_s_q8_1<QK_K, QI3_S/2, block_iq3_s, 1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
                     });
@@ -961,14 +1001,14 @@ static void mul_mat_vec_iq1_s_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK_K == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
 
         stream->submit([&](sycl::handler &cgh) {
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                         mul_mat_vec_q_iq1_s_q8_1<QK_K, QI1_S, block_iq1_s, 1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
                     });
@@ -983,13 +1023,13 @@ static void mul_mat_vec_iq1_m_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK_K == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
         stream->submit([&](sycl::handler &cgh) {
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                         mul_mat_vec_q_iq1_m_q8_1<QK_K, QI1_S, block_iq1_m, 1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
                     });
@@ -1004,14 +1044,14 @@ static void mul_mat_vec_iq4_nl_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK4_NL == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
 
         stream->submit([&](sycl::handler &cgh) {
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                         mul_mat_vec_q_iq4_nl_q8_1<QK4_NL, QI4_NL, block_iq4_nl, 2>(
                             vx, vy, dst, ncols, nrows, item_ct1);
                     });
@@ -1026,14 +1066,14 @@ static void mul_mat_vec_iq4_xs_q8_1_sycl(const void *vx, const void *vy,
     GGML_ASSERT(ncols % QK_K == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, QK_WARP_SIZE);
     {
 
         stream->submit([&](sycl::handler &cgh) {
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                         mul_mat_vec_q_iq4_xs_q8_1<QK_K, QI4_XS/4, block_iq4_xs, 1>(
                             vx, vy, dst, ncols, nrows, item_ct1);
                     });
