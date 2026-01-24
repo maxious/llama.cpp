@@ -49,12 +49,17 @@ static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __r
     }
 
     // sum up partial sums and write back result
+    bool has_work = (nd_item.get_local_id(2) / block_elements_per_subgroup) < blocks_per_row;
+    
 #pragma unroll
     for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        partial_sum += dpct::permute_sub_group_by_xor(nd_item.get_sub_group(), partial_sum, mask);
+        float other_sum = dpct::permute_sub_group_by_xor(nd_item.get_sub_group(), partial_sum, mask);
+        bool other_has_work = ((nd_item.get_local_id(2) ^ mask) / block_elements_per_subgroup) < blocks_per_row;
+        partial_sum = has_work && other_has_work ? partial_sum + other_sum : (has_work ? partial_sum : other_sum);
+        has_work = has_work || other_has_work;
     }
 
-    if (nd_item.get_local_id(2) == 0) {
+    if (nd_item.get_local_id(2) == 0 && has_work) {
         dst[row] = partial_sum;
     }
 }
@@ -102,12 +107,17 @@ static void mul_mat_vec_q_K_reorder(const void * __restrict__ vx, const void * _
     }
 
     // sum up partial sums and write back result
+    bool has_work = (nd_item.get_local_id(2) / block_elements_per_subgroup) < blocks_per_row;
+    
 #pragma unroll
     for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        partial_sum += dpct::permute_sub_group_by_xor(nd_item.get_sub_group(), partial_sum, mask);
+        float other_sum = dpct::permute_sub_group_by_xor(nd_item.get_sub_group(), partial_sum, mask);
+        bool other_has_work = ((nd_item.get_local_id(2) ^ mask) / block_elements_per_subgroup) < blocks_per_row;
+        partial_sum = has_work && other_has_work ? partial_sum + other_sum : (has_work ? partial_sum : other_sum);
+        has_work = has_work || other_has_work;
     }
 
-    if (nd_item.get_local_id(2) == 0) {
+    if (nd_item.get_local_id(2) == 0 && has_work) {
         dst[row] = partial_sum;
     }
 }

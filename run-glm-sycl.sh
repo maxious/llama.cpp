@@ -23,7 +23,7 @@ if ! groups | grep -qwE "(render|video)"; then
 fi
 
 # Debug logging
-export GGML_SYCL_DEBUG=1
+#export GGML_SYCL_DEBUG=1
 
 # SINGLE GPU MODE OPTION
 # Uncomment the line below to force usage of only the first GPU (Device 0)
@@ -38,3 +38,4 @@ export GGML_SYCL_DEBUG=1
     --fit on \
     --batch-size 16 --ubatch-size 16 \
     --temp 0.7 --top-p 1.0 --min-p 0.01
+
