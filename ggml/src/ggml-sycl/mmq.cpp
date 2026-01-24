@@ -12,6 +12,7 @@
 
 #include "mmq.hpp"
 #include "vecdotq.hpp"
+#include "mmq_xmx_int8.hpp"
 
 typedef void (*allocate_tiles_sycl_t)(
     int** x_ql,
@@ -2907,6 +2908,8 @@ void ggml_sycl_op_mul_mat_q(
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream) try {
 
+    GGML_LOG_INFO("%s: entry src0->type=%d src1_ncols=%ld\n", __func__, (int)src0->type, (long)src1_ncols);
+
     const int64_t ne00 = src0->ne[0];
 
     const int64_t ne10 = src1->ne[0];
@@ -2915,6 +2918,8 @@ void ggml_sycl_op_mul_mat_q(
     const int64_t ne0 = dst->ne[0];
 
     const int64_t row_diff = row_high - row_low;
+    
+    fprintf(stderr, "DEBUG: %s: type=%d ncols=%ld support=%d\n", __func__, (int)src0->type, (long)src1_ncols, (int)has_int8_xmx_support(stream));
 
     int device_id;
     SYCL_CHECK(
@@ -2925,12 +2930,14 @@ void ggml_sycl_op_mul_mat_q(
     const int64_t nrows_dst = device_id == ctx.device ? ne0 : row_diff;
 
     switch (src0->type) {
-        case GGML_TYPE_Q4_0:
-            // dp4a path is optimal for decode (batch=1) and small batches
-            // XMX could potentially help for large prompt batches (ncols_y >= 32) but
-            // the dequantization overhead typically negates benefits for quantized matmul
-            ggml_mul_mat_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
+        case GGML_TYPE_Q8_0:
+            if (has_int8_xmx_support(stream) && src1_ncols > 1) {
+                ggml_sycl_op_mul_mat_q_xmx_int8(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low, row_high, src1_ncols, src1_padded_row_size, stream);
+            } else {
+                ggml_mul_mat_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
+            }
             break;
+
         case GGML_TYPE_Q4_1:
             ggml_mul_mat_q4_1_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
@@ -2939,9 +2946,6 @@ void ggml_sycl_op_mul_mat_q(
             break;
         case GGML_TYPE_Q5_1:
             ggml_mul_mat_q5_1_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
-            break;
-        case GGML_TYPE_Q8_0:
-            ggml_mul_mat_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
         case GGML_TYPE_Q2_K:
             // K-quants have complex scale/min handling that doesn't map well to XMX
@@ -2952,7 +2956,11 @@ void ggml_sycl_op_mul_mat_q(
             ggml_mul_mat_q3_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
         case GGML_TYPE_Q4_K:
-            ggml_mul_mat_q4_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
+            if (has_int8_xmx_support(stream) && src1_ncols > 1) {
+                ggml_sycl_op_mul_mat_q_xmx_int8(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low, row_high, src1_ncols, src1_padded_row_size, stream);
+            } else {
+                ggml_mul_mat_q4_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
+            }
             break;
         case GGML_TYPE_Q5_K:
             ggml_mul_mat_q5_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
