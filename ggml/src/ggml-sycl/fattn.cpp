@@ -1,6 +1,7 @@
 #include "./fattn.hpp"
 #include "./fattn_kernel.hpp"
 #include "./fattn_common.hpp"
+#include "./common.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -58,7 +59,7 @@ inline bool ggml_sycl_flash_attn_has_xmx(sycl::device device) {
         const char* env = getenv("GGML_SYCL_FLASH_ATTN_XMX");
         if (env != nullptr && strcmp(env, "0") == 0) {
             xmx_enabled = false;
-            fprintf(stderr, "ggml_sycl: XMX flash attention DISABLED by environment variable\n");
+            GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention DISABLED by environment variable\n");
         }
         env_checked = true;
     }
@@ -91,7 +92,7 @@ inline bool ggml_sycl_flash_attn_use_mkl(sycl::device device) {
         mkl_forced = (env != nullptr && strcmp(env, "1") == 0);
         env_checked = true;
         if (mkl_forced) {
-            fprintf(stderr, "ggml_sycl: oneMKL flash attention FORCED by environment variable\n");
+            GGML_SYCL_DEBUG("ggml_sycl: oneMKL flash attention FORCED by environment variable\n");
         }
     }
     if (mkl_forced) {
@@ -611,26 +612,26 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
     
     static bool first_call = true;
     if (first_call && getenv("GGML_SYCL_FLASH_ATTN_DEBUG")) {
-        fprintf(stderr, "ggml_sycl: XMX flash_attn_coopmat N=%ld N_kv=%ld n_heads=%ld n_kv_heads=%ld DQK=%ld scale=%f\n",
+        GGML_SYCL_DEBUG("ggml_sycl: XMX flash_attn_coopmat N=%ld N_kv=%ld n_heads=%ld n_kv_heads=%ld DQK=%ld scale=%f\n",
                 N, N_kv, n_heads, n_kv_heads, DQK, scale);
-        fprintf(stderr, "ggml_sycl: types: Q=%d K=%d V=%d (q_f16=%d k_f16=%d v_f16=%d)\n",
+        GGML_SYCL_DEBUG("ggml_sycl: types: Q=%d K=%d V=%d (q_f16=%d k_f16=%d v_f16=%d)\n",
                 Q->type, K->type, V->type, q_is_f16, k_is_f16, v_is_f16);
-        
+
         // Debug: check input Q/K/V values after dequantization
         float debug_q[256], debug_k[256], debug_v[256];
         stream->memcpy(debug_q, Q_d_f32, 256 * sizeof(float)).wait();
         stream->memcpy(debug_k, K_d_f32, 256 * sizeof(float)).wait();
         stream->memcpy(debug_v, V_d_f32, 256 * sizeof(float)).wait();
-        fprintf(stderr, "ggml_sycl: Q[0:4] = [%f, %f, %f, %f]\n",
+        GGML_SYCL_DEBUG("ggml_sycl: Q[0:4] = [%f, %f, %f, %f]\n",
                 debug_q[0], debug_q[1], debug_q[2], debug_q[3]);
-        fprintf(stderr, "ggml_sycl: K[0:4] = [%f, %f, %f, %f]\n",
+        GGML_SYCL_DEBUG("ggml_sycl: K[0:4] = [%f, %f, %f, %f]\n",
                 debug_k[0], debug_k[1], debug_k[2], debug_k[3]);
-        fprintf(stderr, "ggml_sycl: V[0:4] = [%f, %f, %f, %f]\n",
+        GGML_SYCL_DEBUG("ggml_sycl: V[0:4] = [%f, %f, %f, %f]\n",
                 debug_v[0], debug_v[1], debug_v[2], debug_v[3]);
         // Also print V[1] (second KV position) - offset by HEAD_DIM=128
         float debug_v2[4];
         stream->memcpy(debug_v2, V_d_f32 + 128, 4 * sizeof(float)).wait();
-        fprintf(stderr, "ggml_sycl: V[kv=1, 0:4] = [%f, %f, %f, %f]\n",
+        GGML_SYCL_DEBUG("ggml_sycl: V[kv=1, 0:4] = [%f, %f, %f, %f]\n",
                 debug_v2[0], debug_v2[1], debug_v2[2], debug_v2[3]);
         first_call = false;
     }
@@ -696,17 +697,17 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
     
     static bool mask_debug = true;
     if (mask_debug && mask_d != nullptr && getenv("GGML_SYCL_FLASH_ATTN_DEBUG")) {
-        fprintf(stderr, "ggml_sycl: Using mask tensor: ne=[%ld, %ld, %ld], stride=%ld, type=%d\n",
+        GGML_SYCL_DEBUG("ggml_sycl: Using mask tensor: ne=[%ld, %ld, %ld], stride=%ld, type=%d\n",
                 mask->ne[0], mask->ne[1], mask->ne[2], mask_stride, mask->type);
         // Debug: print first few mask values
         float debug_mask[16];
         stream->memcpy(debug_mask, mask_d, 16 * sizeof(float)).wait();
-        fprintf(stderr, "ggml_sycl: mask[row0, 0:4] = [%f, %f, %f, %f]\n",
+        GGML_SYCL_DEBUG("ggml_sycl: mask[row0, 0:4] = [%f, %f, %f, %f]\n",
                 debug_mask[0], debug_mask[1], debug_mask[2], debug_mask[3]);
         // Check mask for row 1 (query position 1) - offset by mask_stride
         float debug_mask_row1[8];
         stream->memcpy(debug_mask_row1, mask_d + mask_stride, 8 * sizeof(float)).wait();
-        fprintf(stderr, "ggml_sycl: mask[row1, 0:8] = [%f, %f, %f, %f, %f, %f, %f, %f]\n",
+        GGML_SYCL_DEBUG("ggml_sycl: mask[row1, 0:8] = [%f, %f, %f, %f, %f, %f, %f, %f]\n",
                 debug_mask_row1[0], debug_mask_row1[1], debug_mask_row1[2], debug_mask_row1[3],
                 debug_mask_row1[4], debug_mask_row1[5], debug_mask_row1[6], debug_mask_row1[7]);
         mask_debug = false;
@@ -779,7 +780,7 @@ if (tile_kind == xmx_tile_kind::tile_dg2) {
     if (!output_checked) {
         float debug_o[16];
         stream->memcpy(debug_o, dst_d, 16 * sizeof(float)).wait();
-        fprintf(stderr, "ggml_sycl: XMX Output O[0:4] = [%f, %f, %f, %f]\n",
+        GGML_SYCL_DEBUG("ggml_sycl: XMX Output O[0:4] = [%f, %f, %f, %f]\n",
                 debug_o[0], debug_o[1], debug_o[2], debug_o[3]);
         output_checked = true;
     }
@@ -1127,9 +1128,9 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // Debug: print tensor info on first call (disabled for normal operation)
     static bool first_mkl_call = true;
     if (first_mkl_call && getenv("GGML_SYCL_FLASH_ATTN_DEBUG")) {
-        fprintf(stderr, "ggml_sycl MKL path (OPTIMIZED): Q ne=[%ld,%ld,%ld,%ld] type=%d\n",
+        GGML_SYCL_DEBUG("ggml_sycl MKL path (OPTIMIZED): Q ne=[%ld,%ld,%ld,%ld] type=%d\n",
                 Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3], Q->type);
-        fprintf(stderr, "ggml_sycl MKL path: N=%ld N_kv=%ld n_heads=%ld n_kv_heads=%ld gqa_ratio=%ld\n",
+        GGML_SYCL_DEBUG("ggml_sycl MKL path: N=%ld N_kv=%ld n_heads=%ld n_kv_heads=%ld gqa_ratio=%ld\n",
                 N, N_kv, n_heads, n_kv_heads, gqa_ratio);
         first_mkl_call = false;
     }
@@ -1476,7 +1477,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         sycl_use_mkl = ggml_sycl_flash_attn_use_mkl(device);
         mkl_checked = true;
         if (sycl_use_mkl) {
-            fprintf(stderr, "ggml_sycl: Using oneMKL BLAS for flash attention (device=%s)\n",
+            GGML_SYCL_DEBUG("ggml_sycl: Using oneMKL BLAS for flash attention (device=%s)\n",
                     device.get_info<sycl::info::device::name>().c_str());
         }
     }
@@ -1527,9 +1528,9 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                     break;
             }
         } else if (padded_d > 0) {
-            fprintf(stderr, "ggml_sycl: oneMKL path does not support padded head sizes, falling back\n");
+            GGML_SYCL_DEBUG("ggml_sycl: oneMKL path does not support padded head sizes, falling back\n");
         }
-        fprintf(stderr, "ggml_sycl: oneMKL flash attention not supported for head sizes DQK=%ld DV=%ld, falling back\n", DQK, DV);
+        GGML_SYCL_DEBUG("ggml_sycl: oneMKL flash attention not supported for head sizes DQK=%ld DV=%ld, falling back\n", DQK, DV);
     }
 #endif
 
@@ -1542,12 +1543,12 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         sycl::device device = ctx.stream()->get_device();
         sycl_use_xmx = ggml_sycl_flash_attn_has_xmx(device);
         xmx_checked = true;
-        xmx_tile_kind tile_kind = ggml_sycl_flash_attn_get_tile_kind(device);
+xmx_tile_kind tile_kind = ggml_sycl_flash_attn_get_tile_kind(device);
         const char * tile_str = (tile_kind == xmx_tile_kind::tile_dg2) ? "DG2 (nsize=8)" : "PVC/B60 (nsize=16)";
-        fprintf(stderr, "ggml_sycl: XMX detection: device=%s, has_xmx=%d, tile_kind=%s\n", 
+        GGML_SYCL_DEBUG("ggml_sycl: XMX detection: device=%s, has_xmx=%d, tile_kind=%s\n",
                 device.get_info<sycl::info::device::name>().c_str(), sycl_use_xmx, tile_str);
         if (sycl_use_xmx) {
-            fprintf(stderr, "ggml_sycl: Using XMX (cooperative matrix) for flash attention with %s tiles\n", tile_str);
+            GGML_SYCL_DEBUG("ggml_sycl: Using XMX (cooperative matrix) for flash attention with %s tiles\n", tile_str);
         }
     }
 
@@ -1608,12 +1609,12 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                 }
             }
             // Fall back to non-XMX path for unsupported head sizes
-            fprintf(stderr, "ggml_sycl: XMX flash attention not supported for head size %ld, falling back\n", Q->ne[0]);
+            GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention not supported for head size %ld, falling back\n", Q->ne[0]);
         } catch (const std::exception& e) {
             // XMX kernel failed, fall back to oneMKL for mismatched K/V dimensions
             // Disable XMX for subsequent calls to avoid repeated failures
             sycl_use_xmx = false;
-            fprintf(stderr, "ggml_sycl: XMX kernel failed: %s, falling back to oneMKL path\n", e.what());
+            GGML_SYCL_DEBUG("ggml_sycl: XMX kernel failed: %s, falling back to oneMKL path\n", e.what());
 
             // For mismatched K/V dimensions, use oneMKL directly
             const int64_t DQK = Q->ne[0];
@@ -1623,7 +1624,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                 ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
                 return;
             } else if (DQK != DV) {
-                fprintf(stderr, "ggml_sycl: oneMKL path does not support DQK=%ld DV=%ld, no fallback available\n", DQK, DV);
+                GGML_SYCL_DEBUG("ggml_sycl: oneMKL path does not support DQK=%ld DV=%ld, no fallback available\n", DQK, DV);
                 return;
             }
         }
@@ -1636,9 +1637,9 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     const int64_t fallback_dv = V->ne[0];
 
     if (fallback_dqk != fallback_dv) {
-        fprintf(stderr, "ggml_sycl: Flash attention fallback path requires DQK==DV, got DQK=%ld DV=%ld\n",
+        GGML_SYCL_DEBUG("ggml_sycl: Flash attention fallback path requires DQK==DV, got DQK=%ld DV=%ld\n",
                 fallback_dqk, fallback_dv);
-        fprintf(stderr, "ggml_sycl: This should have been handled by oneMKL path. Check GGML_SYCL_USE_INTEL_ONEMKL.\n");
+        GGML_SYCL_DEBUG("ggml_sycl: This should have been handled by oneMKL path. Check GGML_SYCL_USE_INTEL_ONEMKL.\n");
         return;
     }
     
@@ -1668,7 +1669,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
             ggml_sycl_op_flash_attn_2<512, 512>(ctx, dst);
             break;
         default:
-            fprintf(stderr, "Warning: Unsupported head size %ld — skipping op\n", fallback_dqk);
+            GGML_SYCL_DEBUG("Warning: Unsupported head size %ld — skipping op\n", fallback_dqk);
             break;
     }
 }
