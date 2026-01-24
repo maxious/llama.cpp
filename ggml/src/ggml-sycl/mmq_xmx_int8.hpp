@@ -128,6 +128,99 @@ static void mmq_q4_K_xmx_kernel(
     const int K, const int M, const int N,
     const sycl::nd_item<2> &item_ct1,
     int32_t * slm_tile) {
+
+    const auto sg = item_ct1.get_sub_group();
+
+    joint_matrix<sub_group, int8_t, use::a, TM, TK, layout::row_major> matA;
+    joint_matrix<sub_group, int8_t, use::b, TK, TN, layout::ext_intel_packed> matB;
+
+    float acc[TM];
+    for (int i = 0; i < TM; i++) acc[i] = 0.0f;
+
+    const int sg_startx = item_ct1.get_group(0) * TM;
+    const int sg_starty = item_ct1.get_group(1) * TN;
+    const int lane_id = sg.get_local_id()[0];
+
+    const int K_blocks = K / QK_K;
+    const sycl::half2 * ds_ptr = (const sycl::half2 *) vy;
+    const int8_t * qs_ptr = (const int8_t *) (ds_ptr + N * K_blocks);
+
+    int8_t local_q8[TK];
+
+    for (int k_tile = 0; k_tile < K / TK; k_tile++) {
+        #pragma unroll
+        for (int i = 0; i < TM; i++) {
+            int row = sg_startx + i;
+            if (row < M) {
+                const block_q4_K * block = &vx[row * K_blocks + k_tile * (TK / QK_K)];
+                const uint8_t * qs = block->qs;
+
+                #pragma unroll
+                for (int j = 0; j < TK / 2; j++) {
+                    int idx = i * (TK / 2) + j;
+                    local_q8[idx * 2 + 0] = (int8_t)((qs[j] >> 0) & 0x0F);
+                    local_q8[idx * 2 + 1] = (int8_t)((qs[j] >> 4) & 0x0F);
+                }
+            }
+        }
+
+        auto pA = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(local_q8);
+        joint_matrix_load(sg, matA, pA, TK);
+
+        const int8_t* pB_raw = qs_ptr + (k_tile * TK / 4) * (N * 4) + sg_starty * 4;
+        auto pB = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(pB_raw);
+        joint_matrix_load(sg, matB, pB, N * 4);
+
+        joint_matrix<sub_group, int32_t, use::accumulator, TM, TN> matC;
+        joint_matrix_fill(sg, matC, 0);
+        joint_matrix_mad(sg, matC, matA, matB, matC);
+
+        auto pC = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(slm_tile);
+        joint_matrix_store(sg, matC, pC, TN, layout::row_major);
+        sycl::group_barrier(item_ct1.get_group());
+
+        for (int i = 0; i < TM; i++) {
+            int row = sg_startx + i;
+            if (row < M) {
+                const block_q4_K * block = &vx[row * K_blocks + k_tile * (TK / QK_K)];
+
+                const sycl::half2 dm = block->dm;
+                float d = (float)dm[0];
+                float dmin = (float)dm[1];
+
+                const uint8_t * scales = block->scales;
+                int sub_block_idx = lane_id / 4;
+
+                int scale_val = 0;
+                int min_val = 0;
+
+                if (sub_block_idx < 8) {
+                    int scale_idx = sub_block_idx / 2;
+                    int scale_shift = (sub_block_idx % 2) * 4;
+                    scale_val = (scales[scale_idx] >> scale_shift) & 0x0F;
+
+                    int min_idx = 4 + sub_block_idx / 2;
+                    int min_shift = (sub_block_idx % 2) * 4;
+                    min_val = (scales[min_idx] >> min_shift) & 0x0F;
+                }
+
+                float scale = (float)scale_val;
+                float min = (float)min_val;
+
+                float scale_b = (float)ds_ptr[(sg_starty + lane_id) * K_blocks + k_tile * (TK / QK_K)][0];
+
+                int32_t val = slm_tile[i * TN + lane_id];
+                acc[i] += d * scale * (float)val * scale_b - dmin * min * scale_b;
+            }
+        }
+        sycl::group_barrier(item_ct1.get_group());
+    }
+
+    for (int i = 0; i < TM; i++) {
+        if (sg_startx + i < M && sg_starty + lane_id < N) {
+            dst[(sg_startx + i) * N + sg_starty + lane_id] = acc[i];
+        }
+    }
 }
 
 void ggml_sycl_op_mul_mat_q_xmx_int8(
