@@ -23,12 +23,12 @@ if ! groups | grep -qwE "(render|video)"; then
 fi
 
 # Debug logging
-export GGML_SYCL_DEBUG=1
+#export GGML_SYCL_DEBUG=1
 
 # SINGLE GPU MODE OPTION
 # Uncomment the line below to force usage of only the first GPU (Device 0)
 # This helps rule out multi-GPU synchronization/P2P issues
-export ONEAPI_DEVICE_SELECTOR=level_zero:0
+#export ONEAPI_DEVICE_SELECTOR=level_zero:0
 
 ./build-sycl/bin/llama-server \
     --model koboldcpp/GLM-4.7-Flash-SynthLabs-REAP-25-Q4_K_M.gguf \
