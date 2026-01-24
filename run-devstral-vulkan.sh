@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Initialize Vulkan SDK
-source ~/vulkan/1.4.335.0/setup-env.sh
+source /opt/vulkan/1.4.335.0/setup-env.sh
 
 # Run Devstral 24B with Vulkan backend
 # Exclude iGPU (Vulkan3), use discrete GPUs: Intel Arc B60 (Vulkan0,1) + NVIDIA RTX 5080 (Vulkan2)

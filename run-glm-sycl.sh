@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# GLM-4.7-Flash SYCL Run Script
+# Memory Requirements: ~18GB for 4-bit quantization, 24GB RAM/VRAM/unified memory (32GB for full precision)
+# Maximum Context Window: 202,752 tokens
+# Note: llama.cpp fixed a looping bug - please re-download the model for better outputs
+# Model: unsloth/GLM-4.7-Flash-GGUF (e.g., UD-Q4_K_XL or UD-Q3_K_XL)
+
 # Initialize Intel oneAPI environment
 source /opt/intel/oneapi/setvars.sh intel64
 
@@ -22,15 +28,12 @@ export GGML_SYCL_DEBUG=1
 # SINGLE GPU MODE OPTION
 # Uncomment the line below to force usage of only the first GPU (Device 0)
 # This helps rule out multi-GPU synchronization/P2P issues
-# export ONEAPI_DEVICE_SELECTOR=level_zero:0
+export ONEAPI_DEVICE_SELECTOR=level_zero:0
 
-# Run llama-server (SYCL version)
-./build/bin/llama-server --model koboldcpp/GLM-4.7-Flash-Q4_K_M.gguf \
-  --port 5000 --host 0.0.0.0 --jinja \
-  --threads -1 \
-  --n-gpu-layers 99 \
-  --cache-ram -1 \
-  -sm layer \
-  --seed 3407 \
-  --prio 2 \
-  --temp 0.15
+./build-sycl/bin/llama-server \
+    --model koboldcpp/GLM-4.7-Flash-SynthLabs-REAP-25-Q4_K_M.gguf \
+    --port 5000 --host 0.0.0.0 --jinja \
+    --threads -1 \
+    --cache-ram -1 \
+    --fit on \
+     --temp 0.7 --top-p 1.0 --min-p 0.01

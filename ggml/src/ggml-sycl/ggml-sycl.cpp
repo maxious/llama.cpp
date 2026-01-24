@@ -622,9 +622,18 @@ static void ggml_backend_sycl_buffer_clear(ggml_backend_buffer_t buffer,
     SYCL_CHECK(
         CHECK_TRY_ERROR(dpct::get_current_device().queues_wait_and_throw()));
 
-    SYCL_CHECK(CHECK_TRY_ERROR((*stream)
-                                    .memset(ctx->dev_ptr, value, buffer->size)
-                                    .wait()));
+    // Split large memsets into chunks to avoid GPU command timeout (TDR)
+    // Intel GPUs have a ~2 second command timeout by default
+    constexpr size_t CHUNK_SIZE = 256 * 1024 * 1024;  // 256 MiB chunks
+    size_t remaining = buffer->size;
+    uint8_t * ptr = static_cast<uint8_t *>(ctx->dev_ptr);
+
+    while (remaining > 0) {
+        size_t chunk = std::min(remaining, CHUNK_SIZE);
+        SYCL_CHECK(CHECK_TRY_ERROR((*stream).memset(ptr, value, chunk).wait()));
+        ptr += chunk;
+        remaining -= chunk;
+    }
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
