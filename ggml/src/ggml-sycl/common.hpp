@@ -92,7 +92,7 @@ extern int g_ggml_sycl_prioritize_dmmv;
 #endif
 
 // max batch size to use MMQ kernels when tensor cores are available
-#define MMQ_MAX_BATCH_SIZE 32
+#define MMQ_MAX_BATCH_SIZE 512
 
 // dmmv = dequantize_mul_mat_vec
 #ifndef GGML_SYCL_DMMV_X
