@@ -145,26 +145,27 @@ static void mmq_q4_0_xmx_kernel(
     const sycl::half2 * ds_ptr = (const sycl::half2 *) vy;
     const int8_t * qs_ptr = (const int8_t *) (ds_ptr + N * K_blocks);
 
-    int8_t local_q8[TK];
+    int8_t * slm_A = (int8_t *)(slm_tile + TM * TN);
 
     for (int k_tile = 0; k_tile < K / TK; k_tile++) {
         #pragma unroll
-        for (int i = 0; i < TM; i++) {
+        for (int idx = lane_id; idx < (TM * TK) / 2; idx += 16) {
+            int i = (idx * 2) / TK;
+            int j = (idx * 2) % TK / 2;
             int row = sg_startx + i;
             if (row < M) {
                 const block_q4_0 * block = &vx[row * K_blocks + k_tile * (TK / QK4_0)];
-                const uint8_t * qs = block->qs;
-
-                #pragma unroll
-                for (int j = 0; j < TK / 2; j++) {
-                    int idx = i * (TK / 2) + j;
-                    local_q8[idx * 2 + 0] = (int8_t)((qs[j] >> 0) & 0x0F);
-                    local_q8[idx * 2 + 1] = (int8_t)((qs[j] >> 4) & 0x0F);
-                }
+                uint8_t qs_val = block->qs[j];
+                slm_A[idx * 2 + 0] = (int8_t)((qs_val >> 0) & 0x0F) - 8;
+                slm_A[idx * 2 + 1] = (int8_t)((qs_val >> 4) & 0x0F) - 8;
+            } else {
+                slm_A[idx * 2 + 0] = 0;
+                slm_A[idx * 2 + 1] = 0;
             }
         }
+        sycl::group_barrier(item_ct1.get_group());
 
-        auto pA = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(local_q8);
+        auto pA = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(slm_A);
         joint_matrix_load(sg, matA, pA, TK);
 
         const int8_t* pB_raw = qs_ptr + (k_tile * TK / 4) * (N * 4) + sg_starty * 4;
@@ -224,26 +225,27 @@ static void mmq_q4_1_xmx_kernel(
     const sycl::half2 * ds_ptr = (const sycl::half2 *) vy;
     const int8_t * qs_ptr = (const int8_t *) (ds_ptr + N * K_blocks);
 
-    int8_t local_q8[TK];
+    int8_t * slm_A = (int8_t *)(slm_tile + TM * TN);
 
     for (int k_tile = 0; k_tile < K / TK; k_tile++) {
         #pragma unroll
-        for (int i = 0; i < TM; i++) {
+        for (int idx = lane_id; idx < (TM * TK) / 2; idx += 16) {
+            int i = (idx * 2) / TK;
+            int j = (idx * 2) % TK / 2;
             int row = sg_startx + i;
             if (row < M) {
                 const block_q4_1 * block = &vx[row * K_blocks + k_tile * (TK / QK4_1)];
-                const uint8_t * qs = block->qs;
-
-                #pragma unroll
-                for (int j = 0; j < TK / 2; j++) {
-                    int idx = i * (TK / 2) + j;
-                    local_q8[idx * 2 + 0] = (int8_t)((qs[j] >> 0) & 0x0F);
-                    local_q8[idx * 2 + 1] = (int8_t)((qs[j] >> 4) & 0x0F);
-                }
+                uint8_t qs_val = block->qs[j];
+                slm_A[idx * 2 + 0] = (int8_t)((qs_val >> 0) & 0x0F);
+                slm_A[idx * 2 + 1] = (int8_t)((qs_val >> 4) & 0x0F);
+            } else {
+                slm_A[idx * 2 + 0] = 0;
+                slm_A[idx * 2 + 1] = 0;
             }
         }
+        sycl::group_barrier(item_ct1.get_group());
 
-        auto pA = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(local_q8);
+        auto pA = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(slm_A);
         joint_matrix_load(sg, matA, pA, TK);
 
         const int8_t* pB_raw = qs_ptr + (k_tile * TK / 4) * (N * 4) + sg_starty * 4;
@@ -265,9 +267,11 @@ static void mmq_q4_1_xmx_kernel(
                 const sycl::half2 dm = block->dm;
                 float d = (float)dm[0];
                 float m = (float)dm[1];
-                float scale_b = (float)ds_ptr[(sg_starty + lane_id) * K_blocks + k_tile * (TK / QK4_1)][0];
+                sycl::half2 ds8 = ds_ptr[(sg_starty + lane_id) * K_blocks + k_tile * (TK / QK4_1)];
+                float scale_b = (float)ds8[0];
+                float s_b = (float)ds8[1];
                 int32_t val = slm_tile[i * TN + lane_id];
-                acc[i] += d * (float)val * scale_b - m * scale_b;
+                acc[i] += d * (float)val * scale_b + m * s_b;
             }
         }
         sycl::group_barrier(item_ct1.get_group());
@@ -305,31 +309,33 @@ static void mmq_q5_0_xmx_kernel(
     const sycl::half2 * ds_ptr = (const sycl::half2 *) vy;
     const int8_t * qs_ptr = (const int8_t *) (ds_ptr + N * K_blocks);
 
-    int8_t local_q8[TK];
+    int8_t * slm_A = (int8_t *)(slm_tile + TM * TN);
 
     for (int k_tile = 0; k_tile < K / TK; k_tile++) {
         #pragma unroll
-        for (int i = 0; i < TM; i++) {
+        for (int idx = lane_id; idx < (TM * TK) / 2; idx += 16) {
+            int i = (idx * 2) / TK;
+            int j = (idx * 2) % TK / 2;
             int row = sg_startx + i;
             if (row < M) {
                 const block_q5_0 * block = &vx[row * K_blocks + k_tile * (TK / QK5_0)];
                 const uint8_t * qs = block->qs;
                 const uint32_t qh = *(const uint32_t*)block->qh;
 
-                #pragma unroll
-                for (int j = 0; j < TK / 2; j++) {
-                    int idx = i * (TK / 2) + j;
-                    uint8_t q0 = (qs[j] >> 0) & 0x0F;
-                    uint8_t q1 = (qs[j] >> 4) & 0x0F;
-                    uint8_t h0 = (qh >> (j * 2 + 0)) & 0x01;
-                    uint8_t h1 = (qh >> (j * 2 + 1)) & 0x01;
-                    local_q8[idx * 2 + 0] = (int8_t)((q0 | (h0 << 4)) - 16);
-                    local_q8[idx * 2 + 1] = (int8_t)((q1 | (h1 << 4)) - 16);
-                }
+                uint8_t q0 = (qs[j] >> 0) & 0x0F;
+                uint8_t q1 = (qs[j] >> 4) & 0x0F;
+                uint8_t h0 = (qh >> (j * 2 + 0)) & 0x01;
+                uint8_t h1 = (qh >> (j * 2 + 1)) & 0x01;
+                slm_A[idx * 2 + 0] = (int8_t)((q0 | (h0 << 4)) - 16);
+                slm_A[idx * 2 + 1] = (int8_t)((q1 | (h1 << 4)) - 16);
+            } else {
+                slm_A[idx * 2 + 0] = 0;
+                slm_A[idx * 2 + 1] = 0;
             }
         }
+        sycl::group_barrier(item_ct1.get_group());
 
-        auto pA = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(local_q8);
+        auto pA = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(slm_A);
         joint_matrix_load(sg, matA, pA, TK);
 
         const int8_t* pB_raw = qs_ptr + (k_tile * TK / 4) * (N * 4) + sg_starty * 4;
@@ -389,31 +395,33 @@ static void mmq_q5_1_xmx_kernel(
     const sycl::half2 * ds_ptr = (const sycl::half2 *) vy;
     const int8_t * qs_ptr = (const int8_t *) (ds_ptr + N * K_blocks);
 
-    int8_t local_q8[TK];
+    int8_t * slm_A = (int8_t *)(slm_tile + TM * TN);
 
     for (int k_tile = 0; k_tile < K / TK; k_tile++) {
         #pragma unroll
-        for (int i = 0; i < TM; i++) {
+        for (int idx = lane_id; idx < (TM * TK) / 2; idx += 16) {
+            int i = (idx * 2) / TK;
+            int j = (idx * 2) % TK / 2;
             int row = sg_startx + i;
             if (row < M) {
                 const block_q5_1 * block = &vx[row * K_blocks + k_tile * (TK / QK5_1)];
                 const uint8_t * qs = block->qs;
                 const uint32_t qh = *(const uint32_t*)block->qh;
 
-                #pragma unroll
-                for (int j = 0; j < TK / 2; j++) {
-                    int idx = i * (TK / 2) + j;
-                    uint8_t q0 = (qs[j] >> 0) & 0x0F;
-                    uint8_t q1 = (qs[j] >> 4) & 0x0F;
-                    uint8_t h0 = (qh >> (j * 2 + 0)) & 0x01;
-                    uint8_t h1 = (qh >> (j * 2 + 1)) & 0x01;
-                    local_q8[idx * 2 + 0] = (int8_t)((q0 | (h0 << 4)) - 16);
-                    local_q8[idx * 2 + 1] = (int8_t)((q1 | (h1 << 4)) - 16);
-                }
+                uint8_t q0 = (qs[j] >> 0) & 0x0F;
+                uint8_t q1 = (qs[j] >> 4) & 0x0F;
+                uint8_t h0 = (qh >> (j * 2 + 0)) & 0x01;
+                uint8_t h1 = (qh >> (j * 2 + 1)) & 0x01;
+                slm_A[idx * 2 + 0] = (int8_t)((q0 | (h0 << 4)) - 16);
+                slm_A[idx * 2 + 1] = (int8_t)((q1 | (h1 << 4)) - 16);
+            } else {
+                slm_A[idx * 2 + 0] = 0;
+                slm_A[idx * 2 + 1] = 0;
             }
         }
+        sycl::group_barrier(item_ct1.get_group());
 
-        auto pA = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(local_q8);
+        auto pA = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(slm_A);
         joint_matrix_load(sg, matA, pA, TK);
 
         const int8_t* pB_raw = qs_ptr + (k_tile * TK / 4) * (N * 4) + sg_starty * 4;
@@ -435,9 +443,11 @@ static void mmq_q5_1_xmx_kernel(
                 const sycl::half2 dm = block->dm;
                 float d = (float)dm[0];
                 float m = (float)dm[1];
-                float scale_b = (float)ds_ptr[(sg_starty + lane_id) * K_blocks + k_tile * (TK / QK5_1)][0];
+                sycl::half2 ds8 = ds_ptr[(sg_starty + lane_id) * K_blocks + k_tile * (TK / QK5_1)];
+                float scale_b = (float)ds8[0];
+                float s_b = (float)ds8[1];
                 int32_t val = slm_tile[i * TN + lane_id];
-                acc[i] += d * (float)val * scale_b - m * scale_b;
+                acc[i] += d * (float)val * scale_b + m * s_b;
             }
         }
         sycl::group_barrier(item_ct1.get_group());
@@ -482,7 +492,7 @@ static void mmq_q8_1_xmx_kernel(
         const int8_t* pB_raw = qs_ptr + (k_tile * TK / 4) * (N * 4) + sg_starty * 4;
         auto pB = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(pB_raw);
 
-        joint_matrix_load(sg, matA, pA, K_blocks * 34);
+        joint_matrix_load(sg, matA, pA, K_blocks * 36);
         joint_matrix_load(sg, matB, pB, N * 4);
 
         joint_matrix<sub_group, int32_t, use::accumulator, TM, TN> matC;

@@ -3010,9 +3010,9 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
 
     dpct::has_capability_or_fail(queue->get_device(), { sycl::aspect::fp16 });
 
-    const sycl::half * src0_f16 = static_cast<const sycl::half *>(src0->data);
+    const sycl::half * src0_f16       = static_cast<const sycl::half *>(src0->data);
+    const size_t       type_size_src0 = ggml_type_size(src0->type);
     float *            dst_ddf  = static_cast<float *>(dst->data);
-
     const sycl::half * src1_f16       = static_cast<const sycl::half *>(src1->data);
     const size_t       type_size_src1 = ggml_type_size(src1->type);
 
@@ -3098,9 +3098,9 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
 
 #if GGML_SYCL_DNNL
     if (!g_ggml_sycl_disable_dnn) {
-            int64_t str_a0 = nb00 / type_size_src0;
-            int64_t str_a1 = nb01 / type_size_src0;
-            int64_t str_a2 = nb02 / type_size_src0;
+            int64_t str_a0 = nb00 / type_size_src1;
+            int64_t str_a1 = nb01 / type_size_src1;
+            int64_t str_a2 = nb02 / type_size_src1;
 
             int64_t str_b0 = nb10 / type_size_src1;
             int64_t str_b1 = nb11 / type_size_src1;
@@ -3173,15 +3173,10 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
                 // This case is similar to the one above with the difference that only the batch in dimension 3 is used and the dimension 2 is of size 1.
                 int64_t batches0 = ne02 * ne03;
                 int64_t batches1 = ne12 * ne13;
-                int64_t str_a3 = nb03 / type_size_src0;
-                int64_t str_b3 = nb13 / type_size_src1;
-                launch_gemm_for_batches(src0_f16, src1_f16, dst_ddf, ne00, ne01, batches0,
-                        ne10, ne11, batches1, str_a0, str_a1, str_a3, str_b0, str_b1,
-                        str_b3, nb2 / sizeof(float));
-            } else {
-                for (int64_t b_a = 0; b_a < ne03; b_a++) {
-                    const sycl::half *src0_f16_shifted
-                            = src0_f16 + (nb03 * b_a / type_size_src0);
+                int64_t str_a3 = nb03 / sizeof(sycl::half);
+                for (int b_a = 0; b_a < r3; b_a++) {
+                    const sycl::half * src0_ptr
+                            = src0_f16 + (nb03 * b_a / sizeof(sycl::half));
                     const sycl::half *src1_f16_shifted
                             = src1_f16 + (nb13 * b_a / type_size_src1);
                     float *dst_shifted = dst_ddf + (nb3 * b_a / sizeof(float));

@@ -89,7 +89,7 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(
         case GGML_TYPE_Q8_0:
             if (TM == 8 && TN == 16 && TK == 32) {
                 stream->submit([&](handler& cgh) {
-                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16), cgh);
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16 + 8 * 32 / 4), cgh);
                     cgh.parallel_for(
                         nd_range<2>({static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size)},
                                     {static_cast<size_t>(1), static_cast<size_t>(sg_size)}),
@@ -109,7 +109,7 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(
         case GGML_TYPE_Q4_0:
             if (TM == 8 && TN == 16 && TK == 32) {
                 stream->submit([&](handler& cgh) {
-                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16), cgh);
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16 + 8 * 32 / 4), cgh);
                     cgh.parallel_for(
                         nd_range<2>({static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size)},
                                     {static_cast<size_t>(1), static_cast<size_t>(sg_size)}),
@@ -129,7 +129,7 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(
         case GGML_TYPE_Q4_1:
             if (TM == 8 && TN == 16 && TK == 32) {
                 stream->submit([&](handler& cgh) {
-                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16), cgh);
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16 + 8 * 32 / 4), cgh);
                     cgh.parallel_for(
                         nd_range<2>({static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size)},
                                     {static_cast<size_t>(1), static_cast<size_t>(sg_size)}),
@@ -149,7 +149,7 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(
         case GGML_TYPE_Q5_0:
             if (TM == 8 && TN == 16 && TK == 32) {
                 stream->submit([&](handler& cgh) {
-                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16), cgh);
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16 + 8 * 32 / 4), cgh);
                     cgh.parallel_for(
                         nd_range<2>({static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size)},
                                     {static_cast<size_t>(1), static_cast<size_t>(sg_size)}),
@@ -169,7 +169,7 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(
         case GGML_TYPE_Q5_1:
             if (TM == 8 && TN == 16 && TK == 32) {
                 stream->submit([&](handler& cgh) {
-                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16), cgh);
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16 + 8 * 32 / 4), cgh);
                     cgh.parallel_for(
                         nd_range<2>({static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size)},
                                     {static_cast<size_t>(1), static_cast<size_t>(sg_size)}),
@@ -189,7 +189,7 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(
         case GGML_TYPE_Q8_1:
             if (TM == 8 && TN == 16 && TK == 32) {
                 stream->submit([&](handler& cgh) {
-                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16), cgh);
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16 + 8 * 32 / 4), cgh);
                     cgh.parallel_for(
                         nd_range<2>({static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size)},
                                     {static_cast<size_t>(1), static_cast<size_t>(sg_size)}),

@@ -4,7 +4,7 @@
 #  SPDX-License-Identifier: MIT
 #
 # SYCL Build Script for llama.cpp
-# Usage: ./build-sycl.sh [--clean] [--f16] [--bf16] [--asan] [--ubsan] [--sanitize]
+# Usage: ./build-sycl.sh [--clean] [--no-f16] [--no-bf16] [--asan] [--ubsan] [--sanitize]
 
 set -e
 
@@ -13,8 +13,8 @@ cd "$SCRIPT_DIR"
 
 # Parse arguments
 CLEAN=false
-ENABLE_F16=false
-ENABLE_BF16=false
+ENABLE_F16=true
+ENABLE_BF16=true
 ENABLE_ASAN=false
 ENABLE_UBSAN=false
 BUILD_TYPE="Release"
@@ -29,8 +29,16 @@ while [[ "$1" == --* ]]; do
             ENABLE_F16=true
             shift
             ;;
+        --no-f16)
+            ENABLE_F16=false
+            shift
+            ;;
         --bf16)
             ENABLE_BF16=true
+            shift
+            ;;
+        --no-bf16)
+            ENABLE_BF16=false
             shift
             ;;
         --asan)
@@ -51,7 +59,9 @@ while [[ "$1" == --* ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--clean] [--f16] [--bf16] [--asan] [--ubsan] [--sanitize]"
+            echo "Usage: $0 [--clean] [--no-f16] [--no-bf16] [--asan] [--ubsan] [--sanitize]"
+            echo ""
+            echo "Note: FP16 and BF16 are enabled by default for Intel GPUs."
             echo ""
             echo "Sanitizer options:"
             echo "  --asan     Enable Address Sanitizer (ASAN) for memory error detection"
