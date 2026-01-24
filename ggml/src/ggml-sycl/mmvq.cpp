@@ -122,7 +122,7 @@ static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict_
     }
 
     const int     blocks_per_row  = ncols / qk;
-    constexpr int blocks_per_warp = (vdr * WARP_SIZE + qi - 1) / qi;  // Ensuring blocks_per_warp > 0
+    constexpr int blocks_per_warp = (vdr * QK_WARP_SIZE + qi - 1) / qi;  // Ensuring blocks_per_warp > 0
 
     assert(blocks_per_warp > 0);
 
@@ -137,7 +137,7 @@ static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict_
 
         const int iby = i * (qk / QK8_1);          // y block index that aligns with ibx
 
-        for (size_t elem = 0; elem < qi / vdr; elem += WARP_SIZE) {
+        for (size_t elem = 0; elem < qi / vdr; elem += QK_WARP_SIZE) {
             const int iqs = elem + vdr * (item_ct1.get_local_id(2) %
                                           (qi / vdr));  // x block quant index when casting the quants to int
 
@@ -147,7 +147,7 @@ static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict_
 
     // sum up partial sums and write back result
 #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
         tmp += dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
     }
 
@@ -210,7 +210,7 @@ static void mul_mat_vec_q_iq2_xxs_q8_1(const void *__restrict__ vx,
     }
 
     const int blocks_per_row = ncols / qk;
-    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+    const int blocks_per_warp = vdr * QK_WARP_SIZE / qi;
     assert(blocks_per_warp>0);
 
 // partial sum for each thread
@@ -235,7 +235,7 @@ static void mul_mat_vec_q_iq2_xxs_q8_1(const void *__restrict__ vx,
 
     // sum up partial sums and write back result
 #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
         tmp +=
             dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
     }
@@ -259,7 +259,7 @@ static void mul_mat_vec_q_iq2_xs_q8_1(const void *__restrict__ vx,
     }
 
     const int blocks_per_row = ncols / qk;
-    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+    const int blocks_per_warp = vdr * QK_WARP_SIZE / qi;
     assert(blocks_per_warp>0);
 // partial sum for each thread
     float tmp = 0.0f;
@@ -283,7 +283,7 @@ static void mul_mat_vec_q_iq2_xs_q8_1(const void *__restrict__ vx,
 
     // sum up partial sums and write back result
 #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
         tmp +=
             dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
     }
@@ -307,7 +307,7 @@ static void mul_mat_vec_q_iq2_s_q8_1(const void *__restrict__ vx,
     }
 
     const int blocks_per_row = ncols / qk;
-    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+    const int blocks_per_warp = vdr * QK_WARP_SIZE / qi;
     assert(blocks_per_warp>0);
 // partial sum for each thread
     float tmp = 0.0f;
@@ -331,7 +331,7 @@ static void mul_mat_vec_q_iq2_s_q8_1(const void *__restrict__ vx,
 
     // sum up partial sums and write back result
 #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
         tmp +=
             dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
     }
@@ -355,7 +355,7 @@ static void mul_mat_vec_q_iq3_xxs_q8_1(const void *__restrict__ vx,
     }
 
     const int blocks_per_row = ncols / qk;
-    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+    const int blocks_per_warp = vdr * QK_WARP_SIZE / qi;
     assert(blocks_per_warp>0);
 // partial sum for each thread
     float tmp = 0.0f;
@@ -379,7 +379,7 @@ static void mul_mat_vec_q_iq3_xxs_q8_1(const void *__restrict__ vx,
 
     // sum up partial sums and write back result
 #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
         tmp +=
             dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
     }
@@ -403,7 +403,7 @@ static void mul_mat_vec_q_iq3_s_q8_1(const void *__restrict__ vx,
     }
 
     const int blocks_per_row = ncols / qk;
-    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+    const int blocks_per_warp = vdr * QK_WARP_SIZE / qi;
     assert(blocks_per_warp>0);
 // partial sum for each thread
     float tmp = 0.0f;
@@ -427,7 +427,7 @@ static void mul_mat_vec_q_iq3_s_q8_1(const void *__restrict__ vx,
 
     // sum up partial sums and write back result
 #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
         tmp +=
             dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
     }
@@ -451,7 +451,7 @@ static void mul_mat_vec_q_iq1_s_q8_1(const void *__restrict__ vx,
     }
 
     const int blocks_per_row = ncols / qk;
-    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+    const int blocks_per_warp = vdr * QK_WARP_SIZE / qi;
     assert(blocks_per_warp>0);
 // partial sum for each thread
     float tmp = 0.0f;
@@ -475,7 +475,7 @@ static void mul_mat_vec_q_iq1_s_q8_1(const void *__restrict__ vx,
 
     // sum up partial sums and write back result
 #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
         tmp +=
             dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
     }
@@ -499,7 +499,7 @@ static void mul_mat_vec_q_iq1_m_q8_1(const void *__restrict__ vx,
     }
 
     const int blocks_per_row = ncols / qk;
-    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+    const int blocks_per_warp = vdr * QK_WARP_SIZE / qi;
     assert(blocks_per_warp>0);
 // partial sum for each thread
     float tmp = 0.0f;
@@ -523,7 +523,7 @@ static void mul_mat_vec_q_iq1_m_q8_1(const void *__restrict__ vx,
 
     // sum up partial sums and write back result
 #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
         tmp +=
             dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
     }
@@ -547,7 +547,7 @@ static void mul_mat_vec_q_iq4_nl_q8_1(const void *__restrict__ vx,
     }
 
     const int blocks_per_row = ncols / qk;
-    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+    const int blocks_per_warp = vdr * QK_WARP_SIZE / qi;
     assert(blocks_per_warp>0);
 // partial sum for each thread
     float tmp = 0.0f;
@@ -571,7 +571,7 @@ static void mul_mat_vec_q_iq4_nl_q8_1(const void *__restrict__ vx,
 
     // sum up partial sums and write back result
 #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
         tmp +=
             dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
     }
@@ -596,7 +596,7 @@ static void mul_mat_vec_q_iq4_xs_q8_1(const void *__restrict__ vx,
     }
 
     const int blocks_per_row = ncols / qk;
-    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+    const int blocks_per_warp = vdr * QK_WARP_SIZE / qi;
     assert(blocks_per_warp>0);
 // partial sum for each thread
     float tmp = 0.0f;
@@ -620,7 +620,7 @@ static void mul_mat_vec_q_iq4_xs_q8_1(const void *__restrict__ vx,
 
     // sum up partial sums and write back result
 #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
         tmp +=
             dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
     }
