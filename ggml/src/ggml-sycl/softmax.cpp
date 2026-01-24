@@ -392,7 +392,6 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     params.m1 = m1;
 
     // Allocate temporary F32 buffers for F16/BF16 input/output
-    const size_t nbytes = ggml_nbytes(src0);
     float * src0_f32 = nullptr;
     float * dst_f32 = nullptr;
 

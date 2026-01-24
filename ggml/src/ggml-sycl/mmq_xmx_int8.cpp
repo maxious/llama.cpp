@@ -19,17 +19,18 @@ using namespace sycl::ext::oneapi::experimental::matrix;
 // src: block_q8_1[N][K/32]
 // dst: int8_t[K/4][N*4] (VNNI-packed)
 // scales: float[N][K/32] (Optional SoA for scales)
+// TODO: Implement this function
 void reorder_q8_1_xmx_layout(
     const block_q8_1 * __restrict__ src,
     int8_t * __restrict__ dst,
     int K, int N,
     const sycl::nd_item<1> &item_ct1) {
 
-    int k_block = item_ct1.get_global_id(0);
-    int n = item_ct1.get_global_id(1); // Wait, this is nd_item<1>
-
-    // Simplified reorder for demonstration
-    // ...
+    (void)src;
+    (void)dst;
+    (void)K;
+    (void)N;
+    (void)item_ct1;
 }
 
 void ggml_sycl_op_mul_mat_q_xmx_int8(
@@ -71,8 +72,6 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(
 
     // Get matrix dimensions
     const int64_t ne00 = src0->ne[0];
-    const int64_t ne01 = src0->ne[1];
-    const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
 
     // Calculate grid dimensions

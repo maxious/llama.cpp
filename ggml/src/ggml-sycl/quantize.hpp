@@ -43,6 +43,7 @@ template <int ElementsPerWI> struct no_quantize_q8_1 {
 template <int ElementsPerWI> struct quantize_q8_1_soa {
     __dpct_inline__ void operator()(const float * __restrict__ x, void * q8_tensor, const int kx, const int ky,
                                     const int kx_padded, const sycl::nd_item<1> & it) const {
+        (void)kx_padded;  // Currently unused, kept for interface compatibility
         auto subgroup_id = it.get_group(0);
         auto wi_id       = it.get_local_id(0);
 
@@ -76,6 +77,7 @@ template <int ElementsPerWI> struct quantize_q8_1_soa {
 template <int ElementsPerWI> struct quantize_q8_1 {
     __dpct_inline__ void operator()(const float * __restrict__ x, void * q8_tensor, const int kx, const int ky,
                                     const int kx_padded, const sycl::nd_item<1> & it) const {
+        (void)ky;  // Currently unused, kept for interface compatibility
         auto subgroup_id = it.get_group(0);
         auto wi_id       = it.get_local_id(0);
 
