@@ -480,10 +480,8 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
         const sycl::half * Q_d = (const sycl::half *) Q->data;
         Q_d_f32_alloc = (float *) sycl::malloc_device(N * DQK * n_heads * sizeof(float), *stream);
         
-        // Q layout: ne=[DQK, N, n_heads, 1], nb=[2, n_heads*DQK*2, DQK*2, ...]
-        // Q[d, n, h] = Q_d[d + h*DQK + n*n_heads*DQK] (stride1 = n_heads*DQK half elements)
-        const int64_t q_stride_seq = n_heads * DQK;  // Stride between sequence positions
-        const int64_t q_stride_head = DQK;           // Stride between heads
+        const int64_t q_stride_seq = Q->nb[1] / sizeof(sycl::half);
+        const int64_t q_stride_head = Q->nb[2] / sizeof(sycl::half);
         
         for (int64_t head = 0; head < n_heads; ++head) {
             const int64_t n_elements = N * DQK;
@@ -503,12 +501,11 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
         }
         Q_d_f32 = Q_d_f32_alloc;
     } else {
-        // F32 Q - also need to reorder from tensor layout to contiguous per-head
         const float * Q_d = (const float *) Q->data;
         Q_d_f32_alloc = (float *) sycl::malloc_device(N * DQK * n_heads * sizeof(float), *stream);
         
-        const int64_t q_stride_seq = n_heads * DQK;
-        const int64_t q_stride_head = DQK;
+        const int64_t q_stride_seq = Q->nb[1] / sizeof(float);
+        const int64_t q_stride_head = Q->nb[2] / sizeof(float);
         
         for (int64_t head = 0; head < n_heads; ++head) {
             const int64_t n_elements = N * DQK;
@@ -531,10 +528,8 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
         const sycl::half * K_d = (const sycl::half *) K->data;
         K_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DQK * n_kv_heads * sizeof(float), *stream);
         
-        // K layout: ne=[DQK, N_kv, n_kv_heads, 1]
-        // K[d, n, h] = K_d[d + h*DQK + n*n_kv_heads*DQK]
-        const int64_t k_stride_seq = n_kv_heads * DQK;
-        const int64_t k_stride_head = DQK;
+        const int64_t k_stride_seq = K->nb[1] / sizeof(sycl::half);
+        const int64_t k_stride_head = K->nb[2] / sizeof(sycl::half);
         
         for (int64_t head = 0; head < n_kv_heads; ++head) {
             const int64_t n_elements = N_kv * DQK;
@@ -552,12 +547,11 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
         }
         K_d_f32 = K_d_f32_alloc;
     } else {
-        // F32 K - reorder from tensor layout
         const float * K_d = (const float *) K->data;
         K_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DQK * n_kv_heads * sizeof(float), *stream);
         
-        const int64_t k_stride_seq = n_kv_heads * DQK;
-        const int64_t k_stride_head = DQK;
+        const int64_t k_stride_seq = K->nb[1] / sizeof(float);
+        const int64_t k_stride_head = K->nb[2] / sizeof(float);
         
         for (int64_t head = 0; head < n_kv_heads; ++head) {
             const int64_t n_elements = N_kv * DQK;
@@ -580,10 +574,8 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
         const sycl::half * V_d = (const sycl::half *) V->data;
         V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
         
-        // V layout: ne=[DV, N_kv, n_kv_heads, 1]
-        // V[d, n, h] = V_d[d + h*DV + n*n_kv_heads*DV]
-        const int64_t v_stride_seq = n_kv_heads * DV;
-        const int64_t v_stride_head = DV;
+        const int64_t v_stride_seq = V->nb[1] / sizeof(sycl::half);
+        const int64_t v_stride_head = V->nb[2] / sizeof(sycl::half);
         
         for (int64_t head = 0; head < n_kv_heads; ++head) {
             const int64_t n_elements = N_kv * DV;
@@ -601,12 +593,11 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
         }
         V_d_f32 = V_d_f32_alloc;
     } else {
-        // F32 V - reorder from tensor layout
         const float * V_d = (const float *) V->data;
         V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
         
-        const int64_t v_stride_seq = n_kv_heads * DV;
-        const int64_t v_stride_head = DV;
+        const int64_t v_stride_seq = V->nb[1] / sizeof(float);
+        const int64_t v_stride_head = V->nb[2] / sizeof(float);
         
         for (int64_t head = 0; head < n_kv_heads; ++head) {
             const int64_t n_elements = N_kv * DV;
@@ -870,8 +861,8 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
         const sycl::half * Q_d = (const sycl::half *) Q->data;
         Q_d_f32_alloc = (float *) sycl::malloc_device(N * HEAD_DIM * n_heads * sizeof(float), *stream);
         
-        const int64_t q_stride_seq = n_heads * HEAD_DIM;
-        const int64_t q_stride_head = HEAD_DIM;
+        const int64_t q_stride_seq = Q->nb[1] / sizeof(sycl::half);
+        const int64_t q_stride_head = Q->nb[2] / sizeof(sycl::half);
         
         for (int64_t head = 0; head < n_heads; ++head) {
             const int64_t n_elements = N * HEAD_DIM;
@@ -892,8 +883,8 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
         const float * Q_d = (const float *) Q->data;
         Q_d_f32_alloc = (float *) sycl::malloc_device(N * HEAD_DIM * n_heads * sizeof(float), *stream);
         
-        const int64_t q_stride_seq = n_heads * HEAD_DIM;
-        const int64_t q_stride_head = HEAD_DIM;
+        const int64_t q_stride_seq = Q->nb[1] / sizeof(float);
+        const int64_t q_stride_head = Q->nb[2] / sizeof(float);
         
         for (int64_t head = 0; head < n_heads; ++head) {
             const int64_t n_elements = N * HEAD_DIM;
@@ -916,8 +907,8 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
         const sycl::half * K_d = (const sycl::half *) K->data;
         K_d_f32_alloc = (float *) sycl::malloc_device(N_kv * HEAD_DIM * n_kv_heads * sizeof(float), *stream);
         
-        const int64_t k_stride_seq = n_kv_heads * HEAD_DIM;
-        const int64_t k_stride_head = HEAD_DIM;
+        const int64_t k_stride_seq = K->nb[1] / sizeof(sycl::half);
+        const int64_t k_stride_head = K->nb[2] / sizeof(sycl::half);
         
         for (int64_t head = 0; head < n_kv_heads; ++head) {
             const int64_t n_elements = N_kv * HEAD_DIM;
@@ -938,8 +929,8 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
         const float * K_d = (const float *) K->data;
         K_d_f32_alloc = (float *) sycl::malloc_device(N_kv * HEAD_DIM * n_kv_heads * sizeof(float), *stream);
         
-        const int64_t k_stride_seq = n_kv_heads * HEAD_DIM;
-        const int64_t k_stride_head = HEAD_DIM;
+        const int64_t k_stride_seq = K->nb[1] / sizeof(float);
+        const int64_t k_stride_head = K->nb[2] / sizeof(float);
         
         for (int64_t head = 0; head < n_kv_heads; ++head) {
             const int64_t n_elements = N_kv * HEAD_DIM;
@@ -962,8 +953,8 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
         const sycl::half * V_d = (const sycl::half *) V->data;
         V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * HEAD_DIM * n_kv_heads * sizeof(float), *stream);
         
-        const int64_t v_stride_seq = n_kv_heads * HEAD_DIM;
-        const int64_t v_stride_head = HEAD_DIM;
+        const int64_t v_stride_seq = V->nb[1] / sizeof(sycl::half);
+        const int64_t v_stride_head = V->nb[2] / sizeof(sycl::half);
         
         for (int64_t head = 0; head < n_kv_heads; ++head) {
             const int64_t n_elements = N_kv * HEAD_DIM;
@@ -984,8 +975,8 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
         const float * V_d = (const float *) V->data;
         V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * HEAD_DIM * n_kv_heads * sizeof(float), *stream);
         
-        const int64_t v_stride_seq = n_kv_heads * HEAD_DIM;
-        const int64_t v_stride_head = HEAD_DIM;
+        const int64_t v_stride_seq = V->nb[1] / sizeof(float);
+        const int64_t v_stride_head = V->nb[2] / sizeof(float);
         
         for (int64_t head = 0; head < n_kv_heads; ++head) {
             const int64_t n_elements = N_kv * HEAD_DIM;
