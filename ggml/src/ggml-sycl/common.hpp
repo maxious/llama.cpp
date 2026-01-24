@@ -87,7 +87,7 @@ extern int g_ggml_sycl_prioritize_dmmv;
 // When defined, enables XMX-accelerated flash attention and limits MMQ batch size.
 // Flash attention XMX provides 3-4x speedup on Intel Arc B60/Battlemage.
 // MMQ uses dp4a (int8 dot product) which is optimal for quantized matmul.
-#if !defined(GGML_SYCL_FORCE_MMQ)
+#if !defined(GGML_SYCL_FORCE_MMQ) && !defined(SYCL_USE_XMX)
     #define SYCL_USE_XMX
 #endif
 
