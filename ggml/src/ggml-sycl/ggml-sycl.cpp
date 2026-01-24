@@ -53,6 +53,7 @@
 #include "ggml-sycl/repeat_back.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
+#include "ggml-sycl/mmq_xmx_int8.hpp"
 #include "ggml.h"
 
 static bool g_sycl_loaded = false;
@@ -2944,8 +2945,16 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                         scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
                                                              /*num_src=*/2, " : converting src1 to Q8_1");
                         try {
-                            quantize_row_q8_1_sycl<quantize_q8_1>(src1_ddf_i, src1_ddq_i, ne10, src1_ncols,
-                                                                  src1_padded_col_size, stream);
+                            bool use_xmx = has_int8_xmx_support(stream) && src1_ncols > 1 && 
+                                          (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_K);
+                            
+                            if (use_xmx) {
+                                quantize_row_q8_1_sycl<quantize_q8_1_soa>(src1_ddf_i, src1_ddq_i, ne10, src1_ncols,
+                                                                      src1_padded_col_size, stream);
+                            } else {
+                                quantize_row_q8_1_sycl<quantize_q8_1>(src1_ddf_i, src1_ddq_i, ne10, src1_ncols,
+                                                                      src1_padded_col_size, stream);
+                            }
                         } catch (const sycl::exception & exc) {
                             std::cerr << "Quantize_row_q8_1_sycl error" << exc.what()
                                       << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
@@ -3423,9 +3432,13 @@ enum class mul_mat_algo {
 };
 
 inline bool ggml_sycl_supports_mmq(enum ggml_type type) {
-    // TODO: accuracy issues in MMQ
-    GGML_UNUSED(type);
-    return false;
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+            return true;
+        default:
+            return false;
+    }
 }
 
 inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
@@ -3770,7 +3783,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
         ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
         if (extra && extra->optimized_feature.reorder) {
-            ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
+            ggml_sycl_op_mul_mat<quantize_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         } else {
             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         }
