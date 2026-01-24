@@ -34,6 +34,8 @@ __dpct_inline__ static void quantize_q8_1_impl(const float * __restrict__ x,
     }
 
     d = amax == 0 ? 0 : d;
+    // Clamp sum to avoid infinity in half
+    sum = sycl::fmax(-65504.0f, sycl::fmin(65504.0f, sum));
 }
 
 template <int ElementsPerWI> struct no_quantize_q8_1 {
