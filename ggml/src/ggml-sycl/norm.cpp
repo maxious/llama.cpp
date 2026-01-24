@@ -378,8 +378,7 @@ static void norm_f32_sycl(const float * x, float * dst, const int ncols, const i
         const float eps, queue_ptr stream, int device) {
 
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
-    GGML_ASSERT(ncols % WARP_SIZE == 0);
-    
+
     // Use SLM-cached kernel for rows that fit in shared local memory (up to 4096 floats = 16KB)
     // This avoids re-reading input data from global memory
     constexpr int SLM_CACHE_THRESHOLD = 4096;
