@@ -2908,8 +2908,6 @@ void ggml_sycl_op_mul_mat_q(
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream) try {
 
-    GGML_LOG_INFO("%s: entry src0->type=%d src1_ncols=%ld\n", __func__, (int)src0->type, (long)src1_ncols);
-
     const int64_t ne00 = src0->ne[0];
 
     const int64_t ne10 = src1->ne[0];
@@ -2918,8 +2916,6 @@ void ggml_sycl_op_mul_mat_q(
     const int64_t ne0 = dst->ne[0];
 
     const int64_t row_diff = row_high - row_low;
-    
-    fprintf(stderr, "DEBUG: %s: type=%d ncols=%ld support=%d\n", __func__, (int)src0->type, (long)src1_ncols, (int)has_int8_xmx_support(stream));
 
     int device_id;
     SYCL_CHECK(
