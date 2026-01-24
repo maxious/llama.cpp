@@ -185,32 +185,29 @@ static void mmq_q4_K_xmx_kernel(
                 const block_q4_K * block = &vx[row * K_blocks + k_tile * (TK / QK_K)];
 
                 const sycl::half2 dm = block->dm;
-                float d = (float)dm[0];
+                float dall = (float)dm[0];
                 float dmin = (float)dm[1];
 
                 const uint8_t * scales = block->scales;
-                int sub_block_idx = lane_id / 4;
 
-                int scale_val = 0;
-                int min_val = 0;
+                uint8_t sc, m;
+                int j = lane_id;
 
-                if (sub_block_idx < 8) {
-                    int scale_idx = sub_block_idx / 2;
-                    int scale_shift = (sub_block_idx % 2) * 4;
-                    scale_val = (scales[scale_idx] >> scale_shift) & 0x0F;
-
-                    int min_idx = 4 + sub_block_idx / 2;
-                    int min_shift = (sub_block_idx % 2) * 4;
-                    min_val = (scales[min_idx] >> min_shift) & 0x0F;
+                if (j < 4) {
+                    sc = scales[j] & 63;
+                    m = scales[j + 4] & 63;
+                } else {
+                    sc = (scales[j+4] & 0xF) | ((scales[j-4] >> 6) << 4);
+                    m = (scales[j+4] >>  4) | ((scales[j-0] >> 6) << 4);
                 }
 
-                float scale = (float)scale_val;
-                float min = (float)min_val;
+                float d = dall * (float)sc;
+                float m_val = dmin * (float)m;
 
                 float scale_b = (float)ds_ptr[(sg_starty + lane_id) * K_blocks + k_tile * (TK / QK_K)][0];
 
                 int32_t val = slm_tile[i * TN + lane_id];
-                acc[i] += d * scale * (float)val * scale_b - dmin * min * scale_b;
+                acc[i] += d * (float)val * scale_b - m_val * scale_b;
             }
         }
         sycl::group_barrier(item_ct1.get_group());
