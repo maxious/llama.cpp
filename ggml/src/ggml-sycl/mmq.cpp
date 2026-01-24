@@ -849,15 +849,17 @@ load_tiles_q4_K(const void *__restrict__ vx, int *__restrict__ x_ql,
 
         const int * scales = (const int *) bxi->scales;
 
-        const int ksc_orig = k % (QK_WARP_SIZE/8);
-        for (int l = 0; l < 2; ++l) {
-            const int ksc = ksc_orig + l * (QK_WARP_SIZE/8);
-            // scale arrangement after the following two lines: sc0,...,sc3, sc4,...,sc7, m0,...,m3, m4,...,m8
-            int scales8 = (scales[(ksc%2) + (ksc!=0)] >> (4 * (ksc & (ksc/2)))) & 0x0F0F0F0F; // lower 4 bits
-            scales8    |= (scales[ksc/2]              >> (2 * (ksc % 2)))       & 0x30303030; // upper 2 bits
+        const int ksc = k % (QK_WARP_SIZE/8);
+        // scale arrangement after the following two lines:
+        //   - ksc == 0: sc0, sc1, sc2, sc3
+        //   - ksc == 1: sc4, sc5, sc6, sc7
+        //   - ksc == 2:  m0,  m1,  m2,  m3
+        //   - ksc == 3:  m4,  m5,  m6,  m7
+        int scales8 = (scales[(ksc%2) + (ksc!=0)] >> (4 * (ksc & (ksc/2)))) & 0x0F0F0F0F; // lower 4 bits
+        scales8    |= (scales[ksc/2]              >> (2 * (ksc % 2)))       & 0x30303030; // upper 2 bits
 
-            x_sc[i * 4 + ksc] = scales8;
-        }
+        // Use same indexing as CUDA: i*(QK_WARP_SIZE/8) + i/8 + ksc
+        x_sc[i * (QK_WARP_SIZE/8) + i/8 + ksc] = scales8;
     }
 }
 
@@ -904,7 +906,8 @@ static __dpct_inline__ float vec_dot_q4_K_q8_1_mul_mat(
     const int &i, const int &j, const int &k) {
     (void)x_qh;
 
-    const uint8_t * sc = ((const uint8_t *) &x_sc[i * 4]) + 2*((k % 32) / 8);
+    // Match CUDA indexing: i*(QK_WARP_SIZE/8) + i/8 + k/32, with byte offset for k position
+    const uint8_t * sc = ((const uint8_t *) &x_sc[i * (QK_WARP_SIZE/8) + i/8 + k/32]) + 2*((k % 32) / 8);
 
     const int index_y = j * QK_WARP_SIZE + (QR4_K*k) % QK_WARP_SIZE;
     return vec_dot_q4_K_q8_1_impl_mmq(&x_ql[i * (QK_WARP_SIZE + 1) + k], &y_qs[index_y], sc, sc+8,
