@@ -186,6 +186,7 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     dpct::queue_ptr stream = ctx.stream();
 
     const int64_t N = Q->ne[1];
+    const int64_t N_kv = K->ne[1];  // Key/Value sequence length (can differ from N)
     const int64_t n_heads = Q->ne[2];
     const int64_t n_kv_heads = K->ne[2];
     const int64_t gqa_ratio = n_heads / n_kv_heads;  // GQA ratio
@@ -203,8 +204,8 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
 
         // Allocate F32 buffers on device
         float * Q_d_f32_alloc = (float *) sycl::malloc_device(N * DQK * n_heads * sizeof(float), *stream);
-        float * K_d_f32_alloc = (float *) sycl::malloc_device(N * DQK * n_kv_heads * sizeof(float), *stream);
-        float * V_d_f32_alloc = (float *) sycl::malloc_device(N * DV * n_kv_heads * sizeof(float), *stream);
+        float * K_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DQK * n_kv_heads * sizeof(float), *stream);
+        float * V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
 
         // Get strides in elements for FP16
         const ptrdiff_t q_row_stride_f16 = Q->nb[1] / (ptrdiff_t)sizeof(sycl::half);
@@ -236,14 +237,14 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
 
         // Dequantize K heads
         for (int64_t head = 0; head < n_kv_heads; ++head) {
-            const int64_t n_elements = N * DQK;
+            const int64_t n_elements = N_kv * DQK;
             stream->submit([&](sycl::handler& cgh) {
                 cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
                     const int idx = it.get_id(0);
                     if (idx < n_elements) {
                         const int64_t row = idx / DQK;
                         const int64_t col = idx % DQK;
-                        K_d_f32_alloc[head * N * DQK + idx] = static_cast<float>(
+                        K_d_f32_alloc[head * N_kv * DQK + idx] = static_cast<float>(
                             K_d[head * k_head_stride_f16 + row * k_row_stride_f16 + col]);
                     }
                 });
@@ -252,14 +253,14 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
 
         // Dequantize V heads
         for (int64_t head = 0; head < n_kv_heads; ++head) {
-            const int64_t n_elements = N * DV;
+            const int64_t n_elements = N_kv * DV;
             stream->submit([&](sycl::handler& cgh) {
                 cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
                     const int idx = it.get_id(0);
                     if (idx < n_elements) {
                         const int64_t row = idx / DV;
                         const int64_t col = idx % DV;
-                        V_d_f32_alloc[head * N * DV + idx] = static_cast<float>(
+                        V_d_f32_alloc[head * N_kv * DV + idx] = static_cast<float>(
                             V_d[head * v_head_stride_f16 + row * v_row_stride_f16 + col]);
                     }
                 });
@@ -285,7 +286,7 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     const int Bc = FATTN_BLOCK_C;
 
     const int Tr = (N + Br - 1) / Br;
-    const int Tc = (N + Bc - 1) / Bc;
+    const int Tc = (N_kv + Bc - 1) / Bc;
 
     // Per-row statistics for online softmax (one per Q row)
     float * l_d = (float *) sycl::malloc_device(N * n_heads * sizeof(float), *stream);
@@ -325,14 +326,14 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
             int row0 = group_id_i * Br;
             int col0 = (group_id_j % Tc) * Bc;
 
-            if (row0 >= (int) N || col0 >= (int) N) {
+            if (row0 >= (int) N || col0 >= (int) N_kv) {
                 return;
             }
 
             // Calculate base pointers for this head
             const float* Q_block = Q_d_f32 + (ptrdiff_t)(head_idx * N + row0) * q_row_stride;
-            const float* K_block = K_d_f32 + (ptrdiff_t)(kv_head_idx * N + col0) * k_row_stride;
-            const float* V_block = V_d_f32 + (ptrdiff_t)(kv_head_idx * N + col0) * v_row_stride;
+            const float* K_block = K_d_f32 + (ptrdiff_t)(kv_head_idx * N_kv + col0) * k_row_stride;
+            const float* V_block = V_d_f32 + (ptrdiff_t)(kv_head_idx * N_kv + col0) * v_row_stride;
             float*       O_block = dst_d + (ptrdiff_t)(head_idx * N + row0) * o_row_stride;
 
             // Row statistics offsets
