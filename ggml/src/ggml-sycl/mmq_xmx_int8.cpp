@@ -107,7 +107,7 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(
             }
             break;
 
-        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q4_0:
             if (TM == 8 && TN == 16 && TK == 32) {
                 stream->submit([&](handler& cgh) {
                     sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16), cgh);
@@ -115,8 +115,88 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(
                         nd_range<2>({static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size)},
                                     {static_cast<size_t>(1), static_cast<size_t>(sg_size)}),
                         [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
-                            mmq_q4_K_xmx_kernel<8, 16, 32>(
-                                (const block_q4_K*)src0_dd_i,
+                            mmq_q4_0_xmx_kernel<8, 16, 32>(
+                                (const block_q4_0*)src0_dd_i,
+                                (const block_q8_1*)src1_ddq_i,
+                                dst_dd_i,
+                                K, M, N,
+                                item_ct1,
+                                slm_tile.get_multi_ptr<access::decorated::no>().get());
+                        });
+                });
+            }
+            break;
+
+        case GGML_TYPE_Q4_1:
+            if (TM == 8 && TN == 16 && TK == 32) {
+                stream->submit([&](handler& cgh) {
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16), cgh);
+                    cgh.parallel_for(
+                        nd_range<2>({static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size)},
+                                    {static_cast<size_t>(1), static_cast<size_t>(sg_size)}),
+                        [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
+                            mmq_q4_1_xmx_kernel<8, 16, 32>(
+                                (const block_q4_1*)src0_dd_i,
+                                (const block_q8_1*)src1_ddq_i,
+                                dst_dd_i,
+                                K, M, N,
+                                item_ct1,
+                                slm_tile.get_multi_ptr<access::decorated::no>().get());
+                        });
+                });
+            }
+            break;
+
+        case GGML_TYPE_Q5_0:
+            if (TM == 8 && TN == 16 && TK == 32) {
+                stream->submit([&](handler& cgh) {
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16), cgh);
+                    cgh.parallel_for(
+                        nd_range<2>({static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size)},
+                                    {static_cast<size_t>(1), static_cast<size_t>(sg_size)}),
+                        [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
+                            mmq_q5_0_xmx_kernel<8, 16, 32>(
+                                (const block_q5_0*)src0_dd_i,
+                                (const block_q8_1*)src1_ddq_i,
+                                dst_dd_i,
+                                K, M, N,
+                                item_ct1,
+                                slm_tile.get_multi_ptr<access::decorated::no>().get());
+                        });
+                });
+            }
+            break;
+
+        case GGML_TYPE_Q5_1:
+            if (TM == 8 && TN == 16 && TK == 32) {
+                stream->submit([&](handler& cgh) {
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16), cgh);
+                    cgh.parallel_for(
+                        nd_range<2>({static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size)},
+                                    {static_cast<size_t>(1), static_cast<size_t>(sg_size)}),
+                        [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
+                            mmq_q5_1_xmx_kernel<8, 16, 32>(
+                                (const block_q5_1*)src0_dd_i,
+                                (const block_q8_1*)src1_ddq_i,
+                                dst_dd_i,
+                                K, M, N,
+                                item_ct1,
+                                slm_tile.get_multi_ptr<access::decorated::no>().get());
+                        });
+                });
+            }
+            break;
+
+        case GGML_TYPE_Q8_1:
+            if (TM == 8 && TN == 16 && TK == 32) {
+                stream->submit([&](handler& cgh) {
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16), cgh);
+                    cgh.parallel_for(
+                        nd_range<2>({static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size)},
+                                    {static_cast<size_t>(1), static_cast<size_t>(sg_size)}),
+                        [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
+                            mmq_q8_1_xmx_kernel<8, 16, 32>(
+                                (const block_q8_1*)src0_dd_i,
                                 (const block_q8_1*)src1_ddq_i,
                                 dst_dd_i,
                                 K, M, N,
