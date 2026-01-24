@@ -126,14 +126,10 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
         return false;
     }
 
-    // Causal masking support: check if mask is present but not custom
-    // For custom masks, we still need to check if we support the specific type
     if (mask != nullptr && mask->type != GGML_TYPE_F32 && mask->type != GGML_TYPE_F16) {
         return false;
     }
     
-    // Support F32 or FP16 inputs (FP16 will be dequantized to F32)
-    // Also support mixed types: Q can be F32 while K/V are F16 (common pattern)
     const bool is_all_f32 = (Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F32 && V->type == GGML_TYPE_F32);
     const bool is_all_f16 = (Q->type == GGML_TYPE_F16 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
     const bool is_mixed_f32_q = (Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
@@ -141,54 +137,33 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
         return false;
     }
 
-    // Log non-contiguous tensor info (debug only)
-    static bool warned_non_contiguous = false;
-    if (!warned_non_contiguous && (!ggml_is_contiguous(Q) || !ggml_is_contiguous(K) || !ggml_is_contiguous(V))) {
-        fprintf(stderr, "ggml_sycl: FA tensors not strictly contiguous (padded):\n");
-        fprintf(stderr, "  Q: ne=[%ld,%ld,%ld,%ld] nb=[%ld,%ld,%ld,%ld] cont=%d\n",
-                Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3], Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3], ggml_is_contiguous(Q));
-        fprintf(stderr, "  K: ne=[%ld,%ld,%ld,%ld] nb=[%ld,%ld,%ld,%ld] cont=%d\n",
-                K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[0], K->nb[1], K->nb[2], K->nb[3], ggml_is_contiguous(K));
-        fprintf(stderr, "  V: ne=[%ld,%ld,%ld,%ld] nb=[%ld,%ld,%ld,%ld] cont=%d\n",
-                V->ne[0], V->ne[1], V->ne[2], V->ne[3], V->nb[0], V->nb[1], V->nb[2], V->nb[3], ggml_is_contiguous(V));
-        warned_non_contiguous = true;
-    }
-    
-    // Require contiguously allocated tensors (allows padding, rejects permuted views)
-    // Matches CUDA backend behavior - see ggml/src/ggml-cuda/fattn-common.cuh
-    if (!ggml_is_contiguously_allocated(Q) || !ggml_is_contiguously_allocated(K) || !ggml_is_contiguously_allocated(V)) {
+    const size_t q_elem_size = ggml_type_size(Q->type);
+    const size_t k_elem_size = ggml_type_size(K->type);
+    const size_t v_elem_size = ggml_type_size(V->type);
+    if (Q->nb[0] != q_elem_size || K->nb[0] != k_elem_size || V->nb[0] != v_elem_size) {
         return false;
     }
 
     int64_t DQK = Q->ne[0];
     int64_t DV  = V->ne[0];
 
-    // GLM-4.7-Flash has different K and V head sizes (K=576, V=512)
-    // The oneMKL path supports different DQK and DV via separate template params
-    // XMX path currently requires DQK == DV, so we'll use oneMKL for mismatched sizes
     if (!is_head_size_supported(DQK) || !is_head_size_supported(DV)) {
         return false;
     }
 
-    // GQA support: n_kv_heads can be less than n_heads
     const int64_t n_heads = Q->ne[2];
     const int64_t n_kv_heads = K->ne[2];
 
-    // n_heads must be divisible by n_kv_heads for GQA/MQA
     if (n_heads % n_kv_heads != 0) {
         return false;
     }
 
-    // GQA ratio (number of Q heads per K/V head)
     const int gqa_ratio = n_heads / n_kv_heads;
 
-    // Support high GQA ratios like GLM-4.7-Flash (ratio=20) 
-    // CUDA uses gqa_ratio % 4 == 0 optimization, we require divisibility by 4 for high ratios
     if (gqa_ratio > 8 && gqa_ratio % 4 != 0) {
         return false;
     }
     
-    // Cap at reasonable maximum (GLM-4.7 has ratio=20)
     if (gqa_ratio > 32) {
         return false;
     }
