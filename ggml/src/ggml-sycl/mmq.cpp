@@ -2939,13 +2939,23 @@ void ggml_sycl_op_mul_mat_q(
             ggml_mul_mat_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
 
+        case GGML_TYPE_Q4_0:
+            // Q4_0 XMX kernel produces NaN - use standard dp4a path until fixed
+            ggml_mul_mat_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
+            break;
+
         case GGML_TYPE_Q4_1:
+            // Q4_1 XMX kernel produces NaN - use standard dp4a path until fixed
             ggml_mul_mat_q4_1_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
+
         case GGML_TYPE_Q5_0:
+            // Q5_0 XMX kernel produces NaN - use standard dp4a path until fixed
             ggml_mul_mat_q5_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
+
         case GGML_TYPE_Q5_1:
+            // Q5_1 XMX kernel produces NaN - use standard dp4a path until fixed
             ggml_mul_mat_q5_1_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
         case GGML_TYPE_Q2_K:
@@ -2980,16 +2990,18 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-// Note: XMX (cooperative matrix) acceleration for quantized matmul was evaluated but
-// the dp4a (int8 dot product) path is generally more efficient because:
-// 1. XMX requires dequantizing to bf16/fp16 which adds overhead
-// 2. For decode (batch=1), XMX tiles can't be filled efficiently
-// 3. K-quants have complex per-block scale/min that doesn't map well to GEMM
+// Note: XMX (Intel Xe Matrix Extensions) acceleration for quantized matmul is DISABLED
+// due to NaN production with batch>1. The dp4a (int8 dot product) path is used instead.
 //
-// XMX is used successfully in flash attention where inputs are already fp16/fp32.
-// For quantized weights, the dp4a path with per-block scaling remains optimal.
+// XMX was evaluated but disabled because:
+// 1. XMX kernels produce NaN values with batch size > 1
+// 2. The VNNI packing fix (commit 72c4495cf) did not resolve the issue
+// 3. dp4a path is stable and produces correct results
 //
-// Future consideration: XMX could help for very large prompt batches (ncols_y >= 64)
-// with simple quants (Q4_0/Q4_1) if dequantization is done efficiently in shared memory.
+// K-quants (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K) use dp4a path due to:
+// - Complex per-block scale/min handling that doesn't map well to XMX
+// - dp4a with per-block scaling is more efficient for these formats
+//
+// XMX is still used successfully in flash attention where inputs are already fp16/fp32.
 
 
