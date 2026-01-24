@@ -242,12 +242,13 @@ inline bool ggml_sycl_fattn_debug() {
 // Intel XMX Flash Attention using cooperative matrices
 // Uses xmx_bfloat16 for XMX A/B matrices and float for accumulators
 // Type conversion happens at shared memory boundaries
-// 
+//
 // Template parameters:
-// - HEAD_DIM: head dimension (32, 64, 96, 128, 256)
+// - HEAD_DIM: head dimension for Q/K (32, 64, 96, 128, 256, 576)
+// - V_HEAD_DIM: head dimension for V/O (can differ from HEAD_DIM for models like GLM)
 // - TM, TN, TK: joint matrix tile sizes (8x8x16 for DG2/Arc, 16x16x16 for PVC)
 // - DEBUG: enable debug output
-template <int64_t HEAD_DIM, int TM = 8, int TN = 8, int TK = 16, bool DEBUG = false>
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, int TM = 8, int TN = 8, int TK = 16, bool DEBUG = false>
 inline void flash_attn_coopmat_kernel(
     sycl::nd_item<2> it,
     const float * Q,
@@ -277,8 +278,8 @@ inline void flash_attn_coopmat_kernel(
 
     constexpr int Q_STRIDE = HEAD_DIM + 8;  // Padding for bank conflict avoidance
     constexpr int K_STRIDE = HEAD_DIM + 8;
-    constexpr int V_STRIDE = HEAD_DIM + 8;
-    // V is stored col-major in shVT as [BLOCK_N rows, HEAD_DIM cols] for P@V
+    constexpr int V_STRIDE = V_HEAD_DIM + 8;  // V uses V_HEAD_DIM, not HEAD_DIM
+    // V is stored col-major in shVT as [BLOCK_N rows, V_HEAD_DIM cols] for P@V
     // For col-major, stride (leading dimension) must be >= number of rows = BLOCK_N
     constexpr int V_T_STRIDE = BLOCK_N + 8;  // Must be >= BLOCK_N for col-major storage
     constexpr int S_STRIDE = BLOCK_N + 8;
@@ -287,18 +288,19 @@ inline void flash_attn_coopmat_kernel(
     // Ensure BLOCK_N is divisible by TK for P@V computation
     static_assert(BLOCK_N % TK == 0, "BLOCK_N must be divisible by TK for P@V matmul");
     static_assert(HEAD_DIM % TN == 0, "HEAD_DIM must be divisible by TN for output tiles");
+    static_assert(V_HEAD_DIM % TN == 0, "V_HEAD_DIM must be divisible by TN for output tiles");
 
     // Shared memory layout (all sizes in floats/bf16 as noted):
     // [bf16: Q (BLOCK_M * Q_STRIDE)]
     // [bf16: K (BLOCK_N * K_STRIDE)]
     // [bf16: V (BLOCK_N * V_STRIDE)]
     // [bf16: P (BLOCK_M * P_STRIDE)] - for storing bf16 attention probs
-    // [bf16: VT (HEAD_DIM * BLOCK_N)] - V^T buffer (separate from K to avoid corruption)
+    // [bf16: VT (V_HEAD_DIM * BLOCK_N)] - V^T buffer (separate from K to avoid corruption)
     // [float: S (BLOCK_M * S_STRIDE)] - attention scores
     // [float: rowMax (BLOCK_M)]
     // [float: rowSum (BLOCK_M)]
     // [float: rowAlpha (BLOCK_M)]
-    // [float: shAcc (BLOCK_M * HEAD_DIM)] - output accumulator
+    // [float: shAcc (BLOCK_M * V_HEAD_DIM)] - output accumulator
 
     (void)l_d; // suppress unused parameter warning
     (void)m_d; // suppress unused parameter warning
@@ -323,9 +325,9 @@ inline void flash_attn_coopmat_kernel(
     const int kv_head_idx = head_idx / gqa_ratio;
 
     const ptrdiff_t q_offset = (ptrdiff_t)(head_idx * N + row0) * HEAD_DIM;
-    const ptrdiff_t k_offset = (ptrdiff_t)(kv_head_idx * N_kv) * HEAD_DIM;  // K uses N_kv
-    const ptrdiff_t v_offset = (ptrdiff_t)(kv_head_idx * N_kv) * HEAD_DIM;  // V uses N_kv
-    const ptrdiff_t o_offset = (ptrdiff_t)(head_idx * N + row0) * HEAD_DIM;
+    const ptrdiff_t k_offset = (ptrdiff_t)(kv_head_idx * N_kv) * HEAD_DIM;  // K uses N_kv and HEAD_DIM
+    const ptrdiff_t v_offset = (ptrdiff_t)(kv_head_idx * N_kv) * V_HEAD_DIM;  // V uses N_kv and V_HEAD_DIM
+    const ptrdiff_t o_offset = (ptrdiff_t)(head_idx * N + row0) * V_HEAD_DIM;  // O uses V_HEAD_DIM
 
     // Bfloat16 shared memory for XMX tiles
     xmx_bfloat16 * shQ = reinterpret_cast<xmx_bfloat16*>(shmem);
@@ -335,18 +337,18 @@ inline void flash_attn_coopmat_kernel(
     xmx_bfloat16 * shVT = shP + BLOCK_M * P_STRIDE;  // V^T buffer (separate from K)
 
     // Float shared memory for softmax scores and output accumulator
-    float * shS = reinterpret_cast<float*>(shVT + HEAD_DIM * V_T_STRIDE);
+    float * shS = reinterpret_cast<float*>(shVT + V_HEAD_DIM * V_T_STRIDE);
     float * rowMax = shS + BLOCK_M * S_STRIDE;
     float * rowSum = rowMax + BLOCK_M;
     float * rowAlpha = rowSum + BLOCK_M;
-    float * shAcc = rowAlpha + BLOCK_M;  // Output accumulator [BLOCK_M x HEAD_DIM]
+    float * shAcc = rowAlpha + BLOCK_M;  // Output accumulator [BLOCK_M x V_HEAD_DIM]
 
     // Initialize per-row stats and output accumulator
     if (lid < BLOCK_M) {
         rowMax[lid] = -1.0e20f;
         rowSum[lid] = 0.0f;
     }
-    for (int i = lid; i < BLOCK_M * HEAD_DIM; i += THREADS) {
+    for (int i = lid; i < BLOCK_M * V_HEAD_DIM; i += THREADS) {
         shAcc[i] = 0.0f;
     }
 
@@ -382,18 +384,31 @@ inline void flash_attn_coopmat_kernel(
             const int k_row = col0 + r;
 
             xmx_bfloat16 k_val = xmx_bfloat16(0.0f);
-            xmx_bfloat16 v_val = xmx_bfloat16(0.0f);
 
             if (k_row < N_kv) {  // Use N_kv for K/V bounds
                 const ptrdiff_t base = (ptrdiff_t)k_row * HEAD_DIM;
                 k_val = xmx_bfloat16(K[k_offset + base + c]);
-                v_val = xmx_bfloat16(V[v_offset + base + c]);
             }
 
             // Store K as K^T col-major: K^T[head_dim, kv_col] at shK[head_dim + kv_col * K_STRIDE]
             // K^T[c, r] = K[r, c] = K[kv, head_dim]
             shK[c + r * K_STRIDE] = k_val;
-            // Store V row-major as before
+        }
+
+        // Load V tiles separately with V_HEAD_DIM
+        for (int i = lid; i < BLOCK_N * V_HEAD_DIM; i += THREADS) {
+            const int r = i / V_HEAD_DIM;  // r = kv row index within block (0..BLOCK_N-1)
+            const int c = i % V_HEAD_DIM;  // c = head dim index (0..V_HEAD_DIM-1)
+            const int k_row = col0 + r;
+
+            xmx_bfloat16 v_val = xmx_bfloat16(0.0f);
+
+            if (k_row < N_kv) {  // Use N_kv for K/V bounds
+                const ptrdiff_t base = (ptrdiff_t)k_row * V_HEAD_DIM;
+                v_val = xmx_bfloat16(V[v_offset + base + c]);
+            }
+
+            // Store V row-major
             shV[r * V_STRIDE + c] = v_val;
         }
 
@@ -435,15 +450,15 @@ inline void flash_attn_coopmat_kernel(
         it.barrier(sycl::access::fence_space::local_space);
 
         // ============ Transpose V for P@V computation ============
-        // V is currently stored as [BLOCK_N x HEAD_DIM] row-major in shV
+        // V is currently stored as [BLOCK_N x V_HEAD_DIM] row-major in shV
         // We store V directly (not transposed) in shVT for P@V: V[kv, head_dim]
         // shVT is indexed as: V[kv_row, head_col] at shVT[kv_row + head_col * V_T_STRIDE]
-        // This is col-major storage with V_T_STRIDE >= BLOCK_N (but we use V_T_STRIDE = HEAD_DIM+8)
-        // Actually for the P@V matmul, B needs to be [BLOCK_N rows, HEAD_DIM cols]
+        // This is col-major storage with V_T_STRIDE >= BLOCK_N (but we use V_T_STRIDE = V_HEAD_DIM+8)
+        // Actually for the P@V matmul, B needs to be [BLOCK_N rows, V_HEAD_DIM cols]
         // Stored col-major with stride V_T_STRIDE
-        for (int i = lid; i < BLOCK_N * HEAD_DIM; i += THREADS) {
-            const int row = i / HEAD_DIM;  // kv position 0 to BLOCK_N-1
-            const int col = i % HEAD_DIM;  // head_dim 0 to HEAD_DIM-1
+        for (int i = lid; i < BLOCK_N * V_HEAD_DIM; i += THREADS) {
+            const int row = i / V_HEAD_DIM;  // kv position 0 to BLOCK_N-1
+            const int col = i % V_HEAD_DIM;  // head_dim 0 to V_HEAD_DIM-1
             // Store V[row, col] in col-major format: V[row, col] at shVT[row + col * V_T_STRIDE]
             shVT[row + col * V_T_STRIDE] = shV[row * V_STRIDE + col];
         }
@@ -494,8 +509,8 @@ inline void flash_attn_coopmat_kernel(
         it.barrier(sycl::access::fence_space::local_space);
 
         // ============ Scale previous output by alpha ============
-        for (int i = lid; i < BLOCK_M * HEAD_DIM; i += THREADS) {
-            const int row = i / HEAD_DIM;
+        for (int i = lid; i < BLOCK_M * V_HEAD_DIM; i += THREADS) {
+            const int row = i / V_HEAD_DIM;
             shAcc[i] *= rowAlpha[row];
         }
 
@@ -510,12 +525,12 @@ inline void flash_attn_coopmat_kernel(
 
         // ============ P @ V computation ============
         // For DG2/Arc: use::a requires TM x TK (8x16), use::b requires TK x TN (16x8)
-        // P is [BLOCK_M x BLOCK_N], V is [BLOCK_N x HEAD_DIM]
-        // Output is [BLOCK_M x HEAD_DIM], computed as tiles of [TM x TN]
+        // P is [BLOCK_M x BLOCK_N], V is [BLOCK_N x V_HEAD_DIM]
+        // Output is [BLOCK_M x V_HEAD_DIM], computed as tiles of [TM x TN]
         // Inner loop iterates over BLOCK_N in chunks of TK (16)
         //
-        // Each subgroup computes TM rows of output, for each HEAD_DIM/TN output tiles
-        constexpr int NUM_OUT_TILES = HEAD_DIM / TN;
+        // Each subgroup computes TM rows of output, for each V_HEAD_DIM/TN output tiles
+        constexpr int NUM_OUT_TILES = V_HEAD_DIM / TN;
         
         for (int out_tile = 0; out_tile < NUM_OUT_TILES; ++out_tile) {
             joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN, layout::dynamic> matPV;
@@ -530,7 +545,7 @@ inline void flash_attn_coopmat_kernel(
                     sycl::access::decorated::yes>(&shP[(sg_id * TM) * P_STRIDE + k]);
                 joint_matrix_load(sg, mp, shP_ptr, P_STRIDE);
 
-                // V tile: TK x TN from shVT (col-major, V[BLOCK_N rows, HEAD_DIM cols])
+                // V tile: TK x TN from shVT (col-major, V[BLOCK_N rows, V_HEAD_DIM cols])
                 // V[k:k+TK, out_tile*TN:out_tile*TN+TN] at shVT[k + out_tile*TN * V_T_STRIDE]
                 joint_matrix<sycl::sub_group, xmx_bfloat16, use::b, TK, TN, layout::col_major> mv;
                 auto shV_ptr = sycl::address_space_cast<
@@ -559,8 +574,8 @@ inline void flash_attn_coopmat_kernel(
                 const int local_col = idx % TN;
                 const int global_row = sg_id * TM + local_row;
                 const int global_col = out_tile * TN + local_col;
-                if (global_row < BLOCK_M && global_col < HEAD_DIM) {
-                    shAcc[global_row * HEAD_DIM + global_col] += shS[scratch_offset + idx];
+                if (global_row < BLOCK_M && global_col < V_HEAD_DIM) {
+                    shAcc[global_row * V_HEAD_DIM + global_col] += shS[scratch_offset + idx];
                 }
             }
 
@@ -570,32 +585,32 @@ inline void flash_attn_coopmat_kernel(
 
     it.barrier(sycl::access::fence_space::local_space);
 
-    // ============ Final normalize and store ============
-    for (int i = lid; i < BLOCK_M * HEAD_DIM; i += THREADS) {
-        const int row = i / HEAD_DIM;
-        const int col = i % HEAD_DIM;
+// ============ Final normalize and store ============
+    for (int i = lid; i < BLOCK_M * V_HEAD_DIM; i += THREADS) {
+        const int row = i / V_HEAD_DIM;
+        const int col = i % V_HEAD_DIM;
         const int q_row = row0 + row;
 
         if (q_row < N) {
             float s = rowSum[row];
             float acc = shAcc[i];
             float normalized = acc / (s > 1e-10f ? s : 1.0f);
-            
+
             // Debug output for first few elements
             if (DEBUG && gid_x == 0 && gid_y == 0 && q_row < 2 && col < 4) {
                 sycl::float2 acc_pair = sycl::float2(acc, normalized);
                 // Note: printf in SYCL kernels may not work on all platforms
                 // This is a placeholder for debugging
             }
-            
-            O[o_offset + (ptrdiff_t)row * HEAD_DIM + col] = normalized;
+
+            O[o_offset + (ptrdiff_t)row * V_HEAD_DIM + col] = normalized;
         }
     }
 }
 
 // Wrapper for Arc B60/Battlemage (8x16x16 tiles - msize=8, nsize=16, ksize=16)
 // Based on runtime query showing nsize=16 for bf16/fp16 on Arc B60
-template <int64_t HEAD_DIM>
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM>
 inline void flash_attn_coopmat_kernel_dg2(
     sycl::nd_item<2> it,
     const float * Q, const float * K, const float * V,
@@ -605,14 +620,14 @@ inline void flash_attn_coopmat_kernel_dg2(
     const float * mask, const int64_t mask_stride, float * shmem
 ) {
     // Arc B60 uses 8x16x16 tiles (TM=8, TN=16, TK=16)
-    flash_attn_coopmat_kernel<HEAD_DIM, 8, 16, 16>(
+    flash_attn_coopmat_kernel<HEAD_DIM, V_HEAD_DIM, 8, 16, 16>(
         it, Q, K, V, O, l_d, m_d, N, N_kv, n_heads, n_kv_heads,
         gqa_ratio, scale, mask, mask_stride, shmem
     );
 }
 
 // Wrapper for PVC (8x16x16 tiles - same as Arc B60)
-template <int64_t HEAD_DIM>
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM>
 inline void flash_attn_coopmat_kernel_pvc(
     sycl::nd_item<2> it,
     const float * Q, const float * K, const float * V,
@@ -622,7 +637,7 @@ inline void flash_attn_coopmat_kernel_pvc(
     const float * mask, const int64_t mask_stride, float * shmem
 ) {
     // PVC also uses 8x16x16 tiles
-    flash_attn_coopmat_kernel<HEAD_DIM, 8, 16, 16>(
+    flash_attn_coopmat_kernel<HEAD_DIM, V_HEAD_DIM, 8, 16, 16>(
         it, Q, K, V, O, l_d, m_d, N, N_kv, n_heads, n_kv_heads,
         gqa_ratio, scale, mask, mask_stride, shmem
     );
@@ -631,10 +646,12 @@ inline void flash_attn_coopmat_kernel_pvc(
 // Padded flash attention kernel for head sizes that don't evenly divide tile dimensions
 // Uses padding to the next supported size (e.g., 40 -> 64)
 // Template parameters:
-// - HEAD_DIM: actual head dimension (e.g., 40)
-// - PADDED_HEAD_DIM: padded head dimension for XMX (e.g., 64)
+// - HEAD_DIM: actual head dimension for Q/K (e.g., 40)
+// - V_HEAD_DIM: actual head dimension for V/O (e.g., 40, can differ from HEAD_DIM)
+// - PADDED_HEAD_DIM: padded head dimension for Q/K XMX (e.g., 64)
+// - PADDED_V_HEAD_DIM: padded head dimension for V/O XMX (e.g., 64, can differ from PADDED_HEAD_DIM)
 // - TM, TN, TK: joint matrix tile sizes
-template <int64_t HEAD_DIM, int64_t PADDED_HEAD_DIM, int TM = 8, int TN = 16, int TK = 16>
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, int64_t PADDED_HEAD_DIM, int64_t PADDED_V_HEAD_DIM, int TM = 8, int TN = 16, int TK = 16>
 inline void flash_attn_coopmat_kernel_padded(
     sycl::nd_item<2> it,
     const float * Q,
@@ -663,11 +680,11 @@ inline void flash_attn_coopmat_kernel_padded(
     // Number of subgroups covering the M dimension
     constexpr int NUM_SG_M = BLOCK_M / TM;
 
-    // Use PADDED_HEAD_DIM for all XMX computations
+    // Use PADDED_HEAD_DIM for Q/K XMX computations, PADDED_V_HEAD_DIM for V/O XMX computations
     constexpr int Q_STRIDE = PADDED_HEAD_DIM + 8;
     constexpr int K_STRIDE = PADDED_HEAD_DIM + 8;
-    constexpr int V_STRIDE = PADDED_HEAD_DIM + 8;
-    // V is stored col-major in shVT as [BLOCK_N rows, PADDED_HEAD_DIM cols] for P@V
+    constexpr int V_STRIDE = PADDED_V_HEAD_DIM + 8;
+    // V is stored col-major in shVT as [BLOCK_N rows, PADDED_V_HEAD_DIM cols] for P@V
     // For col-major, stride (leading dimension) must be >= number of rows = BLOCK_N
     constexpr int V_T_STRIDE = BLOCK_N + 8;  // Must be >= BLOCK_N for col-major storage
     constexpr int S_STRIDE = BLOCK_N + 8;
@@ -676,6 +693,7 @@ inline void flash_attn_coopmat_kernel_padded(
     // Ensure BLOCK_N is divisible by TK for P@V computation
     static_assert(BLOCK_N % TK == 0, "BLOCK_N must be divisible by TK for P@V matmul");
     static_assert(PADDED_HEAD_DIM % TN == 0, "PADDED_HEAD_DIM must be divisible by TN for output tiles");
+    static_assert(PADDED_V_HEAD_DIM % TN == 0, "PADDED_V_HEAD_DIM must be divisible by TN for output tiles");
 
     // Shared memory layout (sized for PADDED_HEAD_DIM)
     // shVT is [BLOCK_N rows x PADDED_HEAD_DIM cols] col-major, size = PADDED_HEAD_DIM * V_T_STRIDE
@@ -700,11 +718,12 @@ inline void flash_attn_coopmat_kernel_padded(
     const int head_idx = gid_y;
     const int kv_head_idx = head_idx / gqa_ratio;
 
-    // Use HEAD_DIM for actual data access, PADDED_HEAD_DIM for XMX operations
+    // Use HEAD_DIM for Q/K actual data access, V_HEAD_DIM for V/O actual data access
+    // Use PADDED_HEAD_DIM for Q/K XMX operations, PADDED_V_HEAD_DIM for V/O XMX operations
     const ptrdiff_t q_offset = (ptrdiff_t)(head_idx * N + row0) * HEAD_DIM;
-    const ptrdiff_t k_offset = (ptrdiff_t)(kv_head_idx * N_kv) * HEAD_DIM;  // K uses N_kv
-    const ptrdiff_t v_offset = (ptrdiff_t)(kv_head_idx * N_kv) * HEAD_DIM;  // V uses N_kv
-    const ptrdiff_t o_offset = (ptrdiff_t)(head_idx * N + row0) * HEAD_DIM;
+    const ptrdiff_t k_offset = (ptrdiff_t)(kv_head_idx * N_kv) * HEAD_DIM;  // K uses N_kv and HEAD_DIM
+    const ptrdiff_t v_offset = (ptrdiff_t)(kv_head_idx * N_kv) * V_HEAD_DIM;  // V uses N_kv and V_HEAD_DIM
+    const ptrdiff_t o_offset = (ptrdiff_t)(head_idx * N + row0) * V_HEAD_DIM;  // O uses V_HEAD_DIM
 
     // Bfloat16 shared memory for XMX tiles
     xmx_bfloat16 * shQ = reinterpret_cast<xmx_bfloat16*>(shmem);
@@ -714,19 +733,19 @@ inline void flash_attn_coopmat_kernel_padded(
     xmx_bfloat16 * shVT = shP + BLOCK_M * P_STRIDE;  // V^T buffer (separate from shK to avoid corruption)
 
     // Float shared memory for softmax scores and output accumulator
-    // shVT is [PADDED_HEAD_DIM x BLOCK_N] col-major, so advance by PADDED_HEAD_DIM * V_T_STRIDE
-    float * shS = reinterpret_cast<float*>(shVT + PADDED_HEAD_DIM * V_T_STRIDE);
+    // shVT is [PADDED_V_HEAD_DIM x BLOCK_N] col-major, so advance by PADDED_V_HEAD_DIM * V_T_STRIDE
+    float * shS = reinterpret_cast<float*>(shVT + PADDED_V_HEAD_DIM * V_T_STRIDE);
     float * rowMax = shS + BLOCK_M * S_STRIDE;
     float * rowSum = rowMax + BLOCK_M;
     float * rowAlpha = rowSum + BLOCK_M;
-    float * shAcc = rowAlpha + BLOCK_M;  // Sized for PADDED_HEAD_DIM
+    float * shAcc = rowAlpha + BLOCK_M;  // Sized for PADDED_V_HEAD_DIM
 
     // Initialize per-row stats and output accumulator
     if (lid < BLOCK_M) {
         rowMax[lid] = -1.0e20f;
         rowSum[lid] = 0.0f;
     }
-    for (int i = lid; i < BLOCK_M * PADDED_HEAD_DIM; i += THREADS) {
+    for (int i = lid; i < BLOCK_M * PADDED_V_HEAD_DIM; i += THREADS) {
         shAcc[i] = 0.0f;
     }
 
@@ -750,23 +769,37 @@ inline void flash_attn_coopmat_kernel_padded(
     for (int kv_block = 0; kv_block < num_kv_blocks; ++kv_block) {
         const int col0 = kv_block * BLOCK_N;
 
-        // Load K and V tiles with xmx_bfloat16 conversion and padding
+        // Load K tiles with xmx_bfloat16 conversion and padding
         for (int i = lid; i < BLOCK_N * PADDED_HEAD_DIM; i += THREADS) {
             const int r = i / PADDED_HEAD_DIM;
             const int c = i % PADDED_HEAD_DIM;
             const int k_row = col0 + r;
 
             xmx_bfloat16 k_val = xmx_bfloat16(0.0f);
-            xmx_bfloat16 v_val = xmx_bfloat16(0.0f);
 
             if (k_row < N_kv && c < HEAD_DIM) {  // Use N_kv for bounds check
                 const ptrdiff_t base = (ptrdiff_t)k_row * HEAD_DIM;
                 k_val = xmx_bfloat16(K[k_offset + base + c]);
-                v_val = xmx_bfloat16(V[v_offset + base + c]);
             }
 
             // Store K as K^T col-major: K^T[head_dim, kv_col] at shK[head_dim + kv_col * K_STRIDE]
             shK[c + r * K_STRIDE] = k_val;
+        }
+
+        // Load V tiles separately with V_HEAD_DIM and PADDED_V_HEAD_DIM
+        for (int i = lid; i < BLOCK_N * PADDED_V_HEAD_DIM; i += THREADS) {
+            const int r = i / PADDED_V_HEAD_DIM;
+            const int c = i % PADDED_V_HEAD_DIM;
+            const int k_row = col0 + r;
+
+            xmx_bfloat16 v_val = xmx_bfloat16(0.0f);
+
+            if (k_row < N_kv && c < V_HEAD_DIM) {  // Use N_kv for bounds check
+                const ptrdiff_t base = (ptrdiff_t)k_row * V_HEAD_DIM;
+                v_val = xmx_bfloat16(V[v_offset + base + c]);
+            }
+
+            // Store V row-major
             shV[r * V_STRIDE + c] = v_val;
         }
 
@@ -844,8 +877,8 @@ inline void flash_attn_coopmat_kernel_padded(
         // ============ Scale previous output by alpha (critical for online softmax correctness) ============
         // The online softmax scales previous probabilities by exp(m_old - m_new) = rowAlpha
         // The P@V accumulator must be scaled by the same factor to maintain correctness
-        for (int i = lid; i < BLOCK_M * PADDED_HEAD_DIM; i += THREADS) {
-            const int row = i / PADDED_HEAD_DIM;
+        for (int i = lid; i < BLOCK_M * PADDED_V_HEAD_DIM; i += THREADS) {
+            const int row = i / PADDED_V_HEAD_DIM;
             shAcc[i] *= rowAlpha[row];
         }
 
@@ -857,14 +890,14 @@ inline void flash_attn_coopmat_kernel_padded(
         }
 
         // ============ Copy V to shVT for P@V computation ============
-        // V is stored as [BLOCK_N x PADDED_HEAD_DIM] row-major in shV
-        // Store V col-major in shVT as [BLOCK_N rows, PADDED_HEAD_DIM cols]
+        // V is stored as [BLOCK_N x PADDED_V_HEAD_DIM] row-major in shV
+        // Store V col-major in shVT as [BLOCK_N rows, PADDED_V_HEAD_DIM cols]
         // V[row, col] stored at shVT[row + col * V_T_STRIDE]
-        for (int i = lid; i < BLOCK_N * PADDED_HEAD_DIM; i += THREADS) {
-            const int row = i / PADDED_HEAD_DIM;  // kv position
-            const int col = i % PADDED_HEAD_DIM;  // head dim
-            // Only copy actual HEAD_DIM data, padding elements are zero
-            if (col < HEAD_DIM) {
+        for (int i = lid; i < BLOCK_N * PADDED_V_HEAD_DIM; i += THREADS) {
+            const int row = i / PADDED_V_HEAD_DIM;  // kv position
+            const int col = i % PADDED_V_HEAD_DIM;  // head dim
+            // Only copy actual V_HEAD_DIM data, padding elements are zero
+            if (col < V_HEAD_DIM) {
                 shVT[row + col * V_T_STRIDE] = shV[row * V_STRIDE + col];
             } else {
                 shVT[row + col * V_T_STRIDE] = xmx_bfloat16(0.0f);  // Zero for padding
@@ -874,9 +907,9 @@ inline void flash_attn_coopmat_kernel_padded(
         it.barrier(sycl::access::fence_space::local_space);
 
         // ============ P @ V computation ============
-        // P is [BLOCK_M x BLOCK_N], V is [BLOCK_N x PADDED_HEAD_DIM]
-        // Output is [BLOCK_M x PADDED_HEAD_DIM], computed as tiles of [TM x TN]
-        constexpr int NUM_OUT_TILES = PADDED_HEAD_DIM / TN;
+        // P is [BLOCK_M x BLOCK_N], V is [BLOCK_N x PADDED_V_HEAD_DIM]
+        // Output is [BLOCK_M x PADDED_V_HEAD_DIM], computed as tiles of [TM x TN]
+        constexpr int NUM_OUT_TILES = PADDED_V_HEAD_DIM / TN;
         
         for (int out_tile = 0; out_tile < NUM_OUT_TILES; ++out_tile) {
             joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN, layout::dynamic> matPV;
@@ -891,7 +924,7 @@ inline void flash_attn_coopmat_kernel_padded(
                     sycl::access::decorated::yes>(&shP[(sg_id * TM) * P_STRIDE + k]);
                 joint_matrix_load(sg, mp, shP_ptr, P_STRIDE);
 
-                // V tile: TK x TN from shVT (col-major, V[BLOCK_N rows, PADDED_HEAD_DIM cols])
+                // V tile: TK x TN from shVT (col-major, V[BLOCK_N rows, PADDED_V_HEAD_DIM cols])
                 // V[k:k+TK, out_tile*TN:out_tile*TN+TN] at shVT[k + out_tile*TN * V_T_STRIDE]
                 joint_matrix<sycl::sub_group, xmx_bfloat16, use::b, TK, TN, layout::col_major> mv;
                 auto shV_ptr = sycl::address_space_cast<
@@ -918,8 +951,8 @@ inline void flash_attn_coopmat_kernel_padded(
                 const int local_col = idx % TN;
                 const int global_row = sg_id * TM + local_row;
                 const int global_col = out_tile * TN + local_col;
-                if (global_row < BLOCK_M && global_col < PADDED_HEAD_DIM) {
-                    shAcc[global_row * PADDED_HEAD_DIM + global_col] += shS[scratch_offset + idx];
+                if (global_row < BLOCK_M && global_col < PADDED_V_HEAD_DIM) {
+                    shAcc[global_row * PADDED_V_HEAD_DIM + global_col] += shS[scratch_offset + idx];
                 }
             }
 
@@ -930,16 +963,16 @@ inline void flash_attn_coopmat_kernel_padded(
     it.barrier(sycl::access::fence_space::local_space);
 
     // ============ Final normalize and store ============
-    // Only write actual HEAD_DIM elements, skip padding
-    for (int i = lid; i < BLOCK_M * HEAD_DIM; i += THREADS) {
-        const int row = i / HEAD_DIM;
-        const int col = i % HEAD_DIM;
+    // Only write actual V_HEAD_DIM elements, skip padding
+    for (int i = lid; i < BLOCK_M * V_HEAD_DIM; i += THREADS) {
+        const int row = i / V_HEAD_DIM;
+        const int col = i % V_HEAD_DIM;
         const int q_row = row0 + row;
 
         if (q_row < N) {
             float s = rowSum[row];
-            // shAcc is indexed with PADDED_HEAD_DIM stride
-            float acc_val = shAcc[row * PADDED_HEAD_DIM + col];
+            // shAcc is indexed with PADDED_V_HEAD_DIM stride
+            float acc_val = shAcc[row * PADDED_V_HEAD_DIM + col];
             float normalized = acc_val / (s > 1e-10f ? s : 1.0f);
             O[o_offset + (ptrdiff_t)row * o_row_stride + col] = normalized;
         }
@@ -947,7 +980,7 @@ inline void flash_attn_coopmat_kernel_padded(
 }
 
 // Wrapper for Arc B60/Battlemage with padding support
-template <int64_t HEAD_DIM, int64_t PADDED_HEAD_DIM>
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, int64_t PADDED_HEAD_DIM, int64_t PADDED_V_HEAD_DIM>
 inline void flash_attn_coopmat_kernel_dg2_padded(
     sycl::nd_item<2> it,
     const float * Q, const float * K, const float * V,
@@ -956,14 +989,14 @@ inline void flash_attn_coopmat_kernel_dg2_padded(
     const int gqa_ratio, const float scale,
     const float * mask, const int64_t mask_stride, const int o_row_stride, float * shmem
 ) {
-    flash_attn_coopmat_kernel_padded<HEAD_DIM, PADDED_HEAD_DIM, 8, 16, 16>(
+    flash_attn_coopmat_kernel_padded<HEAD_DIM, V_HEAD_DIM, PADDED_HEAD_DIM, PADDED_V_HEAD_DIM, 8, 16, 16>(
         it, Q, K, V, O, l_d, m_d, N, N_kv, n_heads, n_kv_heads,
         gqa_ratio, scale, mask, mask_stride, o_row_stride, shmem
     );
 }
 
 // Wrapper for PVC with padding support
-template <int64_t HEAD_DIM, int64_t PADDED_HEAD_DIM>
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, int64_t PADDED_HEAD_DIM, int64_t PADDED_V_HEAD_DIM>
 inline void flash_attn_coopmat_kernel_pvc_padded(
     sycl::nd_item<2> it,
     const float * Q, const float * K, const float * V,
@@ -972,7 +1005,7 @@ inline void flash_attn_coopmat_kernel_pvc_padded(
     const int gqa_ratio, const float scale,
     const float * mask, const int64_t mask_stride, const int o_row_stride, float * shmem
 ) {
-    flash_attn_coopmat_kernel_padded<HEAD_DIM, PADDED_HEAD_DIM, 8, 16, 16>(
+    flash_attn_coopmat_kernel_padded<HEAD_DIM, V_HEAD_DIM, PADDED_HEAD_DIM, PADDED_V_HEAD_DIM, 8, 16, 16>(
         it, Q, K, V, O, l_d, m_d, N, N_kv, n_heads, n_kv_heads,
         gqa_ratio, scale, mask, mask_stride, o_row_stride, shmem
     );
