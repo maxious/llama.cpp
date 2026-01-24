@@ -17,7 +17,8 @@ if ! groups | grep -qwE "(render|video)"; then
 fi
 
 # Debug logging
-export GGML_SYCL_DEBUG=1
+export GGML_SYCL_DEBUG=0
+export GGML_SYCL_FLASH_ATTN_DEBUG=0
 
 # SINGLE GPU MODE OPTION
 # Uncomment the line below to force usage of only the first GPU (Device 0)
@@ -28,10 +29,10 @@ export GGML_SYCL_DEBUG=1
 # -ngl 7: Limited to 7 GPU layers (8+ causes UR_RESULT_ERROR_DEVICE_LOST)
 # -c 2048: Smaller context to fit within GPU memory limits
 ./build/bin/llama-server --model ./koboldcpp/Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL.gguf \
+-fa off \
   --port 5000 --host 0.0.0.0 --jinja \
   --threads -1 \
-  --ctx-size 2048 \
-  --n-gpu-layers 7 \
+  --n-gpu-layers 99 \
   --cache-ram -1 \
   -sm layer \
   --seed 3407 \
