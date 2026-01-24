@@ -74,7 +74,7 @@ inline xmx_tile_kind ggml_sycl_flash_attn_get_tile_kind(sycl::device device) {
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
     return ggml_sycl_get_tile_kind(device);
 #else
-    return xmx_tile_kind::tile_8x8;  // Fallback, won't be used
+    return xmx_tile_kind::tile_dg2;  // Fallback, won't be used
 #endif
 }
 
@@ -716,13 +716,13 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
     // Then we scatter to the actual output layout [dim, head, seq, batch]
     float * O_temp = (float *) sycl::malloc_device(N * DV * n_heads * sizeof(float), *stream);
 
-    if (tile_kind == xmx_tile_kind::tile_8x8) {
+if (tile_kind == xmx_tile_kind::tile_dg2) {
         // DG2/Arc B60: Use 8x8x16 tiles
         stream->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
 
             cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                flash_attn_coopmat_kernel_dg2<DQK, DV>(
+                flash_attn_coopmat_kernel_n8<DQK, DV>(
                     it,
                     Q_d_f32, K_d_f32, V_d_f32, O_temp,
                     l_d, m_d,
@@ -738,7 +738,7 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
             sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
 
             cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                flash_attn_coopmat_kernel_pvc<DQK, DV>(
+                flash_attn_coopmat_kernel_n16<DQK, DV>(
                     it,
                     Q_d_f32, K_d_f32, V_d_f32, O_temp,
                     l_d, m_d,
@@ -1037,12 +1037,12 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
     float * O_temp = (float *) sycl::malloc_device(N * V_HEAD_DIM * n_heads * sizeof(float), *stream);
     const int o_row_stride = V_HEAD_DIM;
 
-if (tile_kind == xmx_tile_kind::tile_8x8) {
+if (tile_kind == xmx_tile_kind::tile_dg2) {
         stream->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
 
             cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                flash_attn_coopmat_kernel_dg2_padded<HEAD_DIM, V_HEAD_DIM, PADDED_HEAD_DIM, PADDED_V_HEAD_DIM>(
+                flash_attn_coopmat_kernel_n8_padded<HEAD_DIM, V_HEAD_DIM, PADDED_HEAD_DIM, PADDED_V_HEAD_DIM>(
                     it,
                     Q_d_f32, K_d_f32, V_d_f32, O_temp,
                     l_d, m_d,
@@ -1058,7 +1058,7 @@ if (tile_kind == xmx_tile_kind::tile_8x8) {
             sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
 
             cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                flash_attn_coopmat_kernel_pvc_padded<HEAD_DIM, V_HEAD_DIM, PADDED_HEAD_DIM, PADDED_V_HEAD_DIM>(
+                flash_attn_coopmat_kernel_n16_padded<HEAD_DIM, V_HEAD_DIM, PADDED_HEAD_DIM, PADDED_V_HEAD_DIM>(
                     it,
                     Q_d_f32, K_d_f32, V_d_f32, O_temp,
                     l_d, m_d,
@@ -1543,7 +1543,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         sycl_use_xmx = ggml_sycl_flash_attn_has_xmx(device);
         xmx_checked = true;
         xmx_tile_kind tile_kind = ggml_sycl_flash_attn_get_tile_kind(device);
-        const char * tile_str = (tile_kind == xmx_tile_kind::tile_8x8) ? "8x8x16 (DG2/Arc)" : "16x16x16 (PVC)";
+        const char * tile_str = (tile_kind == xmx_tile_kind::tile_dg2) ? "DG2 (nsize=8)" : "PVC/B60 (nsize=16)";
         fprintf(stderr, "ggml_sycl: XMX detection: device=%s, has_xmx=%d, tile_kind=%s\n", 
                 device.get_info<sycl::info::device::name>().c_str(), sycl_use_xmx, tile_str);
         if (sycl_use_xmx) {

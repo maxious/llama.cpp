@@ -193,9 +193,11 @@ namespace cm = sycl::ext::oneapi::experimental::matrix;
 // XMX bfloat16 type for cooperative matrices (distinct from common.hpp bfloat16 = uint16_t)
 using xmx_bfloat16 = sycl::ext::oneapi::bfloat16;
 
-// Tile size enum for different Intel GPU architectures
-// DG2/Arc (Xe2) supports 8x8x16, PVC supports 8x16x16, AMX supports 16x16x32
-enum class xmx_tile_kind { tile_8x8, tile_16x16 };
+// Tile kind enum for different Intel GPU architectures
+// Both use 8x16x16 tiles, but differ in reported nsize:
+// - DG2 reports nsize=8 (older Xe2 architecture)
+// - PVC/B60 reports nsize=16 (newer architecture)
+enum class xmx_tile_kind { tile_dg2, tile_pvc };
 
 // Check if device supports cooperative matrices
 inline bool ggml_sycl_has_coopmat_support(sycl::device device) {
@@ -214,16 +216,16 @@ inline xmx_tile_kind ggml_sycl_get_tile_kind(sycl::device device) {
         if (c.atype == sycl::ext::oneapi::experimental::matrix::matrix_type::bf16 ||
             c.atype == sycl::ext::oneapi::experimental::matrix::matrix_type::fp16) {
             if (c.nsize == 16 || c.max_nsize == 16) {
-                // PVC-like: 8x16x16 tiles
-                return xmx_tile_kind::tile_16x16;  // Use 16 for the N dimension
+                // PVC/B60: reports nsize=16
+                return xmx_tile_kind::tile_pvc;
             } else if (c.nsize == 8 || c.max_nsize == 8) {
-                // DG2: 8x8x16 tiles
-                return xmx_tile_kind::tile_8x8;
+                // DG2: reports nsize=8
+                return xmx_tile_kind::tile_dg2;
             }
         }
     }
-    // Default to 16x16 if we can't determine
-    return xmx_tile_kind::tile_16x16;
+    // Default to PVC if we can't determine
+    return xmx_tile_kind::tile_pvc;
 }
 
 // Debug mode for flash attention kernel
@@ -608,10 +610,9 @@ inline void flash_attn_coopmat_kernel(
     }
 }
 
-// Wrapper for Arc B60/Battlemage (8x16x16 tiles - msize=8, nsize=16, ksize=16)
-// Based on runtime query showing nsize=16 for bf16/fp16 on Arc B60
+// Wrapper for DG2 (reports nsize=8, uses 8x16x16 tiles)
 template <int64_t HEAD_DIM, int64_t V_HEAD_DIM>
-inline void flash_attn_coopmat_kernel_dg2(
+inline void flash_attn_coopmat_kernel_n8(
     sycl::nd_item<2> it,
     const float * Q, const float * K, const float * V,
     float * O, float * l_d, float * m_d,
@@ -619,16 +620,16 @@ inline void flash_attn_coopmat_kernel_dg2(
     const int gqa_ratio, const float scale,
     const float * mask, const int64_t mask_stride, float * shmem
 ) {
-    // Arc B60 uses 8x16x16 tiles (TM=8, TN=16, TK=16)
+    // Both n8 and n16 use 8x16x16 tiles (TM=8, TN=16, TK=16)
     flash_attn_coopmat_kernel<HEAD_DIM, V_HEAD_DIM, 8, 16, 16>(
         it, Q, K, V, O, l_d, m_d, N, N_kv, n_heads, n_kv_heads,
         gqa_ratio, scale, mask, mask_stride, shmem
     );
 }
 
-// Wrapper for PVC (8x16x16 tiles - same as Arc B60)
+// Wrapper for PVC/B60 (reports nsize=16, uses 8x16x16 tiles)
 template <int64_t HEAD_DIM, int64_t V_HEAD_DIM>
-inline void flash_attn_coopmat_kernel_pvc(
+inline void flash_attn_coopmat_kernel_n16(
     sycl::nd_item<2> it,
     const float * Q, const float * K, const float * V,
     float * O, float * l_d, float * m_d,
@@ -979,9 +980,9 @@ inline void flash_attn_coopmat_kernel_padded(
     }
 }
 
-// Wrapper for Arc B60/Battlemage with padding support
+// Wrapper for DG2 (nsize=8) with padding support
 template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, int64_t PADDED_HEAD_DIM, int64_t PADDED_V_HEAD_DIM>
-inline void flash_attn_coopmat_kernel_dg2_padded(
+inline void flash_attn_coopmat_kernel_n8_padded(
     sycl::nd_item<2> it,
     const float * Q, const float * K, const float * V,
     float * O, float * l_d, float * m_d,
@@ -995,9 +996,9 @@ inline void flash_attn_coopmat_kernel_dg2_padded(
     );
 }
 
-// Wrapper for PVC with padding support
+// Wrapper for PVC/B60 (nsize=16) with padding support
 template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, int64_t PADDED_HEAD_DIM, int64_t PADDED_V_HEAD_DIM>
-inline void flash_attn_coopmat_kernel_pvc_padded(
+inline void flash_attn_coopmat_kernel_n16_padded(
     sycl::nd_item<2> it,
     const float * Q, const float * K, const float * V,
     float * O, float * l_d, float * m_d,
