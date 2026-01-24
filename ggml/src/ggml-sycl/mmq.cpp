@@ -2927,11 +2927,8 @@ void ggml_sycl_op_mul_mat_q(
 
     switch (src0->type) {
         case GGML_TYPE_Q8_0:
-            if (has_int8_xmx_support(stream) && src1_ncols > 1) {
-                ggml_sycl_op_mul_mat_q_xmx_int8(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low, row_high, src1_ncols, src1_padded_row_size, stream);
-            } else {
-                ggml_mul_mat_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
-            }
+            // Q8_0 XMX kernel produces NaN - use standard dp4a path until fixed
+            ggml_mul_mat_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
 
         case GGML_TYPE_Q4_1:
@@ -2952,11 +2949,8 @@ void ggml_sycl_op_mul_mat_q(
             ggml_mul_mat_q3_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
         case GGML_TYPE_Q4_K:
-            if (has_int8_xmx_support(stream) && src1_ncols > 1) {
-                ggml_sycl_op_mul_mat_q_xmx_int8(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low, row_high, src1_ncols, src1_padded_row_size, stream);
-            } else {
-                ggml_mul_mat_q4_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
-            }
+            // Q4_K XMX kernel not yet implemented - use standard dp4a path
+            ggml_mul_mat_q4_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
         case GGML_TYPE_Q5_K:
             ggml_mul_mat_q5_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
