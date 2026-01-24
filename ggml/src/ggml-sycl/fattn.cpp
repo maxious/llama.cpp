@@ -15,7 +15,8 @@ constexpr int FATTN_BLOCK_C = 32;  // Bc
 // Head size padding support
 // Returns the next supported head size for padding, or 0 if not paddable
 inline int64_t get_padded_head_size(int64_t head_size) {
-    // Supported sizes: 32, 64, 80, 96, 112, 128, 256, 512
+    // Supported sizes: 32, 64, 80, 96, 112, 128, 256, 512, 576
+    // 576 added for GLM-4.7-Flash which has K head size 576
     if (head_size <= 32) return 32;
     if (head_size <= 64) return 64;
     if (head_size <= 80) return 80;
@@ -24,6 +25,7 @@ inline int64_t get_padded_head_size(int64_t head_size) {
     if (head_size <= 128) return 128;
     if (head_size <= 256) return 256;
     if (head_size <= 512) return 512;
+    if (head_size <= 576) return 576;
     return 0;  // Not supported
 }
 
@@ -147,11 +149,10 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     int64_t DQK = Q->ne[0];
     int64_t DV  = V->ne[0];
 
-    if (DQK != DV) {
-        return false;
-    }
-
-    if (!is_head_size_supported(DV)) {
+    // GLM-4.7-Flash has different K and V head sizes (K=576, V=512)
+    // The oneMKL path supports different DQK and DV via separate template params
+    // XMX path currently requires DQK == DV, so we'll use oneMKL for mismatched sizes
+    if (!is_head_size_supported(DQK) || !is_head_size_supported(DV)) {
         return false;
     }
 
@@ -167,9 +168,14 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     // GQA ratio (number of Q heads per K/V head)
     const int gqa_ratio = n_heads / n_kv_heads;
 
-    // For now, only support ratio of 1 (MHA) or small ratios
-    // Larger ratios would require different memory access patterns
-    if (gqa_ratio > 8) {
+    // Support high GQA ratios like GLM-4.7-Flash (ratio=20) 
+    // CUDA uses gqa_ratio % 4 == 0 optimization, we require divisibility by 4 for high ratios
+    if (gqa_ratio > 8 && gqa_ratio % 4 != 0) {
+        return false;
+    }
+    
+    // Cap at reasonable maximum (GLM-4.7 has ratio=20)
+    if (gqa_ratio > 32) {
         return false;
     }
 
@@ -1486,39 +1492,57 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         }
     }
 
-    if (sycl_use_mkl) {
-        const int64_t actual_d = Q->ne[0];
-        const int64_t padded_d = get_padded_head_size(actual_d);
+    const int64_t DQK = Q->ne[0];
+    const int64_t DV = V->ne[0];
+    
+    // Force MKL path when DQK != DV (XMX doesn't support mismatched K/V head sizes)
+    bool force_mkl = (DQK != DV);
+    
+    if (sycl_use_mkl || force_mkl) {
+        if (force_mkl && !sycl_use_mkl) {
+            static bool warned = false;
+            if (!warned) {
+                fprintf(stderr, "ggml_sycl: Using oneMKL for flash attention (DQK=%ld != DV=%ld, XMX requires equal sizes)\n", DQK, DV);
+                warned = true;
+            }
+        }
         
-        if (actual_d == padded_d) {
-            switch (actual_d) {
+        // Handle mismatched DQK/DV case (e.g., GLM-4.7-Flash: K=576, V=512)
+        if (DQK == 576 && DV == 512) {
+            ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
+            return;
+        }
+        
+        const int64_t padded_d = get_padded_head_size(DQK);
+        
+        if (DQK == padded_d && DQK == DV) {
+            switch (DQK) {
                 case 32:
-                    GGML_ASSERT(V->ne[0] == 32);
                     ggml_sycl_op_flash_attn_mkl<32, 32>(ctx, dst);
                     return;
                 case 64:
-                    GGML_ASSERT(V->ne[0] == 64);
                     ggml_sycl_op_flash_attn_mkl<64, 64>(ctx, dst);
                     return;
                 case 80:
-                    GGML_ASSERT(V->ne[0] == 80);
                     ggml_sycl_op_flash_attn_mkl<80, 80>(ctx, dst);
                     return;
                 case 96:
-                    GGML_ASSERT(V->ne[0] == 96);
                     ggml_sycl_op_flash_attn_mkl<96, 96>(ctx, dst);
                     return;
                 case 112:
-                    GGML_ASSERT(V->ne[0] == 112);
                     ggml_sycl_op_flash_attn_mkl<112, 112>(ctx, dst);
                     return;
                 case 128:
-                    GGML_ASSERT(V->ne[0] == 128);
                     ggml_sycl_op_flash_attn_mkl<128, 128>(ctx, dst);
                     return;
                 case 256:
-                    GGML_ASSERT(V->ne[0] == 256);
                     ggml_sycl_op_flash_attn_mkl<256, 256>(ctx, dst);
+                    return;
+                case 512:
+                    ggml_sycl_op_flash_attn_mkl<512, 512>(ctx, dst);
+                    return;
+                case 576:
+                    ggml_sycl_op_flash_attn_mkl<576, 576>(ctx, dst);
                     return;
                 default:
                     break;
@@ -1526,7 +1550,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         } else if (padded_d > 0) {
             fprintf(stderr, "ggml_sycl: oneMKL path does not support padded head sizes, falling back\n");
         }
-        fprintf(stderr, "ggml_sycl: oneMKL flash attention not supported for head size %ld, falling back\n", actual_d);
+        fprintf(stderr, "ggml_sycl: oneMKL flash attention not supported for head sizes DQK=%ld DV=%ld, falling back\n", DQK, DV);
     }
 #endif
 
@@ -1550,31 +1574,34 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
 
     if (sycl_use_xmx) {
         const int64_t actual_d = Q->ne[0];
+        const int64_t actual_dv = V->ne[0];
         const int64_t padded_d = get_padded_head_size(actual_d);
         
-        try {
+        // XMX path requires DQK == DV (we already handled mismatched case with MKL above)
+        if (actual_d != actual_dv) {
+            fprintf(stderr, "ggml_sycl: XMX flash attention requires DQK==DV, but got DQK=%ld DV=%ld\n", actual_d, actual_dv);
+            // Fall through to basic path
+        } else try {
             if (actual_d == padded_d) {
                 // Native head size - use non-padded kernel
                 switch (actual_d) {
                     case 32:
-                        GGML_ASSERT(V->ne[0] == 32);
                         ggml_sycl_op_flash_attn_coopmat<32, 32>(ctx, dst);
                         return;
                     case 64:
-                        GGML_ASSERT(V->ne[0] == 64);
                         ggml_sycl_op_flash_attn_coopmat<64, 64>(ctx, dst);
                         return;
                     case 96:
-                        GGML_ASSERT(V->ne[0] == 96);
                         ggml_sycl_op_flash_attn_coopmat<96, 96>(ctx, dst);
                         return;
                     case 128:
-                        GGML_ASSERT(V->ne[0] == 128);
                         ggml_sycl_op_flash_attn_coopmat<128, 128>(ctx, dst);
                         return;
                     case 256:
-                        GGML_ASSERT(V->ne[0] == 256);
                         ggml_sycl_op_flash_attn_coopmat<256, 256>(ctx, dst);
+                        return;
+                    case 512:
+                        ggml_sycl_op_flash_attn_coopmat<512, 512>(ctx, dst);
                         return;
                     default:
                         break;
@@ -1583,27 +1610,21 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                 // Padded head size - use padded kernel
                 switch (actual_d) {
                     case 40:
-                        GGML_ASSERT(V->ne[0] == 40);
                         ggml_sycl_op_flash_attn_coopmat_padded<40, 64>(ctx, dst);
                         return;
                     case 48:
-                        GGML_ASSERT(V->ne[0] == 48);
                         ggml_sycl_op_flash_attn_coopmat_padded<48, 64>(ctx, dst);
                         return;
                     case 56:
-                        GGML_ASSERT(V->ne[0] == 56);
                         ggml_sycl_op_flash_attn_coopmat_padded<56, 64>(ctx, dst);
                         return;
                     case 72:
-                        GGML_ASSERT(V->ne[0] == 72);
                         ggml_sycl_op_flash_attn_coopmat_padded<72, 80>(ctx, dst);
                         return;
                     case 88:
-                        GGML_ASSERT(V->ne[0] == 88);
                         ggml_sycl_op_flash_attn_coopmat_padded<88, 96>(ctx, dst);
                         return;
                     case 104:
-                        GGML_ASSERT(V->ne[0] == 104);
                         ggml_sycl_op_flash_attn_coopmat_padded<104, 112>(ctx, dst);
                         return;
                     default:
@@ -1622,41 +1643,44 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
 #endif
 
     // Fallback to basic flash attention implementation
-    switch (Q->ne[0]) {
+    // Note: basic path doesn't support mismatched DQK/DV (that's handled by MKL above)
+    const int64_t fallback_dqk = Q->ne[0];
+    const int64_t fallback_dv = V->ne[0];
+    
+    if (fallback_dqk != fallback_dv) {
+        fprintf(stderr, "ggml_sycl: Flash attention fallback path requires DQK==DV, got DQK=%ld DV=%ld\n", 
+                fallback_dqk, fallback_dv);
+        fprintf(stderr, "ggml_sycl: This should have been handled by oneMKL path. Check GGML_SYCL_USE_INTEL_ONEMKL.\n");
+        return;
+    }
+    
+    switch (fallback_dqk) {
         case 32:
-            GGML_ASSERT(V->ne[0] == 32);
             ggml_sycl_op_flash_attn_2< 32,  32>(ctx, dst);
             break;
         case 64:
-            GGML_ASSERT(V->ne[0] == 64);
             ggml_sycl_op_flash_attn_2< 64,  64>(ctx, dst);
             break;
         case 80:
-            GGML_ASSERT(V->ne[0] == 80);
             ggml_sycl_op_flash_attn_2< 80,  80>(ctx, dst);
             break;
         case 96:
-            GGML_ASSERT(V->ne[0] == 96);
             ggml_sycl_op_flash_attn_2< 96,  96>(ctx, dst);
             break;
         case 112:
-            GGML_ASSERT(V->ne[0] == 112);
             ggml_sycl_op_flash_attn_2<112, 112>(ctx, dst);
             break;
         case 128:
-            GGML_ASSERT(V->ne[0] == 128);
             ggml_sycl_op_flash_attn_2<128, 128>(ctx, dst);
             break;
         case 256:
-            GGML_ASSERT(V->ne[0] == 256);
             ggml_sycl_op_flash_attn_2<256, 256>(ctx, dst);
             break;
-        case 576:
-            GGML_ASSERT(V->ne[0] == 512);
+        case 512:
             ggml_sycl_op_flash_attn_2<512, 512>(ctx, dst);
             break;
         default:
-            fprintf(stderr, "Warning: Unsupported head size %ld — skipping op\n", Q->ne[0]);
+            fprintf(stderr, "Warning: Unsupported head size %ld — skipping op\n", fallback_dqk);
             break;
     }
 }
