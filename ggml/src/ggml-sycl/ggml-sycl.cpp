@@ -2720,7 +2720,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                             // XMX kernels produce NaN - disable until fixed
                             bool use_xmx = false;
                             (void)has_int8_xmx_support; // unused for now
-                            
+
                             if (use_xmx) {
                                 quantize_row_q8_1_sycl<quantize_q8_1_soa>(src1_ddf_i, src1_ddq_i, ne10, src1_ncols,
                                                                       src1_padded_col_size, stream);
