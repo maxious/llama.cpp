@@ -141,8 +141,22 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
         return false;
     }
 
-    // Require contiguous tensors - permuted KV cache views are not supported
-    if (!ggml_is_contiguous(Q) || !ggml_is_contiguous(K) || !ggml_is_contiguous(V)) {
+    // Log non-contiguous tensor info (debug only)
+    static bool warned_non_contiguous = false;
+    if (!warned_non_contiguous && (!ggml_is_contiguous(Q) || !ggml_is_contiguous(K) || !ggml_is_contiguous(V))) {
+        fprintf(stderr, "ggml_sycl: FA tensors not strictly contiguous (padded):\n");
+        fprintf(stderr, "  Q: ne=[%ld,%ld,%ld,%ld] nb=[%ld,%ld,%ld,%ld] cont=%d\n",
+                Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3], Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3], ggml_is_contiguous(Q));
+        fprintf(stderr, "  K: ne=[%ld,%ld,%ld,%ld] nb=[%ld,%ld,%ld,%ld] cont=%d\n",
+                K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[0], K->nb[1], K->nb[2], K->nb[3], ggml_is_contiguous(K));
+        fprintf(stderr, "  V: ne=[%ld,%ld,%ld,%ld] nb=[%ld,%ld,%ld,%ld] cont=%d\n",
+                V->ne[0], V->ne[1], V->ne[2], V->ne[3], V->nb[0], V->nb[1], V->nb[2], V->nb[3], ggml_is_contiguous(V));
+        warned_non_contiguous = true;
+    }
+    
+    // Require contiguously allocated tensors (allows padding, rejects permuted views)
+    // Matches CUDA backend behavior - see ggml/src/ggml-cuda/fattn-common.cuh
+    if (!ggml_is_contiguously_allocated(Q) || !ggml_is_contiguously_allocated(K) || !ggml_is_contiguously_allocated(V)) {
         return false;
     }
 
@@ -1164,10 +1178,11 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
     float * K_d_f32_alloc = nullptr;
     float * V_d_f32_alloc = nullptr;
 
-    // Dequantize Q into per-head row-major [N x DQK] layout
     Q_d_f32_alloc = (float *) sycl::malloc_device(N * DQK * n_heads * sizeof(float), *stream);
     if (q_is_f16) {
         const sycl::half * Q_f16 = (const sycl::half *) Q->data;
+        const int64_t q_stride_seq = Q->nb[1] / sizeof(sycl::half);
+        const int64_t q_stride_head = Q->nb[2] / sizeof(sycl::half);
         stream->submit([&](sycl::handler& cgh) {
             const int64_t total = N * DQK * n_heads;
             cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
@@ -1177,11 +1192,13 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 const int64_t rem = idx % (N * DQK);
                 const int64_t n = rem / DQK;
                 const int64_t d = rem % DQK;
-                Q_d_f32_alloc[idx] = static_cast<float>(Q_f16[d + head * DQK + n * n_heads * DQK]);
+                Q_d_f32_alloc[idx] = static_cast<float>(Q_f16[d + head * q_stride_head + n * q_stride_seq]);
             });
         });
     } else {
         const float * Q_f32 = (const float *) Q->data;
+        const int64_t q_stride_seq = Q->nb[1] / sizeof(float);
+        const int64_t q_stride_head = Q->nb[2] / sizeof(float);
         stream->submit([&](sycl::handler& cgh) {
             const int64_t total = N * DQK * n_heads;
             cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
@@ -1191,15 +1208,16 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 const int64_t rem = idx % (N * DQK);
                 const int64_t n = rem / DQK;
                 const int64_t d = rem % DQK;
-                Q_d_f32_alloc[idx] = Q_f32[d + head * DQK + n * n_heads * DQK];
+                Q_d_f32_alloc[idx] = Q_f32[d + head * q_stride_head + n * q_stride_seq];
             });
         });
     }
 
-    // Dequantize K into per-head row-major [N_kv x DQK] layout
     K_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DQK * n_kv_heads * sizeof(float), *stream);
     if (k_is_f16) {
         const sycl::half * K_f16 = (const sycl::half *) K->data;
+        const int64_t k_stride_seq = K->nb[1] / sizeof(sycl::half);
+        const int64_t k_stride_head = K->nb[2] / sizeof(sycl::half);
         stream->submit([&](sycl::handler& cgh) {
             const int64_t total = N_kv * DQK * n_kv_heads;
             cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
@@ -1209,11 +1227,13 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 const int64_t rem = idx % (N_kv * DQK);
                 const int64_t n = rem / DQK;
                 const int64_t d = rem % DQK;
-                K_d_f32_alloc[idx] = static_cast<float>(K_f16[d + head * DQK + n * n_kv_heads * DQK]);
+                K_d_f32_alloc[idx] = static_cast<float>(K_f16[d + head * k_stride_head + n * k_stride_seq]);
             });
         });
     } else {
         const float * K_f32 = (const float *) K->data;
+        const int64_t k_stride_seq = K->nb[1] / sizeof(float);
+        const int64_t k_stride_head = K->nb[2] / sizeof(float);
         stream->submit([&](sycl::handler& cgh) {
             const int64_t total = N_kv * DQK * n_kv_heads;
             cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
@@ -1223,15 +1243,16 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 const int64_t rem = idx % (N_kv * DQK);
                 const int64_t n = rem / DQK;
                 const int64_t d = rem % DQK;
-                K_d_f32_alloc[idx] = K_f32[d + head * DQK + n * n_kv_heads * DQK];
+                K_d_f32_alloc[idx] = K_f32[d + head * k_stride_head + n * k_stride_seq];
             });
         });
     }
 
-    // Dequantize V into per-head row-major [N_kv x DV] layout
     V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
     if (v_is_f16) {
         const sycl::half * V_f16 = (const sycl::half *) V->data;
+        const int64_t v_stride_seq = V->nb[1] / sizeof(sycl::half);
+        const int64_t v_stride_head = V->nb[2] / sizeof(sycl::half);
         stream->submit([&](sycl::handler& cgh) {
             const int64_t total = N_kv * DV * n_kv_heads;
             cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
@@ -1241,11 +1262,13 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 const int64_t rem = idx % (N_kv * DV);
                 const int64_t n = rem / DV;
                 const int64_t d = rem % DV;
-                V_d_f32_alloc[idx] = static_cast<float>(V_f16[d + head * DV + n * n_kv_heads * DV]);
+                V_d_f32_alloc[idx] = static_cast<float>(V_f16[d + head * v_stride_head + n * v_stride_seq]);
             });
         });
     } else {
         const float * V_f32 = (const float *) V->data;
+        const int64_t v_stride_seq = V->nb[1] / sizeof(float);
+        const int64_t v_stride_head = V->nb[2] / sizeof(float);
         stream->submit([&](sycl::handler& cgh) {
             const int64_t total = N_kv * DV * n_kv_heads;
             cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
@@ -1255,7 +1278,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 const int64_t rem = idx % (N_kv * DV);
                 const int64_t n = rem / DV;
                 const int64_t d = rem % DV;
-                V_d_f32_alloc[idx] = V_f32[d + head * DV + n * n_kv_heads * DV];
+                V_d_f32_alloc[idx] = V_f32[d + head * v_stride_head + n * v_stride_seq];
             });
         });
     }
