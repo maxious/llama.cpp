@@ -131,7 +131,12 @@ poetry.toml
 /run-vim.sh
 /run-chat.sh
 /run-spec.sh
+/run-*.sh
+/test-*.sh
 /.ccache/
+
+# IDE configuration
+/.clangd
 
 # IDE
 /*.code-workspace
