@@ -139,13 +139,13 @@ static void dequantize_row_q4_0_sycl_reorder(const void *vx, dst_t *y, const int
     dpct::has_capability_or_fail(stream->get_device(),
                                     {sycl::aspect::fp16});
 
-    int constexpr WARP_K = WARP_SIZE * QK4_0;
+    int constexpr WARP_K = QK_WARP_SIZE * QK4_0;
     const int n_warp = (k + WARP_K - 1) / WARP_K;
     GGML_ASSERT(k % 2 == 0);
     stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, n_warp) *
-        sycl::range<3>(1, 1, WARP_SIZE),
-        sycl::range<3>(1, 1, WARP_SIZE)),
-        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]]{
+        sycl::range<3>(1, 1, QK_WARP_SIZE),
+        sycl::range<3>(1, 1, QK_WARP_SIZE)),
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]]{
             dequantize_block_q4_0_reorder(vx, y, k, item_ct1);
         });
 
@@ -202,7 +202,7 @@ static void dequantize_row_q4_K_sycl_reorder(const void * vx, dst_t * y, const i
         sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(12), cgh);
 
         cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(local_size)),
-                         [=](sycl::nd_item<1> item_ct1) {
+                         [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                              dequantize_block_q4_K_reorder(vx, y, get_pointer(scale_local_acc), item_ct1, nb);
                          });
     });
@@ -280,7 +280,7 @@ static void dequantize_row_q6_K_sycl_reorder(const void * vx, dst_t * y, const i
 
     stream->parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 64), sycl::range<3>(1, 1, 64)),
-        [=](sycl::nd_item<3> item_ct1) { dequantize_block_q6_K_reorder(vx, y, item_ct1, nb); });
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] { dequantize_block_q6_K_reorder(vx, y, item_ct1, nb); });
 }
 
 template <typename dst_t>

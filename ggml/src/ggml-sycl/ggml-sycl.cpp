@@ -3299,15 +3299,21 @@ static void reorder_qw_q4_0(uint8_t * data_device, const int ncols, const int nr
 
     GGML_ASSERT((size % sizeof(block_q4_0) == 0));
     GGML_ASSERT((offset % sizeof(block_q4_0) == 0));
-    int offset_blks = offset / sizeof(block_q4_0);
-    auto qs_ptr      = data_device + offset_blks * QK4_0 / 2;
-    auto d_ptr = (sycl::half*)(qs_ptr + ncols * nrows / 2) + offset_blks;
+
+    const int nblocks = size / sizeof(block_q4_0);
+    const int nblocks_padded = (nblocks + 31) / 32 * 32;
+
+    auto qs_ptr      = data_device;
+    auto d_ptr = (sycl::half*)(qs_ptr + nblocks * QK4_0 / 2);
 
     auto reorder_event = stream->parallel_for(
-        size / sizeof(block_q4_0),
-            [=](auto i) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+        nblocks_padded,
+            [=](auto i) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
             const block_q4_0* x = (const block_q4_0*)tmp_buf;
             const int ib = i;
+            if (ib >= nblocks) {
+                return;
+            }
 
             for (int j = 0; j < QK4_0/2; j ++)
             {
@@ -3336,12 +3342,17 @@ static void reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, d
     }
 
     auto * qs_ptr     = data_device;
-    auto * scales_ptr = qs_ptr + QK_K / 2 * nblocks;
+    auto * scales_ptr = qs_ptr + (QK_K / 2) * nblocks;
     auto * dm_ptr     = (sycl::half2 *) (scales_ptr + K_SCALE_SIZE * nblocks);
 
-    auto reorder_event = stream->parallel_for(nblocks, [=](auto i) {
+    const int nblocks_padded = (nblocks + 31) / 32 * 32;
+
+    auto reorder_event = stream->parallel_for(nblocks_padded, [=](auto i) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
         const block_q4_K * x  = (const block_q4_K *) tmp_buf;
         const int          ib = i;
+        if (ib >= nblocks) {
+            return;
+        }
 
         for (int j = 0; j < QK_K / 2; ++j) {
             qs_ptr[ib * (QK_K / 2) + j] = x[ib].qs[j];
@@ -3378,9 +3389,14 @@ static void reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, d
     auto *       scales_ptr = qh_ptr + (QK_K / 4) * nblocks;
     sycl::half * dm_ptr     = (sycl::half *) (scales_ptr + (QK_K / 16) * nblocks);
 
-    auto reorder_event = stream->parallel_for(nblocks, [=](auto i) {
+    const int nblocks_padded = (nblocks + 31) / 32 * 32;
+
+    auto reorder_event = stream->parallel_for(nblocks_padded, [=](auto i) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
         const block_q6_K * x  = (const block_q6_K *) tmp_buf;
         const int          ib = i;
+        if (ib >= nblocks) {
+            return;
+        }
 
         const uint8_t * ql              = x[ib].ql;
         const uint8_t * qh              = x[ib].qh;
@@ -3421,7 +3437,7 @@ static void reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
             reorder_qw_q4_k(data_device, size, 0, stream);
             break;
         case GGML_TYPE_Q6_K:
-            reorder_qw_q6_k(data_device, size, 0, stream);
+            // reorder_qw_q6_k(data_device, size, 0, stream);
             break;
         default:
             GGML_ABORT("reorder_qw() called with unsupported type");
@@ -3557,7 +3573,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
         ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
         if (extra && extra->optimized_feature.reorder) {
-            ggml_sycl_op_mul_mat<quantize_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
+            ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         } else {
             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         }
