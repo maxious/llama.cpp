@@ -149,8 +149,10 @@ endif()
 
 if (GGML_SYCL_TARGET STREQUAL "INTEL")
     add_compile_definitions(GGML_SYCL_WARP_SIZE=16)
-    # XMX (cooperative matrix) flash attention disabled by default - use MKL path
-    # Uncomment to enable XMX: add_compile_definitions(SYCL_EXT_COOPERATIVE_MATRICES)
+    # XMX (cooperative matrix) flash attention disabled - causes memory faults on Arc B60
+    # The XMX kernel has issues with subgroup size mismatch (B60 supports 16 and 32)
+    # Use oneMKL BLAS path instead which is stable and produces correct results
+    # Uncomment to enable XMX (for testing): add_compile_definitions(SYCL_EXT_COOPERATIVE_MATRICES)
     # add_compile_definitions(SYCL_USE_XMX)
     # target_link_options(ggml-sycl PRIVATE  -Xs   -ze-intel-greater-than-4GB-buffer-required)  # Only needed for Data Center Max Series GPUs
 elseif (GGML_SYCL_TARGET STREQUAL "NVIDIA")

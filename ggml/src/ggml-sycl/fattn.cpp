@@ -1582,7 +1582,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     const int64_t DV = V->ne[0];
 
     // Handle mismatched DQK/DV case (e.g., GLM-4.7-Flash: K=576, V=512)
-    // Always use oneMKL for mismatched dimensions since XMX doesn't support them
+    // XMX cooperative matrix doesn't support mismatched K/V dimensions - use oneMKL
     if (DQK == 576 && DV == 512) {
         ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
         return;
