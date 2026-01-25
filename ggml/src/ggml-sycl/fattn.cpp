@@ -112,6 +112,7 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
 
     float scale, max_bias, logit_softcap;
 
@@ -123,7 +124,17 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
         return false;
     }
 
+    // Sinks (attention sinks / StreamingLLM) not yet implemented in SYCL flash attention
+    if (sinks != nullptr) {
+        return false;
+    }
+
     if (Q == nullptr || K == nullptr || V == nullptr) {
+        return false;
+    }
+
+    // Batch > 1 not yet supported in oneMKL flash attention path
+    if (Q->ne[3] > 1) {
         return false;
     }
 
@@ -149,6 +160,11 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     int64_t DV  = V->ne[0];
 
     if (!is_head_size_supported(DQK) || !is_head_size_supported(DV)) {
+        return false;
+    }
+
+    // Only DQK==DV or specifically supported DQK/DV combinations (e.g., 576/512) are handled
+    if (DQK != DV && !(DQK == 576 && DV == 512)) {
         return false;
     }
 
@@ -1589,6 +1605,9 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                     return;
                 case 128:
                     ggml_sycl_op_flash_attn_mkl<128, 128>(ctx, dst);
+                    return;
+                case 192:
+                    ggml_sycl_op_flash_attn_mkl<192, 192>(ctx, dst);
                     return;
                 case 256:
                     ggml_sycl_op_flash_attn_mkl<256, 256>(ctx, dst);
