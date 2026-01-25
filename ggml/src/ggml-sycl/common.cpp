@@ -14,6 +14,7 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
+#include <cstdlib>
 
 int get_current_device_id() {
   return dpct::dev_mgr::instance().current_device_id();
@@ -25,15 +26,32 @@ void* ggml_sycl_host_malloc(size_t size) try {
   }
 
   void* ptr = nullptr;
+
+#ifdef __linux__
+  // Use 4096 alignment for O_DIRECT compatibility
+  if (posix_memalign(&ptr, 4096, size) != 0) {
+    GGML_LOG_ERROR("WARNING: failed to allocate %.2f MB of host memory\n", size / 1024.0 / 1024.0);
+    return nullptr;
+  }
+
+#if defined(SYCL_EXT_ONEAPI_COPY_OPTIMIZE)
+  try {
+    sycl::ext::oneapi::experimental::prepare_for_device_copy(ptr, size, dpct::get_in_order_queue());
+  } catch (...) {
+    // Pinning failed, but memory is still valid for CPU
+  }
+#endif
+#else
   // allow to use dpct::get_in_order_queue() for host malloc
   dpct::err0 err = CHECK_TRY_ERROR(
       ptr = (void*)sycl::malloc_host(size, dpct::get_in_order_queue()));
 
   if (err != 0) {
     // clear the error
-    GGML_LOG_ERROR("WARNING: failed to allocate %.2f MB of pinned memory: %s\n", size / 1024.0 / 1024.0,    "syclGetErrorString is not supported");
+    GGML_LOG_ERROR("WARNING: failed to allocate %.2f MB of pinned memory: %s\n", size / 1024.0 / 1024.0, "syclGetErrorString is not supported");
     return nullptr;
   }
+#endif
 
   return ptr;
 } catch (sycl::exception const& exc) {
@@ -43,8 +61,20 @@ void* ggml_sycl_host_malloc(size_t size) try {
 }
 
 void ggml_sycl_host_free(void* ptr) try {
+  if (ptr == nullptr) {
+    return;
+  }
+#ifdef __linux__
+#if defined(SYCL_EXT_ONEAPI_COPY_OPTIMIZE)
+  try {
+    sycl::ext::oneapi::experimental::release_from_device_copy(ptr, dpct::get_in_order_queue());
+  } catch (...) {}
+#endif
+  free(ptr);
+#else
   // allow to use dpct::get_in_order_queue() for host malloc
   SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, dpct::get_in_order_queue())));
+#endif
 } catch (sycl::exception const& exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
