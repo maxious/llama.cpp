@@ -833,16 +833,30 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
 
     const int64_t N = Q->ne[1];
     const int64_t N_kv = K->ne[1];
-    const int64_t n_heads = Q->ne[2];
-    const int64_t n_kv_heads = K->ne[2];
-    const int64_t gqa_ratio = n_heads / n_kv_heads;
+    const int64_t n_heads_per_batch = Q->ne[2];
+    const int64_t n_kv_heads_per_batch = K->ne[2];
+    const int64_t batch = Q->ne[3];
+    const int64_t gqa_ratio = n_heads_per_batch / n_kv_heads_per_batch;
+    
+    // Flatten batch into heads for kernel processing
+    const int64_t n_heads = n_heads_per_batch * batch;
+    const int64_t n_kv_heads = n_kv_heads_per_batch * batch;
 
     float scale = 1.0f;
     std::memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
+    GGML_SYCL_DEBUG("Flash attn padded: Q shape [%ld, %ld, %ld, %ld], K shape [%ld, %ld, %ld, %ld]\n",
+        Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
+        K->ne[0], K->ne[1], K->ne[2], K->ne[3]);
+    GGML_SYCL_DEBUG("Flash attn padded: Q strides [%ld, %ld, %ld, %ld], K strides [%ld, %ld, %ld, %ld]\n",
+        (int64_t)Q->nb[0], (int64_t)Q->nb[1], (int64_t)Q->nb[2], (int64_t)Q->nb[3],
+        (int64_t)K->nb[0], (int64_t)K->nb[1], (int64_t)K->nb[2], (int64_t)K->nb[3]);
+    GGML_SYCL_DEBUG("Flash attn padded: n_heads=%ld (per_batch=%ld), n_kv_heads=%ld (per_batch=%ld), batch=%ld, gqa_ratio=%ld\n",
+        n_heads, n_heads_per_batch, n_kv_heads, n_kv_heads_per_batch, batch, gqa_ratio);
+
     // Dequantize/reorder tensors to contiguous per-head format
     // Input layout: [head_dim, seq_len, n_heads, batch]
-    // Output layout: contiguous [N_seq, HEAD_DIM] per head
+    // Output layout: contiguous [N_seq, HEAD_DIM] per head (with batch flattened into heads)
     
     if (q_is_f16) {
         const sycl::half * Q_d = (const sycl::half *) Q->data;
@@ -850,20 +864,24 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
         
         const int64_t q_stride_seq = Q->nb[1] / sizeof(sycl::half);
         const int64_t q_stride_head = Q->nb[2] / sizeof(sycl::half);
+        const int64_t q_stride_batch = Q->nb[3] / sizeof(sycl::half);
         
-        for (int64_t head = 0; head < n_heads; ++head) {
-            const int64_t n_elements = N * HEAD_DIM;
-            stream->submit([&](sycl::handler& cgh) {
-                cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
-                    const int idx = it.get_id(0);
-                    if (idx < n_elements) {
-                        const int64_t seq = idx / HEAD_DIM;
-                        const int64_t dim = idx % HEAD_DIM;
-                        Q_d_f32_alloc[head * N * HEAD_DIM + seq * HEAD_DIM + dim] = static_cast<float>(
-                            Q_d[dim + head * q_stride_head + seq * q_stride_seq]);
-                    }
+        for (int64_t b = 0; b < batch; ++b) {
+            for (int64_t head = 0; head < n_heads_per_batch; ++head) {
+                const int64_t head_total = b * n_heads_per_batch + head;
+                const int64_t n_elements = N * HEAD_DIM;
+                stream->submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
+                        const int idx = it.get_id(0);
+                        if (idx < n_elements) {
+                            const int64_t seq = idx / HEAD_DIM;
+                            const int64_t dim = idx % HEAD_DIM;
+                            Q_d_f32_alloc[head_total * N * HEAD_DIM + seq * HEAD_DIM + dim] = static_cast<float>(
+                                Q_d[dim + head * q_stride_head + seq * q_stride_seq + b * q_stride_batch]);
+                        }
+                    });
                 });
-            });
+            }
         }
         Q_d_f32 = Q_d_f32_alloc;
     } else {
@@ -872,20 +890,24 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
         
         const int64_t q_stride_seq = Q->nb[1] / sizeof(float);
         const int64_t q_stride_head = Q->nb[2] / sizeof(float);
+        const int64_t q_stride_batch = Q->nb[3] / sizeof(float);
         
-        for (int64_t head = 0; head < n_heads; ++head) {
-            const int64_t n_elements = N * HEAD_DIM;
-            stream->submit([&](sycl::handler& cgh) {
-                cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
-                    const int idx = it.get_id(0);
-                    if (idx < n_elements) {
-                        const int64_t seq = idx / HEAD_DIM;
-                        const int64_t dim = idx % HEAD_DIM;
-                        Q_d_f32_alloc[head * N * HEAD_DIM + seq * HEAD_DIM + dim] = 
-                            Q_d[dim + head * q_stride_head + seq * q_stride_seq];
-                    }
+        for (int64_t b = 0; b < batch; ++b) {
+            for (int64_t head = 0; head < n_heads_per_batch; ++head) {
+                const int64_t head_total = b * n_heads_per_batch + head;
+                const int64_t n_elements = N * HEAD_DIM;
+                stream->submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
+                        const int idx = it.get_id(0);
+                        if (idx < n_elements) {
+                            const int64_t seq = idx / HEAD_DIM;
+                            const int64_t dim = idx % HEAD_DIM;
+                            Q_d_f32_alloc[head_total * N * HEAD_DIM + seq * HEAD_DIM + dim] = 
+                                Q_d[dim + head * q_stride_head + seq * q_stride_seq + b * q_stride_batch];
+                        }
+                    });
                 });
-            });
+            }
         }
         Q_d_f32 = Q_d_f32_alloc;
     }
@@ -896,20 +918,24 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
         
         const int64_t k_stride_seq = K->nb[1] / sizeof(sycl::half);
         const int64_t k_stride_head = K->nb[2] / sizeof(sycl::half);
+        const int64_t k_stride_batch = K->nb[3] / sizeof(sycl::half);
         
-        for (int64_t head = 0; head < n_kv_heads; ++head) {
-            const int64_t n_elements = N_kv * HEAD_DIM;
-            stream->submit([&](sycl::handler& cgh) {
-                cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
-                    const int idx = it.get_id(0);
-                    if (idx < n_elements) {
-                        const int64_t seq = idx / HEAD_DIM;
-                        const int64_t dim = idx % HEAD_DIM;
-                        K_d_f32_alloc[head * N_kv * HEAD_DIM + seq * HEAD_DIM + dim] = static_cast<float>(
-                            K_d[dim + head * k_stride_head + seq * k_stride_seq]);
-                    }
+        for (int64_t b = 0; b < batch; ++b) {
+            for (int64_t head = 0; head < n_kv_heads_per_batch; ++head) {
+                const int64_t head_total = b * n_kv_heads_per_batch + head;
+                const int64_t n_elements = N_kv * HEAD_DIM;
+                stream->submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
+                        const int idx = it.get_id(0);
+                        if (idx < n_elements) {
+                            const int64_t seq = idx / HEAD_DIM;
+                            const int64_t dim = idx % HEAD_DIM;
+                            K_d_f32_alloc[head_total * N_kv * HEAD_DIM + seq * HEAD_DIM + dim] = static_cast<float>(
+                                K_d[dim + head * k_stride_head + seq * k_stride_seq + b * k_stride_batch]);
+                        }
+                    });
                 });
-            });
+            }
         }
         K_d_f32 = K_d_f32_alloc;
     } else {
@@ -918,20 +944,24 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
         
         const int64_t k_stride_seq = K->nb[1] / sizeof(float);
         const int64_t k_stride_head = K->nb[2] / sizeof(float);
+        const int64_t k_stride_batch = K->nb[3] / sizeof(float);
         
-        for (int64_t head = 0; head < n_kv_heads; ++head) {
-            const int64_t n_elements = N_kv * HEAD_DIM;
-            stream->submit([&](sycl::handler& cgh) {
-                cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
-                    const int idx = it.get_id(0);
-                    if (idx < n_elements) {
-                        const int64_t seq = idx / HEAD_DIM;
-                        const int64_t dim = idx % HEAD_DIM;
-                        K_d_f32_alloc[head * N_kv * HEAD_DIM + seq * HEAD_DIM + dim] = 
-                            K_d[dim + head * k_stride_head + seq * k_stride_seq];
-                    }
+        for (int64_t b = 0; b < batch; ++b) {
+            for (int64_t head = 0; head < n_kv_heads_per_batch; ++head) {
+                const int64_t head_total = b * n_kv_heads_per_batch + head;
+                const int64_t n_elements = N_kv * HEAD_DIM;
+                stream->submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
+                        const int idx = it.get_id(0);
+                        if (idx < n_elements) {
+                            const int64_t seq = idx / HEAD_DIM;
+                            const int64_t dim = idx % HEAD_DIM;
+                            K_d_f32_alloc[head_total * N_kv * HEAD_DIM + seq * HEAD_DIM + dim] = 
+                                K_d[dim + head * k_stride_head + seq * k_stride_seq + b * k_stride_batch];
+                        }
+                    });
                 });
-            });
+            }
         }
         K_d_f32 = K_d_f32_alloc;
     }
@@ -942,20 +972,24 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
 
         const int64_t v_stride_seq = V->nb[1] / sizeof(sycl::half);
         const int64_t v_stride_head = V->nb[2] / sizeof(sycl::half);
+        const int64_t v_stride_batch = V->nb[3] / sizeof(sycl::half);
 
-        for (int64_t head = 0; head < n_kv_heads; ++head) {
-            const int64_t n_elements = N_kv * V_HEAD_DIM;
-            stream->submit([&](sycl::handler& cgh) {
-                cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
-                    const int idx = it.get_id(0);
-                    if (idx < n_elements) {
-                        const int64_t seq = idx / V_HEAD_DIM;
-                        const int64_t dim = idx % V_HEAD_DIM;
-                        V_d_f32_alloc[head * N_kv * V_HEAD_DIM + seq * V_HEAD_DIM + dim] = static_cast<float>(
-                            V_d[dim + head * v_stride_head + seq * v_stride_seq]);
-                    }
+        for (int64_t b = 0; b < batch; ++b) {
+            for (int64_t head = 0; head < n_kv_heads_per_batch; ++head) {
+                const int64_t head_total = b * n_kv_heads_per_batch + head;
+                const int64_t n_elements = N_kv * V_HEAD_DIM;
+                stream->submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
+                        const int idx = it.get_id(0);
+                        if (idx < n_elements) {
+                            const int64_t seq = idx / V_HEAD_DIM;
+                            const int64_t dim = idx % V_HEAD_DIM;
+                            V_d_f32_alloc[head_total * N_kv * V_HEAD_DIM + seq * V_HEAD_DIM + dim] = static_cast<float>(
+                                V_d[dim + head * v_stride_head + seq * v_stride_seq + b * v_stride_batch]);
+                        }
+                    });
                 });
-            });
+            }
         }
         V_d_f32 = V_d_f32_alloc;
     } else {
@@ -964,20 +998,24 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
 
         const int64_t v_stride_seq = V->nb[1] / sizeof(float);
         const int64_t v_stride_head = V->nb[2] / sizeof(float);
+        const int64_t v_stride_batch = V->nb[3] / sizeof(float);
 
-        for (int64_t head = 0; head < n_kv_heads; ++head) {
-            const int64_t n_elements = N_kv * V_HEAD_DIM;
-            stream->submit([&](sycl::handler& cgh) {
-                cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
-                    const int idx = it.get_id(0);
-                    if (idx < n_elements) {
-                        const int64_t seq = idx / V_HEAD_DIM;
-                        const int64_t dim = idx % V_HEAD_DIM;
-                        V_d_f32_alloc[head * N_kv * V_HEAD_DIM + seq * V_HEAD_DIM + dim] =
-                            V_d[dim + head * v_stride_head + seq * v_stride_seq];
-                    }
+        for (int64_t b = 0; b < batch; ++b) {
+            for (int64_t head = 0; head < n_kv_heads_per_batch; ++head) {
+                const int64_t head_total = b * n_kv_heads_per_batch + head;
+                const int64_t n_elements = N_kv * V_HEAD_DIM;
+                stream->submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
+                        const int idx = it.get_id(0);
+                        if (idx < n_elements) {
+                            const int64_t seq = idx / V_HEAD_DIM;
+                            const int64_t dim = idx % V_HEAD_DIM;
+                            V_d_f32_alloc[head_total * N_kv * V_HEAD_DIM + seq * V_HEAD_DIM + dim] =
+                                V_d[dim + head * v_stride_head + seq * v_stride_seq + b * v_stride_batch];
+                        }
+                    });
                 });
-            });
+            }
         }
         V_d_f32 = V_d_f32_alloc;
     }
@@ -1084,22 +1122,30 @@ if (tile_kind == xmx_tile_kind::tile_dg2) {
 
     stream->wait();
     
-    // Scatter from temp output to correct layout
-    // Kernel writes: O_temp[head * N * HEAD_DIM + seq * HEAD_DIM + dim]
-    // Output layout: O[dim, head, seq] = dst_d[dim + head*HEAD_DIM + seq*n_heads*HEAD_DIM]
-    for (int64_t head = 0; head < n_heads; ++head) {
-        const int64_t n_elements = N * HEAD_DIM;
-        stream->submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
-                const int idx = it.get_id(0);
-                if (idx < n_elements) {
-                    const int64_t seq = idx / HEAD_DIM;
-                    const int64_t dim = idx % HEAD_DIM;
-                    dst_d[dim + head * HEAD_DIM + seq * n_heads * HEAD_DIM] = 
-                        O_temp[head * N * HEAD_DIM + seq * HEAD_DIM + dim];
-                }
+    // Scatter from temp output to correct layout using actual tensor strides
+    // Kernel writes: O_temp[head_total * N * V_HEAD_DIM + seq * V_HEAD_DIM + dim]
+    // where head_total = batch * n_heads_per_batch + head
+    // Output layout uses dst->nb[] strides to handle batch dimension properly
+    const int64_t dst_stride_seq = dst->nb[1] / sizeof(float);
+    const int64_t dst_stride_head = dst->nb[2] / sizeof(float);
+    const int64_t dst_stride_batch = dst->nb[3] / sizeof(float);
+    
+    for (int64_t b = 0; b < batch; ++b) {
+        for (int64_t head = 0; head < n_heads_per_batch; ++head) {
+            const int64_t head_total = b * n_heads_per_batch + head;
+            const int64_t n_elements = N * V_HEAD_DIM;
+            stream->submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
+                    const int idx = it.get_id(0);
+                    if (idx < n_elements) {
+                        const int64_t seq = idx / V_HEAD_DIM;
+                        const int64_t dim = idx % V_HEAD_DIM;
+                        dst_d[dim + head * dst_stride_head + seq * dst_stride_seq + b * dst_stride_batch] = 
+                            O_temp[head_total * N * V_HEAD_DIM + seq * V_HEAD_DIM + dim];
+                    }
+                });
             });
-        });
+        }
     }
     
     stream->wait();
