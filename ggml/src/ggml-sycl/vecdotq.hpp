@@ -388,7 +388,7 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K> {
         const uint8_t *    scs            = base + d_offset.first;
         const ggml_half2 * dms            = reinterpret_cast<const ggml_half2 *>(base + d_offset.second);
 
-        const int tid = iqs / 2; // 0..15
+        const int tid = iqs / 2;
         const int segment_pair_idx = tid / 4;
         const int bit_offset = (tid / 2) % 2;
         const int thread_in_segment = tid % 2;
@@ -433,35 +433,31 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
         const uint8_t *   base   = static_cast<const uint8_t *>(vbq);
         const uint8_t *   ql     = base + ibx_offset.first;
         const uint8_t *   qh     = base + ibx_offset.second;
-        const int8_t *    scales = reinterpret_cast<const int8_t *>(base + d_offset.first);
-        const ggml_half * d      = (const ggml_half *) (base + d_offset.second);
+        const int8_t *    scs    = reinterpret_cast<const int8_t *>(base + d_offset.first);
+        const ggml_half * d_ptr  = (const ggml_half *) (base + d_offset.second);
 
         const int bq8_idx = iqs / 4;
-        const int vl = get_int_from_uint8(ql, iqs);
+        const int thread_in_bq8 = iqs % 4;
 
-        const uint16_t qh_raw = *(const uint16_t *)(qh + 2 * iqs);
-        const uint8_t qh0 = qh_raw & 0xFF;
-        const uint8_t qh1 = qh_raw >> 8;
+        const float d = (float)(*d_ptr);
+        const float d8 = (float)bq8_1[bq8_idx].ds.x();
+        const int8_t * q8_ptr = bq8_1[bq8_idx].qs + thread_in_bq8 * 8;
 
-        const uint32_t vh = ((qh0 & 0x03) | ((qh0 & 0x0C) << 2)) |
-                            (((qh0 >> 4 & 0x03) | ((qh0 >> 4 & 0x0C) << 2)) << 8) |
-                            (((qh1 & 0x03) | ((qh1 & 0x0C) << 2)) << 16) |
-                            (((qh1 >> 4 & 0x03) | ((qh1 >> 4 & 0x0C) << 2)) << 24);
+        float sum = 0.0f;
+        for (int l = 0; l < 8; ++l) {
+            const int e_idx = iqs * 8 + l;
+            const uint8_t b_l = ql[e_idx / 2];
+            const int v_l = (e_idx % 2 == 0) ? (b_l & 0x0F) : (b_l >> 4);
 
-        const block_q8_1 * bq8i = bq8_1 + bq8_idx;
-        const int8_t * q8_b = bq8i->qs + (iqs % 4) * 8;
+            const uint8_t b_h = qh[e_idx / 4];
+            const int v_h = (b_h >> (2 * (e_idx % 4))) & 0x03;
 
-        int u[2];
-        u[0] = (q8_b[0] & 0xFF) | ((q8_b[2] & 0xFF) << 8) | ((q8_b[4] & 0xFF) << 16) | ((q8_b[6] & 0xFF) << 24);
-        u[1] = (q8_b[1] & 0xFF) | ((q8_b[3] & 0xFF) << 8) | ((q8_b[5] & 0xFF) << 16) | ((q8_b[7] & 0xFF) << 24);
+            const float scale = (float)scs[e_idx / 16];
+            const int q6 = (v_l | (v_h << 4)) - 32;
 
-        const float d8_val = (float)bq8i->ds.x();
-        float d8[2] = { d8_val, d8_val };
-
-        const int8_t sc = scales[iqs / 2];
-        const int8_t sc_vec[8] = { sc, 0, 0, 0, sc, 0, 0, 0 };
-
-        return vec_dot_q6_K_q8_1_impl_mmvq(vl, (int)vh, u, sc_vec, (float)(*d), d8);
+            sum += d * scale * (float)q6 * (float)q8_ptr[l] * d8;
+        }
+        return sum;
     }
 };
 
