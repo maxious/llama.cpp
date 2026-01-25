@@ -3157,7 +3157,6 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
     dpct::has_capability_or_fail(queue->get_device(), { sycl::aspect::fp16 });
 
     const sycl::half * src0_f16       = static_cast<const sycl::half *>(src0->data);
-    const size_t       type_size_src0 = ggml_type_size(src0->type);
     float *            dst_ddf  = static_cast<float *>(dst->data);
     const sycl::half * src1_f16       = static_cast<const sycl::half *>(src1->data);
     const size_t       type_size_src1 = ggml_type_size(src1->type);
@@ -3178,7 +3177,7 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
 
         // iterate tensor dims and find the slowest moving dim and stride
         int last_dim = 0;
-        int last_str = 0;
+        [[maybe_unused]] int last_str = 0;
         size_t largest_str = 0;
         for(int i = 0; i< 4; i++){
             // last stride is always the largest

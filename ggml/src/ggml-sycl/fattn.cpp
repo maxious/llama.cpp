@@ -182,6 +182,9 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     const float * Q_d_f32;
     const float * K_d_f32;
     const float * V_d_f32;
+    float * Q_d_f32_alloc = nullptr;
+    float * K_d_f32_alloc = nullptr;
+    float * V_d_f32_alloc = nullptr;
 
     dpct::queue_ptr stream = ctx.stream();
 
@@ -203,9 +206,9 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
         const sycl::half * V_d = (const sycl::half *) V->data;
 
         // Allocate F32 buffers on device
-        float * Q_d_f32_alloc = (float *) sycl::malloc_device(N * DQK * n_heads * sizeof(float), *stream);
-        float * K_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DQK * n_kv_heads * sizeof(float), *stream);
-        float * V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
+        Q_d_f32_alloc = (float *) sycl::malloc_device(N * DQK * n_heads * sizeof(float), *stream);
+        K_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DQK * n_kv_heads * sizeof(float), *stream);
+        V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
 
         // Get strides in elements for FP16
         const ptrdiff_t q_row_stride_f16 = Q->nb[1] / (ptrdiff_t)sizeof(sycl::half);
@@ -407,6 +410,13 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
 
     sycl::free(l_d, *stream);
     sycl::free(m_d, *stream);
+
+    // Free F16 dequantization buffers if allocated
+    if (is_f16) {
+        sycl::free(Q_d_f32_alloc, *stream);
+        sycl::free(K_d_f32_alloc, *stream);
+        sycl::free(V_d_f32_alloc, *stream);
+    }
 }
 
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
