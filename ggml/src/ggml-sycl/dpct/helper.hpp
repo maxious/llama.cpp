@@ -1849,6 +1849,14 @@ namespace dpct
     T permute_sub_group_by_xor(sycl::sub_group g, T x, unsigned int mask,
                                unsigned int logical_sub_group_size = 32)
     {
+        // Use standard SYCL 2020 permute_group_by_xor when logical_sub_group_size
+        // matches the physical sub-group size (common case). This avoids using
+        // sycl::select_from_group which requires GroupNonUniformArithmetic capability
+        // that can cause IGC compiler crashes on some Intel GPUs.
+        if (logical_sub_group_size >= g.get_local_linear_range()) {
+            return sycl::permute_group_by_xor(g, x, mask);
+        }
+        // Fallback for logical sub-groups smaller than physical sub-group
         unsigned int id = g.get_local_linear_id();
         unsigned int start_index =
             id / logical_sub_group_size * logical_sub_group_size;

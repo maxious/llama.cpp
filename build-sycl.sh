@@ -85,8 +85,8 @@ mkdir -p build-sycl
 cd build-sycl
 
 # Source oneAPI environment (required for SYCL and oneDNN)
-echo "Loading oneAPI environment..."
-source /opt/intel/oneapi/setvars.sh
+    echo "Loading oneAPI environment..."
+    source /opt/intel/oneapi/setvars.sh
 
 # Configure with SYCL backend
 echo "Configuring CMake..."
@@ -111,18 +111,19 @@ if [[ "$ENABLE_BF16" == true ]]; then
 fi
 
 if [[ "$ENABLE_ASAN" == true ]]; then
-    SANITIZER_FLAGS="${SANITIZER_FLAGS} -fsanitize=address -fno-omit-frame-pointer"
-    CMAKE_OPTS+=(-DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g")
-    CMAKE_OPTS+=(-DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address")
-    CMAKE_OPTS+=(-DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g")
-    echo "Enabling Address Sanitizer (ASAN)..."
-    echo ""
-    echo "IMPORTANT: For GPU memory issues, run with device-side ASAN:"
-    echo "  export UR_LAYER_ASAN_OPTIONS=\"quarantine_size_mb:16;redzone:64\""
-    echo "  ./build-sycl/bin/llama-cli -m model.gguf -p 'test'"
-    echo ""
-    echo "Device-side ASAN makes GPU execution sequential and may reduce workgroup size."
-fi
+        SANITIZER_FLAGS="${SANITIZER_FLAGS} -fsanitize=address -fno-omit-frame-pointer"
+        CMAKE_OPTS+=(-DCMAKE_CXX_FLAGS="-fsycl -fsanitize=address -fno-omit-frame-pointer -g")
+        CMAKE_OPTS+=(-DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address")
+        CMAKE_OPTS+=(-DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g")
+        echo "Enabling Address Sanitizer (ASAN)..."
+        echo ""
+        echo "IMPORTANT: For GPU memory issues, run with device-side ASAN:"
+        echo "  export UR_LAYER_ASAN_OPTIONS=\"quarantine_size_mb:16;redzone:64\""
+        echo "  export CLANG_TOOLCHAIN_PROGRAM_TIMEOUT=600"
+        echo "  ./build-sycl/bin/llama-cli -m model.gguf -p 'test'"
+        echo ""
+        echo "Device-side ASAN makes GPU execution sequential and may reduce workgroup size."
+    fi
 
 if [[ "$ENABLE_UBSAN" == true ]]; then
     SANITIZER_FLAGS="${SANITIZER_FLAGS} -fsanitize=undefined"
