@@ -9,7 +9,7 @@
 // (only first WARP_SIZE lanes do work, rest are idle but participate in reduction)
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
-                                  const int ncols, const int nrows, const sycl::nd_item<3> & nd_item) {
+                                  const int ncols, const int nrows, const int channel_nrows, const sycl::nd_item<3> & nd_item) {
     using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
     using block_traits = typename block_type::traits;
 
@@ -35,7 +35,7 @@ static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __r
         const int ibx = row * blocks_per_row + i;  // x block index
 
         const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
-        const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+        const auto d_offset  = block_type::get_d_offset(channel_nrows, ncols, ibx);
         // Y block index that aligns with ibx
         const int iby = i * block_type::block_to_q8_1_ratio();
 
@@ -67,7 +67,7 @@ static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __r
 // Specialized version for K-quant types that need QK_WARP_SIZE (32) sub-groups
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_K_reorder(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
-                                    const int ncols, const int nrows, const sycl::nd_item<3> & nd_item) {
+                                    const int ncols, const int nrows, const int channel_nrows, const sycl::nd_item<3> & nd_item) {
     using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
     using block_traits = typename block_type::traits;
 
@@ -93,7 +93,7 @@ static void mul_mat_vec_q_K_reorder(const void * __restrict__ vx, const void * _
         const int ibx = row * blocks_per_row + i;  // x block index
 
         const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
-        const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+        const auto d_offset  = block_type::get_d_offset(channel_nrows, ncols, ibx);
         // Y block index that aligns with ibx
         const int iby = i * block_type::block_to_q8_1_ratio();
 
@@ -641,7 +641,7 @@ static void mul_mat_vec_q_iq4_xs_q8_1(const void *__restrict__ vx,
 }
 
 static void reorder_mul_mat_vec_q4_0_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
-                                                    const int nrows, dpct::queue_ptr stream) {
+                                                    const int nrows, const int channel_nrows, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK4_0 == 0);
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y);
     // Use single workgroup per row for compatibility with all nrows values
@@ -651,7 +651,7 @@ static void reorder_mul_mat_vec_q4_0_q8_1_sycl(const void * vx, const void * vy,
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
-                             mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0>>(vx, vy, dst, ncols, nrows,
+                             mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0>>(vx, vy, dst, ncols, nrows, channel_nrows,
                                                                                            nd_item);
                          });
     });
@@ -863,7 +863,7 @@ static void mul_mat_vec_q4_K_q8_1_sycl(const void *vx, const void *vy,
 }
 
 static void reorder_mul_mat_vec_q4_k_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
-    const int nrows, dpct::queue_ptr stream) {
+    const int nrows, const int channel_nrows, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
 
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y);
@@ -875,7 +875,7 @@ static void reorder_mul_mat_vec_q4_k_q8_1_sycl(const void * vx, const void * vy,
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                             [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
                                 mul_mat_vec_q_K_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(vx, vy, dst, ncols,
-                                                                                            nrows, nd_item);
+                                                                                            nrows, channel_nrows, nd_item);
                             });
     });
 }
@@ -906,7 +906,7 @@ static void mul_mat_vec_q5_K_q8_1_sycl(const void *vx, const void *vy,
 }
 
 static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
-                                               const int nrows, dpct::queue_ptr stream) {
+                                               const int nrows, const int channel_nrows, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y);
     // Use single workgroup per row for small nrows, otherwise use 16 subgroups per workgroup
@@ -916,7 +916,7 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void * vx, const void * vy,
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
-                             mul_mat_vec_q_K_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>>(vx, vy, dst, ncols, nrows,
+                             mul_mat_vec_q_K_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>>(vx, vy, dst, ncols, nrows, channel_nrows,
                                                                                            nd_item);
                          });
     });
@@ -1150,6 +1150,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
     GGML_ASSERT(ne10 % QK8_1 == 0);
 
     const int64_t ne00     = src0->ne[0];
+    const int64_t ne01     = src0->ne[1];
     const int64_t row_diff = row_high - row_low;
 
     int id;
@@ -1168,7 +1169,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
                     GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_0_q8_1_sycl\n");
-                    reorder_mul_mat_vec_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                    reorder_mul_mat_vec_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, ne01, stream);
                 } else {
                     GGML_SYCL_DEBUG("Calling mul_mat_vec_q4_0_q8_1_sycl\n");
                     mul_mat_vec_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
@@ -1196,7 +1197,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
                     GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_sycl\n");
-                    reorder_mul_mat_vec_q4_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                    reorder_mul_mat_vec_q4_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, ne01, stream);
                 } else {
                     GGML_SYCL_DEBUG("Calling mul_mat_vec_q4_K_q8_1_sycl\n");
                     mul_mat_vec_q4_K_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
@@ -1209,7 +1210,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
                     GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q6_k_q8_1_sycl\n");
-                    reorder_mul_mat_vec_q6_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                    reorder_mul_mat_vec_q6_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, ne01, stream);
                 } else {
                     GGML_SYCL_DEBUG("Calling mul_mat_vec_q6_k_q8_1_sycl\n");
                     mul_mat_vec_q6_K_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);

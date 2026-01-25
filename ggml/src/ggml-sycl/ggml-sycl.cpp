@@ -3442,6 +3442,12 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
         return;
     }
 
+    // Disable reorder for split tensors as it's not supported correctly
+    const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
+    if (split) {
+        return;
+    }
+
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
     if (!extra || extra->optimized_feature.reorder) {
         return;  // Skip permutations and already reordered tensors
@@ -3466,6 +3472,7 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
     }
 
     reorder_qw(src0, ctx->stream());
+    ctx->stream()->wait();
     extra->optimized_feature.reorder = true;  // Used to decode/dequan in next steps and avoid re-reordering
 }
 
