@@ -69,15 +69,13 @@ inline bool ggml_sycl_flash_attn_has_xmx(sycl::device device) {
 #endif
 }
 
+#ifdef SYCL_EXT_COOPERATIVE_MATRICES
 // Get the appropriate tile kind for flash attention XMX kernel
 // DG2/Arc uses 8x8 tiles, PVC uses 16x16 tiles
 inline xmx_tile_kind ggml_sycl_flash_attn_get_tile_kind(sycl::device device) {
-#ifdef SYCL_EXT_COOPERATIVE_MATRICES
     return ggml_sycl_get_tile_kind(device);
-#else
-    return xmx_tile_kind::tile_dg2;  // Fallback, won't be used
-#endif
 }
+#endif
 
 // Check if device should use oneMKL BLAS for flash attention (fallback path)
 // oneMKL is only used when XMX is not available or explicitly disabled.
@@ -124,8 +122,9 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
         return false;
     }
 
-    // Sinks (attention sinks / StreamingLLM) not yet implemented in SYCL flash attention
-    if (sinks != nullptr) {
+    // Sinks (attention sinks / StreamingLLM) supported in MKL path
+    // Sinks tensor has shape [n_heads] - one float per head
+    if (sinks != nullptr && sinks->type != GGML_TYPE_F32) {
         return false;
     }
 
@@ -1189,6 +1188,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
 
     const int64_t N = Q->ne[1];       // Query sequence length
     const int64_t N_kv = K->ne[1];    // Key/Value sequence length (can differ from N)
@@ -1365,6 +1365,13 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
         }
     }
 
+    // Get sinks pointer if available (attention sinks / StreamingLLM)
+    // Sinks tensor has shape [n_heads] - one float per head
+    const float * sinks_d = nullptr;
+    if (sinks != nullptr && sinks->data != nullptr) {
+        sinks_d = (const float *) sinks->data;
+    }
+
     // Wait for all data preparation to complete (single sync point)
     stream->wait();
 
@@ -1437,7 +1444,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // PHASE 2: Fused softmax for ALL heads in parallel
     // ============================================================
     // Each work-item handles one (head, query_position) pair
-    // Fused: mask + max + exp + sum + normalize
+    // Fused: mask + sinks + max + exp + sum + normalize
     stream->submit([&](sycl::handler& cgh) {
         cgh.parallel_for(sycl::range<1>(n_heads * N), [=](sycl::id<1> idx) {
             const int64_t head = idx[0] / N;
@@ -1456,12 +1463,25 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 row_max = sycl::fmax(row_max, s_val);
             }
             
+            // Include sink value in max computation (attention sinks / StreamingLLM)
+            // Sinks act as if there's a virtual "sink token" with pre-computed attention score
+            float sink_val = 0.0f;
+            if (sinks_d != nullptr) {
+                sink_val = sinks_d[head];
+                row_max = sycl::fmax(row_max, sink_val);
+            }
+            
             // Pass 2: Compute exp and sum
             float sum = 0.0f;
             for (int64_t k = 0; k < N_kv; ++k) {
                 float exp_val = sycl::exp(sycl::fmax(S_row[k] - row_max, -20.0f));
                 S_row[k] = exp_val;
                 sum += exp_val;
+            }
+            
+            // Add sink contribution to sum (exp(sink - max))
+            if (sinks_d != nullptr) {
+                sum += sycl::exp(sycl::fmax(sink_val - row_max, -20.0f));
             }
             
             // Pass 3: Normalize
@@ -1541,6 +1561,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
 void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * sinks = dst->src[4];
 
 #ifdef GGML_SYCL_USE_INTEL_ONEMKL
     // Check if oneMKL is forced first (before XMX check)
@@ -1567,7 +1588,11 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         return;
     }
 
-    if (sycl_use_mkl) {
+    // Sinks (attention sinks / StreamingLLM) only supported in MKL path
+    // XMX cooperative matrix kernels don't support sinks yet
+    const bool use_mkl_for_sinks = (sinks != nullptr);
+
+    if (sycl_use_mkl || use_mkl_for_sinks) {
         if (DQK == DV) {
             switch (DQK) {
                 case 32:
