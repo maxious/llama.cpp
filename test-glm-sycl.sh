@@ -8,7 +8,7 @@ export UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
 export ZES_ENABLE_SYSMAN=1
 #export ONEAPI_DEVICE_SELECTOR=level_zero:0
 ./build-sycl/bin/llama-completion \
-    --model ~/koboldcpp/GLM-4.7-Flash-REAP-23B-A3B-Q8_0.gguf --mmap \
+    --model ~/koboldcpp/GLM-4.7-Flash-REAP-23B-A3B-Q8_0.gguf \
     --prompt "What is the capital of france?" --n-predict 8  --no-conversation \
     --ctx-size 512 --flash-attn on \
     --batch-size 64 --ubatch-size 64 \

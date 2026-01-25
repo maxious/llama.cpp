@@ -1308,6 +1308,11 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
     float * O_d = (float *) dst->data;
 
+    // Output tensor layout from ggml_flash_attn_ext: ne = { DV, n_heads, N, batch }
+    // So nb[1] = stride between heads, nb[2] = stride between sequence positions
+    const int64_t o_stride_head = dst->nb[1] / sizeof(float);  // DV for contiguous
+    const int64_t o_stride_seq = dst->nb[2] / sizeof(float);   // DV * n_heads for contiguous
+
     float scale = 1.0f;
     std::memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
@@ -1493,18 +1498,15 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // ============================================================
     // PHASE 4: Scatter output to correct layout for ALL heads
     // ============================================================
-    // Output layout: O[d, h, n] = O_d[d + h*DV + n*n_heads*DV]
-    // O_temp layout: O_temp[head][n][d] = O_temp[head*N*DV + n*DV + d]
     stream->submit([&](sycl::handler& cgh) {
         cgh.parallel_for(sycl::range<1>(n_heads * N * DV), [=](sycl::id<1> idx) {
             const int64_t i = idx[0];
             const int64_t head = i / (N * DV);
             const int64_t rem = i % (N * DV);
-            const int64_t row = rem / DV;   // sequence position
-            const int64_t col = rem % DV;   // head dimension
-            
-            // O_temp[head, row, col] -> O_d[col + head*DV + row*n_heads*DV]
-            O_d[col + head * DV + row * n_heads * DV] = O_temp[i];
+            const int64_t row = rem / DV;
+            const int64_t col = rem % DV;
+
+            O_d[col + head * o_stride_head + row * o_stride_seq] = O_temp[i];
         });
     });
 
@@ -1550,21 +1552,37 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     }
 
     if (sycl_use_mkl) {
-        const int64_t padded_d = get_padded_head_size(DQK);
-        
-        if (DQK == padded_d && DQK == DV) {
+        if (DQK == DV) {
             switch (DQK) {
                 case 32:
                     ggml_sycl_op_flash_attn_mkl<32, 32>(ctx, dst);
                     return;
+                case 40:
+                    ggml_sycl_op_flash_attn_mkl<40, 40>(ctx, dst);
+                    return;
+                case 48:
+                    ggml_sycl_op_flash_attn_mkl<48, 48>(ctx, dst);
+                    return;
+                case 56:
+                    ggml_sycl_op_flash_attn_mkl<56, 56>(ctx, dst);
+                    return;
                 case 64:
                     ggml_sycl_op_flash_attn_mkl<64, 64>(ctx, dst);
+                    return;
+                case 72:
+                    ggml_sycl_op_flash_attn_mkl<72, 72>(ctx, dst);
                     return;
                 case 80:
                     ggml_sycl_op_flash_attn_mkl<80, 80>(ctx, dst);
                     return;
+                case 88:
+                    ggml_sycl_op_flash_attn_mkl<88, 88>(ctx, dst);
+                    return;
                 case 96:
                     ggml_sycl_op_flash_attn_mkl<96, 96>(ctx, dst);
+                    return;
+                case 104:
+                    ggml_sycl_op_flash_attn_mkl<104, 104>(ctx, dst);
                     return;
                 case 112:
                     ggml_sycl_op_flash_attn_mkl<112, 112>(ctx, dst);
@@ -1582,12 +1600,12 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                     ggml_sycl_op_flash_attn_mkl<576, 576>(ctx, dst);
                     return;
                 default:
+                    GGML_SYCL_DEBUG("ggml_sycl: oneMKL not implemented for head size DQK=%ld DV=%ld\n", DQK, DV);
                     break;
             }
-        } else if (padded_d > 0) {
-            GGML_SYCL_DEBUG("ggml_sycl: oneMKL path does not support padded head sizes, falling back\n");
+        } else {
+            GGML_SYCL_DEBUG("ggml_sycl: oneMKL path requires DQK==DV, got DQK=%ld DV=%ld\n", DQK, DV);
         }
-        GGML_SYCL_DEBUG("ggml_sycl: oneMKL flash attention not supported for head sizes DQK=%ld DV=%ld, falling back\n", DQK, DV);
     }
 #endif
 

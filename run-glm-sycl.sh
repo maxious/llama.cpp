@@ -31,7 +31,7 @@ fi
 #export ONEAPI_DEVICE_SELECTOR=level_zero:0
 
 ./build-sycl/bin/llama-server \
-    --model ~/koboldcpp/GLM-4.7-Flash-REAP-23B-A3B-Q8_0.gguf --mmap \
+    --model ~/koboldcpp/GLM-4.7-Flash-REAP-23B-A3B-Q8_0.gguf \
     --port 5000 --host 0.0.0.0 --jinja \
     --threads -1 \
     --cache-ram -1 \
