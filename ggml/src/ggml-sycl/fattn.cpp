@@ -268,8 +268,28 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
             });
         }
 
-        if (V_is_K_view) {
+        if (V_is_K_view && DQK == DV) {
+            // V is a view of K and they have the same head dimension - can reuse directly
             V_d_f32_alloc = K_d_f32_alloc;
+        } else if (V_is_K_view && DQK != DV) {
+            // MLA case: V is a view of K but with different head dimension
+            // K layout is [kv_lora_scaled (DV), pe (DQK-DV)] = DQK total
+            // V uses only the first DV elements of each K row
+            V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
+            for (int64_t head = 0; head < n_kv_heads; ++head) {
+                const int64_t n_elements = N_kv * DV;
+                stream->submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
+                        const int idx = it.get_id(0);
+                        if (idx < n_elements) {
+                            const int64_t row = idx / DV;
+                            const int64_t col = idx % DV;
+                            // Read from K's first DV elements per row
+                            V_d_f32_alloc[head * N_kv * DV + idx] = K_d_f32_alloc[head * N * DQK + row * DQK + col];
+                        }
+                    });
+                });
+            }
         } else {
             const sycl::half * V_d = (const sycl::half *) V->data;
             const ptrdiff_t v_row_stride_f16 = V->nb[1] / (ptrdiff_t)sizeof(sycl::half);
@@ -302,8 +322,31 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
         // F32 case - direct pointer cast
         Q_d_f32 = (const float *) Q->data;
         K_d_f32 = (const float *) K->data;
-        if (V_is_K_view) {
+        if (V_is_K_view && DQK == DV) {
             V_d_f32 = K_d_f32;
+        } else if (V_is_K_view && DQK != DV) {
+            // MLA case: V is a view of K but with different head dimension
+            // Need to extract first DV elements from each K row
+            V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
+            const float * K_f32 = (const float *) K->data;
+            const ptrdiff_t k_row_stride = K->nb[1] / (ptrdiff_t)sizeof(float);
+            const ptrdiff_t k_head_stride = K->nb[2] / (ptrdiff_t)sizeof(float);
+            for (int64_t head = 0; head < n_kv_heads; ++head) {
+                const int64_t n_elements = N_kv * DV;
+                stream->submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
+                        const int idx = it.get_id(0);
+                        if (idx < n_elements) {
+                            const int64_t row = idx / DV;
+                            const int64_t col = idx % DV;
+                            V_d_f32_alloc[head * N_kv * DV + idx] = 
+                                K_f32[head * k_head_stride + row * k_row_stride + col];
+                        }
+                    });
+                });
+            }
+            stream->wait();
+            V_d_f32 = V_d_f32_alloc;
         } else {
             V_d_f32 = (const float *) V->data;
         }
@@ -574,8 +617,30 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
         K_d_f32 = K_d_f32_alloc;
     }
     
-    if (V_is_K_view) {
+    if (V_is_K_view && DQK == DV) {
+        // V is a view of K and they have the same head dimension - can reuse directly
         V_d_f32 = K_d_f32;
+    } else if (V_is_K_view && DQK != DV) {
+        // MLA case: V is a view of K but with different head dimension
+        // K layout is [kv_lora_scaled (DV), pe (DQK-DV)] = DQK total
+        // V uses only the first DV elements of each K row
+        V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
+        for (int64_t head = 0; head < n_kv_heads; ++head) {
+            const int64_t n_elements = N_kv * DV;
+            stream->submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
+                    const int idx = it.get_id(0);
+                    if (idx < n_elements) {
+                        const int64_t seq = idx / DV;
+                        const int64_t dim = idx % DV;
+                        // Read from K's reordered layout (first DV elements per row)
+                        V_d_f32_alloc[head * N_kv * DV + seq * DV + dim] = 
+                            K_d_f32[head * N_kv * DQK + seq * DQK + dim];
+                    }
+                });
+            });
+        }
+        V_d_f32 = V_d_f32_alloc;
     } else if (v_is_f16) {
         const sycl::half * V_d = (const sycl::half *) V->data;
         V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
@@ -1204,8 +1269,28 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
     }
     K_d_f32 = K_d_f32_alloc;
 
-    if (V_is_K_view) {
+    if (V_is_K_view && DQK == DV) {
+        // V is a view of K and they have the same head dimension - can reuse directly
         V_d_f32 = K_d_f32;
+    } else if (V_is_K_view && DQK != DV) {
+        // MLA case: V is a view of K but with different head dimension
+        // K layout is [kv_lora_scaled (DV), pe (DQK-DV)] = DQK total
+        // V uses only the first DV elements of each K row
+        V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
+        stream->submit([&](sycl::handler& cgh) {
+            const int64_t total = N_kv * DV * n_kv_heads;
+            cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
+                const int idx = it.get_id(0);
+                if (idx >= total) return;
+                const int64_t head = idx / (N_kv * DV);
+                const int64_t rem = idx % (N_kv * DV);
+                const int64_t n = rem / DV;
+                const int64_t d = rem % DV;
+                // Read from K's reordered layout: K_d_f32[head * N_kv * DQK + n * DQK + d]
+                V_d_f32_alloc[idx] = K_d_f32[head * N_kv * DQK + n * DQK + d];
+            });
+        });
+        V_d_f32 = V_d_f32_alloc;
     } else {
         V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
         if (v_is_f16) {
