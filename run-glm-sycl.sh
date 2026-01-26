@@ -13,6 +13,8 @@ source /opt/intel/oneapi/setvars.sh intel64
 export UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
 # Enable SYSMAN for better memory management
 export ZES_ENABLE_SYSMAN=1
+# Disable shared USM - causes incorrect output with multi-GPU
+export GGML_SYCL_SHARED_USM=0
 
 # Check for required GPU group permissions
 if ! groups | grep -qwE "(render|video)"; then
@@ -31,11 +33,9 @@ fi
 #export ONEAPI_DEVICE_SELECTOR=level_zero:0
 
 ./build-sycl/bin/llama-server \
-    --model ~/koboldcpp/GLM-4.7-Flash-REAP-23B-A3B-Q8_0.gguf \
+    --model koboldcpp/GLM-4.7-Flash-SynthLabs-REAP-25-Q4_K_M.gguf \
     --port 5000 --host 0.0.0.0 --jinja \
     --threads -1 \
     --cache-ram -1 \
     --fit on \
-    --batch-size 16 --ubatch-size 16 \
-    --temp 0.7 --top-p 1.0 --min-p 0.01
-
+     --temp 0.7 --top-p 1.0 --min-p 0.01
