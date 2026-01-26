@@ -14,7 +14,7 @@ export UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
 # Enable SYSMAN for better memory management
 export ZES_ENABLE_SYSMAN=1
 # Disable shared USM - causes incorrect output with multi-GPU
-export GGML_SYCL_SHARED_USM=0
+#export GGML_SYCL_SHARED_USM=0
 
 # Check for required GPU group permissions
 if ! groups | grep -qwE "(render|video)"; then
@@ -30,12 +30,12 @@ fi
 # SINGLE GPU MODE OPTION
 # Uncomment the line below to force usage of only the first GPU (Device 0)
 # This helps rule out multi-GPU synchronization/P2P issues
-#export ONEAPI_DEVICE_SELECTOR=level_zero:0
+export ONEAPI_DEVICE_SELECTOR=level_zero:0
 
 ./build-sycl/bin/llama-server \
-    --model koboldcpp/GLM-4.7-Flash-SynthLabs-REAP-25-Q4_K_M.gguf \
+    --model ../koboldcpp/GLM-4.7-Flash-SynthLabs-REAP-25-Q4_K_M.gguf \
     --port 5000 --host 0.0.0.0 --jinja \
     --threads -1 \
     --cache-ram -1 \
-    --fit on \
+    --fit on  \
      --temp 0.7 --top-p 1.0 --min-p 0.01
