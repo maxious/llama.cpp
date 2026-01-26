@@ -194,7 +194,7 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     const ggml_tensor * V    = dst->src[2];
 
     const bool is_f16 = (Q->type == GGML_TYPE_F16);
-    const bool V_is_K_view = V->op == GGML_OP_VIEW && V->src[0] == K && V->data == K->data;
+    const bool V_is_K_view = V->view_src && V->view_offs == 0 && (V->view_src == K || V->view_src == K->view_src);
 
     const float * Q_d_f32;
     const float * K_d_f32;
@@ -460,7 +460,7 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
     const bool k_is_f16 = (K->type == GGML_TYPE_F16);
     const bool v_is_f16 = (V->type == GGML_TYPE_F16);
 
-    const bool V_is_K_view = V->op == GGML_OP_VIEW && V->src[0] == K && V->data == K->data;
+    const bool V_is_K_view = V->view_src && V->view_offs == 0 && (V->view_src == K || V->view_src == K->view_src);
 
     const float * Q_d_f32;
     const float * K_d_f32;
@@ -771,7 +771,7 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
     const bool k_is_f16 = (K->type == GGML_TYPE_F16);
     const bool v_is_f16 = (V->type == GGML_TYPE_F16);
 
-    const bool V_is_K_view = V->op == GGML_OP_VIEW && V->src[0] == K && V->data == K->data;
+    const bool V_is_K_view = V->view_src && V->view_offs == 0 && (V->view_src == K || V->view_src == K->view_src);
 
     const float * Q_d_f32;
     const float * K_d_f32;
@@ -1123,7 +1123,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const bool k_is_f16 = (K->type == GGML_TYPE_F16);
     const bool v_is_f16 = (V->type == GGML_TYPE_F16);
 
-    const bool V_is_K_view = V->op == GGML_OP_VIEW && V->src[0] == K && V->data == K->data;
+    const bool V_is_K_view = V->view_src && V->view_offs == 0 && (V->view_src == K || V->view_src == K->view_src);
 
     const float * Q_d_f32;
     const float * K_d_f32;
