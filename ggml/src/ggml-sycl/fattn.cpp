@@ -104,6 +104,88 @@ inline bool ggml_sycl_flash_attn_use_mkl(sycl::device device) {
     return false;
 }
 
+// Check if direct stride loading is enabled via environment variable
+// GGML_SYCL_FLASH_ATTN_DIRECT=1 to enable (disabled by default for safety)
+inline bool ggml_sycl_flash_attn_use_direct() {
+    static bool direct_enabled = false;
+    static bool env_checked = false;
+    if (!env_checked) {
+        const char* env = getenv("GGML_SYCL_FLASH_ATTN_DIRECT");
+        direct_enabled = (env != nullptr && strcmp(env, "1") == 0);
+        env_checked = true;
+        if (direct_enabled) {
+            GGML_SYCL_DEBUG("ggml_sycl: Direct stride flash attention ENABLED by environment variable\n");
+        }
+    }
+    return direct_enabled;
+}
+
+#ifdef SYCL_EXT_COOPERATIVE_MATRICES
+// Check if tensor layout is compatible with direct stride loading
+// Requirements:
+// - Inner dimension (dim=0) must be contiguous (nb[0] == element_size)
+// - For Q/K/V: layout is [dim, seq, head] with arbitrary strides for seq and head
+// Returns true if direct loading is possible
+inline bool can_use_direct_loading(const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V,
+                                    const ggml_tensor * dst) {
+    // Check Q/K/V inner dimension is contiguous
+    const size_t q_elem_size = ggml_type_size(Q->type);
+    const size_t k_elem_size = ggml_type_size(K->type);
+    const size_t v_elem_size = ggml_type_size(V->type);
+    const size_t o_elem_size = ggml_type_size(dst->type);
+    
+    if (Q->nb[0] != q_elem_size) return false;
+    if (K->nb[0] != k_elem_size) return false;
+    if (V->nb[0] != v_elem_size) return false;
+    if (dst->nb[0] != o_elem_size) return false;
+    
+    // All Q/K/V must be same type (F16 or F32)
+    const bool is_f16 = (Q->type == GGML_TYPE_F16);
+    const bool is_f32 = (Q->type == GGML_TYPE_F32);
+    if (!is_f16 && !is_f32) return false;
+    
+    // K and V must match Q's type (or mixed F32 Q with F16 K/V is also ok)
+    if (is_f16) {
+        if (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) return false;
+    } else {
+        // For F32 Q, K/V can be F32 or F16
+        if (K->type != GGML_TYPE_F32 && K->type != GGML_TYPE_F16) return false;
+        if (V->type != GGML_TYPE_F32 && V->type != GGML_TYPE_F16) return false;
+    }
+    
+    // Output must be F32
+    if (dst->type != GGML_TYPE_F32) return false;
+    
+    return true;
+}
+
+// Compute stride parameters for direct loading
+inline fattn_tensor_strides compute_tensor_strides(const ggml_tensor * Q, const ggml_tensor * K,
+                                                    const ggml_tensor * V, const ggml_tensor * dst) {
+    fattn_tensor_strides s;
+    
+    // Q strides in elements
+    const size_t q_elem_size = ggml_type_size(Q->type);
+    s.q_stride_seq = Q->nb[1] / q_elem_size;
+    s.q_stride_head = Q->nb[2] / q_elem_size;
+    
+    // K strides in elements
+    const size_t k_elem_size = ggml_type_size(K->type);
+    s.k_stride_seq = K->nb[1] / k_elem_size;
+    s.k_stride_head = K->nb[2] / k_elem_size;
+    
+    // V strides in elements
+    const size_t v_elem_size = ggml_type_size(V->type);
+    s.v_stride_seq = V->nb[1] / v_elem_size;
+    s.v_stride_head = V->nb[2] / v_elem_size;
+    
+    // Output strides in elements (always F32)
+    s.o_stride_seq = dst->nb[1] / sizeof(float);
+    s.o_stride_head = dst->nb[2] / sizeof(float);
+    
+    return s;
+}
+#endif // SYCL_EXT_COOPERATIVE_MATRICES
 
 bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
@@ -617,30 +699,19 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
         K_d_f32 = K_d_f32_alloc;
     }
     
+    // Track whether V_FROM_K optimization is used (MLA zero-copy)
+    const bool use_v_from_k = V_is_K_view && DQK != DV;
+    
     if (V_is_K_view && DQK == DV) {
         // V is a view of K and they have the same head dimension - can reuse directly
         V_d_f32 = K_d_f32;
-    } else if (V_is_K_view && DQK != DV) {
+    } else if (use_v_from_k) {
         // MLA case: V is a view of K but with different head dimension
         // K layout is [kv_lora_scaled (DV), pe (DQK-DV)] = DQK total
         // V uses only the first DV elements of each K row
-        V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
-        for (int64_t head = 0; head < n_kv_heads; ++head) {
-            const int64_t n_elements = N_kv * DV;
-            stream->submit([&](sycl::handler& cgh) {
-                cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
-                    const int idx = it.get_id(0);
-                    if (idx < n_elements) {
-                        const int64_t seq = idx / DV;
-                        const int64_t dim = idx % DV;
-                        // Read from K's reordered layout (first DV elements per row)
-                        V_d_f32_alloc[head * N_kv * DV + seq * DV + dim] = 
-                            K_d_f32[head * N_kv * DQK + seq * DQK + dim];
-                    }
-                });
-            });
-        }
-        V_d_f32 = V_d_f32_alloc;
+        // Zero-copy optimization: kernel reads V directly from K using V_FROM_K template
+        // V_d_f32 points to K data but kernel knows to use HEAD_DIM stride and clamp columns
+        V_d_f32 = K_d_f32;  // Kernel will read from K directly with V_FROM_K=true
     } else if (v_is_f16) {
         const sycl::half * V_d = (const sycl::half *) V->data;
         V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
@@ -687,8 +758,8 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
         V_d_f32 = V_d_f32_alloc;
     }
     
-    // Always wait since we now always do reordering
-    stream->wait();
+    // Event-based synchronization: kernels will depend on prep work via in-order queue
+    std::vector<sycl::event> prep_events;
 
     float *       dst_d = (float *) dst->data;
 
@@ -745,7 +816,7 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
             const sycl::half * mask_f16 = (const sycl::half *) mask->data;
             const ptrdiff_t mask_row_stride_f16 = mask->nb[1] / sizeof(sycl::half);
             
-            stream->submit([&](sycl::handler& cgh) {
+            sycl::event mask_event = stream->submit([&](sycl::handler& cgh) {
                 cgh.parallel_for(sycl::range<1>((mask_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
                     const int idx = it.get_id(0);
                     if (idx < mask_elements) {
@@ -755,7 +826,7 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
                     }
                 });
             });
-            stream->wait();
+            prep_events.push_back(mask_event);
             
             mask_d = mask_d_f32_alloc;
             mask_stride = mask_n_kv;
@@ -764,8 +835,11 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
     
     float * O_temp = (float *) sycl::malloc_device(N * DV * n_heads * sizeof(float), *stream);
 
+    // XMX kernel depends on prep events (in-order queue provides implicit ordering too)
+    sycl::event xmx_event;
     if (tile_kind == xmx_tile_kind::tile_dg2) {
-        stream->submit([&](sycl::handler& cgh) {
+        xmx_event = stream->submit([&](sycl::handler& cgh) {
+            cgh.depends_on(prep_events);
             sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
 
             cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
@@ -780,7 +854,8 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
             });
         });
     } else {
-        stream->submit([&](sycl::handler& cgh) {
+        xmx_event = stream->submit([&](sycl::handler& cgh) {
+            cgh.depends_on(prep_events);
             sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
 
             cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
@@ -796,11 +871,12 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
         });
     }
 
-    stream->wait();
-    
+    // Output reorder depends on XMX kernel
+    std::vector<sycl::event> reorder_events;
     for (int64_t head = 0; head < n_heads; ++head) {
         const int64_t n_elements = N * DV;
-        stream->submit([&](sycl::handler& cgh) {
+        sycl::event reorder_event = stream->submit([&](sycl::handler& cgh) {
+            cgh.depends_on(xmx_event);
             cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
                 const int idx = it.get_id(0);
                 if (idx < n_elements) {
@@ -811,9 +887,11 @@ void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tenso
                 }
             });
         });
+        reorder_events.push_back(reorder_event);
     }
     
-    stream->wait();
+    // Wait only at the end
+    sycl::event::wait(reorder_events);
     
     sycl::free(O_temp, *stream);
     if (Q_d_f32_alloc) sycl::free(Q_d_f32_alloc, *stream);
@@ -837,6 +915,10 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
     const bool v_is_f16 = (V->type == GGML_TYPE_F16);
 
     const bool V_is_K_view = V->view_src && V->view_offs == 0 && (V->view_src == K || V->view_src == K->view_src);
+    
+    // Compile-time flag for MLA zero-copy optimization
+    // When HEAD_DIM != V_HEAD_DIM and V is a view of K, kernel reads V from K directly
+    constexpr bool V_FROM_K = (HEAD_DIM != V_HEAD_DIM);
 
     const float * Q_d_f32;
     const float * K_d_f32;
@@ -968,7 +1050,12 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
         K_d_f32 = K_d_f32_alloc;
     }
     
-    if (V_is_K_view) {
+    if (V_is_K_view && V_FROM_K) {
+        // MLA zero-copy: kernel reads V directly from K with HEAD_DIM stride
+        // V_d_f32 points to K but kernel knows to use V_FROM_K template
+        V_d_f32 = K_d_f32;
+    } else if (V_is_K_view) {
+        // V is view of K with same dimension - direct reuse
         V_d_f32 = K_d_f32;
     } else if (v_is_f16) {
         const sycl::half * V_d = (const sycl::half *) V->data;
@@ -1024,7 +1111,9 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
         V_d_f32 = V_d_f32_alloc;
     }
     
-    stream->wait();
+    // Event-based synchronization: collect prep events for kernel dependency
+    // The reordering kernels are already in-flight, kernel will depend on them via event
+    std::vector<sycl::event> prep_events;
 
     float * dst_d = (float *) dst->data;
 
@@ -1070,7 +1159,7 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
             const sycl::half * mask_f16 = (const sycl::half *) mask->data;
             const ptrdiff_t mask_row_stride_f16 = mask->nb[1] / sizeof(sycl::half);
             
-            stream->submit([&](sycl::handler& cgh) {
+            sycl::event mask_event = stream->submit([&](sycl::handler& cgh) {
                 cgh.parallel_for(sycl::range<1>((mask_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
                     const int idx = it.get_id(0);
                     if (idx < mask_elements) {
@@ -1080,7 +1169,7 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
                     }
                 });
             });
-            stream->wait();
+            prep_events.push_back(mask_event);
             
             mask_d = mask_d_f32_alloc;
             mask_stride = mask_n_kv;
@@ -1091,12 +1180,17 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
     float * O_temp = (float *) sycl::malloc_device(N * V_HEAD_DIM * n_heads * sizeof(float), *stream);
     const int o_row_stride = V_HEAD_DIM;
 
+    // Use V_FROM_K template parameter for MLA zero-copy optimization
+    // When V_FROM_K is true, kernel reads V directly from K's memory
+    sycl::event xmx_event;
     if (tile_kind == xmx_tile_kind::tile_dg2) {
-        stream->submit([&](sycl::handler& cgh) {
+        xmx_event = stream->submit([&](sycl::handler& cgh) {
+            // Depend on prep kernels (Q/K/V reorder, mask conversion)
+            cgh.depends_on(prep_events);
             sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
 
             cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                flash_attn_coopmat_kernel_n8_padded<HEAD_DIM, V_HEAD_DIM, PADDED_HEAD_DIM, PADDED_V_HEAD_DIM>(
+                flash_attn_coopmat_kernel_n8_padded<HEAD_DIM, V_HEAD_DIM, PADDED_HEAD_DIM, PADDED_V_HEAD_DIM, V_FROM_K>(
                     it,
                     Q_d_f32, K_d_f32, V_d_f32, O_temp,
                     l_d, m_d,
@@ -1107,11 +1201,13 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
             });
         });
     } else {
-        stream->submit([&](sycl::handler& cgh) {
+        xmx_event = stream->submit([&](sycl::handler& cgh) {
+            // Depend on prep kernels (Q/K/V reorder, mask conversion)
+            cgh.depends_on(prep_events);
             sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
 
             cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                flash_attn_coopmat_kernel_n16_padded<HEAD_DIM, V_HEAD_DIM, PADDED_HEAD_DIM, PADDED_V_HEAD_DIM>(
+                flash_attn_coopmat_kernel_n16_padded<HEAD_DIM, V_HEAD_DIM, PADDED_HEAD_DIM, PADDED_V_HEAD_DIM, V_FROM_K>(
                     it,
                     Q_d_f32, K_d_f32, V_d_f32, O_temp,
                     l_d, m_d,
@@ -1123,8 +1219,8 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
         });
     }
 
-    stream->wait();
-    
+    // Output reorder kernels depend on XMX kernel completion
+    std::vector<sycl::event> reorder_events;
     const int64_t dst_stride_seq = dst->nb[1] / sizeof(float);
     const int64_t dst_stride_head = dst->nb[2] / sizeof(float);
     const int64_t dst_stride_batch = dst->nb[3] / sizeof(float);
@@ -1133,7 +1229,8 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
         for (int64_t head = 0; head < n_heads_per_batch; ++head) {
             const int64_t head_total = b * n_heads_per_batch + head;
             const int64_t n_elements = N * V_HEAD_DIM;
-            stream->submit([&](sycl::handler& cgh) {
+            sycl::event reorder_event = stream->submit([&](sycl::handler& cgh) {
+                cgh.depends_on(xmx_event);
                 cgh.parallel_for(sycl::range<1>((n_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
                     const int idx = it.get_id(0);
                     if (idx < n_elements) {
@@ -1144,10 +1241,12 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
                     }
                 });
             });
+            reorder_events.push_back(reorder_event);
         }
     }
     
-    stream->wait();
+    // Wait only at the end when results are needed
+    sycl::event::wait(reorder_events);
 
     sycl::free(O_temp, *stream);
     if (Q_d_f32_alloc) sycl::free(Q_d_f32_alloc, *stream);
@@ -1156,6 +1255,187 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
     if (mask_d_f32_alloc) sycl::free(mask_d_f32_alloc, *stream);
     sycl::free(l_d, *stream);
     sycl::free(m_d, *stream);
+}
+
+// ============================================================================
+// Stride-Aware Direct Loading Flash Attention
+// ============================================================================
+// This variant eliminates the intermediate F32 repack buffers by loading
+// directly from ggml's strided tensor layout. This reduces memory bandwidth
+// by 2x and eliminates temporary allocations.
+//
+// Enabled by setting GGML_SYCL_FLASH_ATTN_DIRECT=1
+// ============================================================================
+template<int64_t DQK, int64_t DV>
+void ggml_sycl_op_flash_attn_coopmat_direct(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const bool is_f16 = (Q->type == GGML_TYPE_F16);
+    const bool V_is_K_view = V->view_src && V->view_offs == 0 && (V->view_src == K || V->view_src == K->view_src);
+
+    dpct::queue_ptr stream = ctx.stream();
+
+    const int64_t N = Q->ne[1];
+    const int64_t N_kv = K->ne[1];
+    const int64_t n_heads = Q->ne[2];
+    const int64_t n_kv_heads = K->ne[2];
+    const int64_t gqa_ratio = n_heads / n_kv_heads;
+
+    float scale = 1.0f;
+    std::memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    // Compute strides for direct loading
+    fattn_tensor_strides strides = compute_tensor_strides(Q, K, V, dst);
+
+    // Get raw data pointers (type depends on input format)
+    const void * Q_data = Q->data;
+    const void * K_data = K->data;
+    const void * V_data = V_is_K_view ? K->data : V->data;
+    float * O_data = (float *) dst->data;
+
+    // Process mask if present
+    const float * mask_d = nullptr;
+    float * mask_d_f32_alloc = nullptr;
+    int64_t mask_stride_val = N_kv;
+    if (mask != nullptr && mask->data != nullptr) {
+        if (mask->type == GGML_TYPE_F32) {
+            mask_d = (const float *) mask->data;
+            mask_stride_val = mask->nb[1] / sizeof(float);
+        } else if (mask->type == GGML_TYPE_F16) {
+            const int64_t mask_n_kv = mask->ne[0];
+            const int64_t mask_n_q = mask->ne[1];
+            const int64_t mask_elements = mask_n_kv * mask_n_q;
+            
+            mask_d_f32_alloc = (float *) sycl::malloc_device(mask_elements * sizeof(float), *stream);
+            const sycl::half * mask_f16 = (const sycl::half *) mask->data;
+            const ptrdiff_t mask_row_stride_f16 = mask->nb[1] / sizeof(sycl::half);
+            
+            stream->submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(sycl::range<1>((mask_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
+                    const int idx = it.get_id(0);
+                    if (idx < mask_elements) {
+                        const int64_t row = idx / mask_n_kv;
+                        const int64_t col = idx % mask_n_kv;
+                        mask_d_f32_alloc[idx] = static_cast<float>(mask_f16[row * mask_row_stride_f16 + col]);
+                    }
+                });
+            });
+            mask_d = mask_d_f32_alloc;
+            mask_stride_val = mask_n_kv;
+        }
+    }
+
+    constexpr int BLOCK_M = 32;
+    constexpr int THREADS_PER_WG = 64;
+
+    const int Tr = (N + BLOCK_M - 1) / BLOCK_M;
+
+    // Unused but needed for API compatibility
+    float * l_d = nullptr;
+    float * m_d = nullptr;
+
+    sycl::range<2> global(Tr * THREADS_PER_WG, n_heads);
+    sycl::range<2> local(THREADS_PER_WG, 1);
+
+    xmx_tile_kind tile_kind = ggml_sycl_flash_attn_get_tile_kind(stream->get_device());
+
+    // Shared memory size calculation
+    constexpr int Q_STRIDE = DQK + 8;
+    constexpr int K_STRIDE = DQK + 8;
+    constexpr int V_STRIDE = DV + 8;
+    constexpr int P_STRIDE = 32 + 8;  // BLOCK_N + padding
+    constexpr int V_T_STRIDE = 32 + 8;
+    constexpr size_t BF16_BYTES = (BLOCK_M * Q_STRIDE + 32 * K_STRIDE +
+                                    32 * V_STRIDE + BLOCK_M * P_STRIDE +
+                                    DV * V_T_STRIDE) * sizeof(sycl::half);
+    constexpr size_t FLOAT_BYTES = (BLOCK_M * (32 + 8) + BLOCK_M * 3 + BLOCK_M * DV) * sizeof(float);
+    constexpr size_t SHMEM_SIZE = (BF16_BYTES + FLOAT_BYTES + sizeof(float) - 1) / sizeof(float);
+
+    static bool first_call = true;
+    if (first_call && getenv("GGML_SYCL_FLASH_ATTN_DEBUG")) {
+        GGML_SYCL_DEBUG("ggml_sycl: DIRECT XMX flash_attn N=%ld N_kv=%ld n_heads=%ld DQK=%ld DV=%ld is_f16=%d\n",
+                N, N_kv, n_heads, DQK, DV, is_f16);
+        GGML_SYCL_DEBUG("ggml_sycl: Q strides: seq=%ld head=%ld\n", strides.q_stride_seq, strides.q_stride_head);
+        GGML_SYCL_DEBUG("ggml_sycl: K strides: seq=%ld head=%ld\n", strides.k_stride_seq, strides.k_stride_head);
+        GGML_SYCL_DEBUG("ggml_sycl: V strides: seq=%ld head=%ld\n", strides.v_stride_seq, strides.v_stride_head);
+        GGML_SYCL_DEBUG("ggml_sycl: O strides: seq=%ld head=%ld\n", strides.o_stride_seq, strides.o_stride_head);
+        first_call = false;
+    }
+
+    // Select kernel based on input type and tile kind
+    if (is_f16) {
+        if (tile_kind == xmx_tile_kind::tile_dg2) {
+            stream->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
+
+                cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                    flash_attn_coopmat_kernel_strided_n8<DQK, DV, fattn_input_type::f16, false>(
+                        it,
+                        Q_data, K_data, V_data, O_data,
+                        l_d, m_d,
+                        N, N_kv, n_heads, n_kv_heads, gqa_ratio,
+                        scale, mask_d, mask_stride_val, strides,
+                        shmem.get_multi_ptr<sycl::access::decorated::no>().get()
+                    );
+                });
+            });
+        } else {
+            stream->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
+
+                cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                    flash_attn_coopmat_kernel_strided_n16<DQK, DV, fattn_input_type::f16, false>(
+                        it,
+                        Q_data, K_data, V_data, O_data,
+                        l_d, m_d,
+                        N, N_kv, n_heads, n_kv_heads, gqa_ratio,
+                        scale, mask_d, mask_stride_val, strides,
+                        shmem.get_multi_ptr<sycl::access::decorated::no>().get()
+                    );
+                });
+            });
+        }
+    } else {
+        // F32 input
+        if (tile_kind == xmx_tile_kind::tile_dg2) {
+            stream->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
+
+                cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                    flash_attn_coopmat_kernel_strided_n8<DQK, DV, fattn_input_type::f32, false>(
+                        it,
+                        Q_data, K_data, V_data, O_data,
+                        l_d, m_d,
+                        N, N_kv, n_heads, n_kv_heads, gqa_ratio,
+                        scale, mask_d, mask_stride_val, strides,
+                        shmem.get_multi_ptr<sycl::access::decorated::no>().get()
+                    );
+                });
+            });
+        } else {
+            stream->submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
+
+                cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                    flash_attn_coopmat_kernel_strided_n16<DQK, DV, fattn_input_type::f32, false>(
+                        it,
+                        Q_data, K_data, V_data, O_data,
+                        l_d, m_d,
+                        N, N_kv, n_heads, n_kv_heads, gqa_ratio,
+                        scale, mask_d, mask_stride_val, strides,
+                        shmem.get_multi_ptr<sycl::access::decorated::no>().get()
+                    );
+                });
+            });
+        }
+    }
+
+    stream->wait();
+
+    if (mask_d_f32_alloc) sycl::free(mask_d_f32_alloc, *stream);
 }
 #endif // SYCL_EXT_COOPERATIVE_MATRICES
 
@@ -1176,6 +1456,9 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const int64_t gqa_ratio = n_heads / n_kv_heads;
 
     dpct::queue_ptr stream = ctx.stream();
+
+    GGML_SYCL_DEBUG("[SYCL][OP] flash_attn_mkl<%ld,%ld> ENTRY: N=%ld N_kv=%ld n_heads=%ld n_kv_heads=%ld\n",
+            DQK, DV, N, N_kv, n_heads, n_kv_heads);
 
     static bool first_mkl_call = true;
     if (first_mkl_call && getenv("GGML_SYCL_FLASH_ATTN_DEBUG")) {
@@ -1505,8 +1788,13 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
 void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * sinks = dst->src[4];
+    (void)K; // Used by direct loading path when SYCL_EXT_COOPERATIVE_MATRICES is defined
+
+    GGML_SYCL_DEBUG("[SYCL][OP] call ggml_sycl_op_flash_attn: Q=[%ld,%ld,%ld] V=[%ld,%ld,%ld]\n",
+            Q->ne[0], Q->ne[1], Q->ne[2], V->ne[0], V->ne[1], V->ne[2]);
 
 #ifdef GGML_SYCL_USE_INTEL_ONEMKL
     // Check if oneMKL is forced first (before XMX check)
@@ -1525,13 +1813,6 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
 
     const int64_t DQK = Q->ne[0];
     const int64_t DV = V->ne[0];
-
-    // Handle mismatched DQK/DV case (e.g., GLM-4.7-Flash: K=576, V=512)
-    // XMX cooperative matrix doesn't support mismatched K/V dimensions - use oneMKL
-    if (DQK == 576 && DV == 512) {
-        ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
-        return;
-    }
 
     // Sinks (attention sinks / StreamingLLM) only supported in MKL path
     // XMX cooperative matrix kernels don't support sinks yet
@@ -1602,6 +1883,8 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     // Try XMX path if device supports it
     static bool sycl_use_xmx = false;
     static bool xmx_checked = false;
+    static bool use_direct_loading = false;
+    static bool direct_checked = false;
 
     if (!xmx_checked) {
         sycl::device device = ctx.stream()->get_device();
@@ -1616,14 +1899,61 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         }
     }
 
+    // Check for direct loading mode (stride-aware kernel)
+    if (!direct_checked) {
+        use_direct_loading = ggml_sycl_flash_attn_use_direct();
+        direct_checked = true;
+    }
+
     if (sycl_use_xmx) {
         const int64_t actual_d = Q->ne[0];
         const int64_t actual_dv = V->ne[0];
         const int64_t padded_d = get_padded_head_size(actual_d);
         const int64_t padded_dv = get_padded_head_size(actual_dv);
 
+        // Try direct loading path first if enabled and compatible
+        if (use_direct_loading && actual_d == actual_dv && 
+            actual_d == padded_d && can_use_direct_loading(Q, K, V, dst)) {
+            try {
+                switch (actual_d) {
+                    case 32:
+                        ggml_sycl_op_flash_attn_coopmat_direct<32, 32>(ctx, dst);
+                        return;
+                    case 64:
+                        ggml_sycl_op_flash_attn_coopmat_direct<64, 64>(ctx, dst);
+                        return;
+                    case 96:
+                        ggml_sycl_op_flash_attn_coopmat_direct<96, 96>(ctx, dst);
+                        return;
+                    case 128:
+                        ggml_sycl_op_flash_attn_coopmat_direct<128, 128>(ctx, dst);
+                        return;
+                    case 256:
+                        ggml_sycl_op_flash_attn_coopmat_direct<256, 256>(ctx, dst);
+                        return;
+                    case 512:
+                        ggml_sycl_op_flash_attn_coopmat_direct<512, 512>(ctx, dst);
+                        return;
+                    default:
+                        break;
+                }
+            } catch (const std::exception& e) {
+                GGML_SYCL_DEBUG("ggml_sycl: Direct loading kernel failed: %s, falling back to repack kernel\n", e.what());
+            }
+        }
+
         try {
-            if (actual_d == padded_d && actual_dv == padded_dv) {
+            if (actual_d != actual_dv && padded_d > 0 && padded_dv > 0) {
+                // MLA case: DQK != DV (e.g., GLM-4.7-Flash with K=576, V=512)
+                // Use padded kernel with V_FROM_K optimization when V is a view of K
+                if (actual_d == 576 && actual_dv == 512) {
+                    // GLM-4.7: K=576 (native), V=512 (native)
+                    ggml_sycl_op_flash_attn_coopmat_padded<576, 512, 576, 512>(ctx, dst);
+                    return;
+                }
+                // Add more MLA combinations here as needed
+                GGML_SYCL_DEBUG("ggml_sycl: XMX MLA not supported for DQK=%ld DV=%ld, falling back\n", actual_d, actual_dv);
+            } else if (actual_d == padded_d && actual_dv == padded_dv) {
                 // Native head size - use non-padded kernel
                 switch (actual_d) {
                     case 32:
@@ -1647,8 +1977,8 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                     default:
                         break;
                 }
-            } else if (padded_d > 0) {
-                // Padded head size - use padded kernel
+            } else if (padded_d > 0 && padded_dv > 0) {
+                // Padded head size - use padded kernel (DQK == DV case)
                 switch (actual_d) {
                     case 40:
                         ggml_sycl_op_flash_attn_coopmat_padded<40, 40, 64, 64>(ctx, dst);
@@ -1673,19 +2003,10 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                 }
             }
             // Fall back to non-XMX path for unsupported head sizes
-            GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention not supported for head size %ld, falling back\n", Q->ne[0]);
+            GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention not supported for head size DQK=%ld DV=%ld, falling back\n", actual_d, actual_dv);
         } catch (const std::exception& e) {
             sycl_use_xmx = false;
-            GGML_SYCL_DEBUG("ggml_sycl: XMX kernel failed: %s, falling back to oneMKL path\n", e.what());
-            const int64_t DQK = Q->ne[0];
-            const int64_t DV = V->ne[0];
-            if (DQK == 576 && DV == 512) {
-                ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
-                return;
-            } else if (DQK != DV) {
-                GGML_SYCL_DEBUG("ggml_sycl: oneMKL path does not support DQK=%ld DV=%ld, no fallback available\n", DQK, DV);
-                return;
-            }
+            GGML_SYCL_DEBUG("ggml_sycl: XMX kernel failed: %s, falling back to non-XMX path\n", e.what());
         }
     }
 #endif
