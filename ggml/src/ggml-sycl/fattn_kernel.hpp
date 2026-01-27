@@ -193,6 +193,19 @@ namespace cm = sycl::ext::oneapi::experimental::matrix;
 // XMX bfloat16 type for cooperative matrices (distinct from common.hpp bfloat16 = uint16_t)
 using xmx_bfloat16 = sycl::ext::oneapi::bfloat16;
 
+// Stride parameters for direct loading from ggml tensor layout
+// Strides are in elements, not bytes
+struct fattn_tensor_strides {
+    int64_t q_stride_seq;    // stride between Q rows (sequence positions)
+    int64_t q_stride_head;   // stride between Q heads
+    int64_t k_stride_seq;    // stride between K rows
+    int64_t k_stride_head;   // stride between K heads
+    int64_t v_stride_seq;    // stride between V rows
+    int64_t v_stride_head;   // stride between V heads
+    int64_t o_stride_seq;    // stride between O rows (output)
+    int64_t o_stride_head;   // stride between O heads
+};
+
 // Tile kind enum for different Intel GPU architectures
 // Both use 8x16x16 tiles, but differ in reported nsize:
 // - DG2 reports nsize=8 (older Xe2 architecture)
@@ -248,14 +261,15 @@ inline bool ggml_sycl_fattn_debug() {
 // Template parameters:
 // - HEAD_DIM: head dimension for Q/K (32, 64, 96, 128, 256, 576)
 // - V_HEAD_DIM: head dimension for V/O (can differ from HEAD_DIM for models like GLM)
+// - V_FROM_K: if true, V is extracted from K's first V_HEAD_DIM columns (MLA zero-copy)
 // - TM, TN, TK: joint matrix tile sizes (8x8x16 for DG2/Arc, 16x16x16 for PVC)
 // - DEBUG: enable debug output
-template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, int TM = 8, int TN = 8, int TK = 16, bool DEBUG = false>
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, bool V_FROM_K = false, int TM = 8, int TN = 8, int TK = 16, bool DEBUG = false>
 inline void flash_attn_coopmat_kernel(
     sycl::nd_item<2> it,
     const float * Q,
     const float * K,
-    const float * V,
+    const float * V,  // When V_FROM_K=true, this is ignored and V is read from K
     float * O,
     float * l_d,
     float * m_d,
@@ -328,8 +342,14 @@ inline void flash_attn_coopmat_kernel(
 
     const ptrdiff_t q_offset = (ptrdiff_t)(head_idx * N + row0) * HEAD_DIM;
     const ptrdiff_t k_offset = (ptrdiff_t)(kv_head_idx * N_kv) * HEAD_DIM;  // K uses N_kv and HEAD_DIM
-    const ptrdiff_t v_offset = (ptrdiff_t)(kv_head_idx * N_kv) * V_HEAD_DIM;  // V uses N_kv and V_HEAD_DIM
+    // When V_FROM_K is true, V is read from K's memory (first V_HEAD_DIM columns per row)
+    // v_offset points to same base as K, but we read only first V_HEAD_DIM elements per row
+    const ptrdiff_t v_offset = V_FROM_K ? k_offset : (ptrdiff_t)(kv_head_idx * N_kv) * V_HEAD_DIM;
     const ptrdiff_t o_offset = (ptrdiff_t)(head_idx * N + row0) * V_HEAD_DIM;  // O uses V_HEAD_DIM
+    
+    // For V_FROM_K mode, V data is interleaved in K's layout with HEAD_DIM stride
+    // We need to read V[row, col] from K[row, col] where col < V_HEAD_DIM
+    constexpr ptrdiff_t V_ROW_STRIDE = V_FROM_K ? HEAD_DIM : V_HEAD_DIM;
 
     // Bfloat16 shared memory for XMX tiles
     xmx_bfloat16 * shQ = reinterpret_cast<xmx_bfloat16*>(shmem);
@@ -398,6 +418,7 @@ inline void flash_attn_coopmat_kernel(
         }
 
         // Load V tiles separately with V_HEAD_DIM
+        // When V_FROM_K is true, read V from K's memory with HEAD_DIM stride (zero-copy MLA)
         for (int i = lid; i < BLOCK_N * V_HEAD_DIM; i += THREADS) {
             const int r = i / V_HEAD_DIM;  // r = kv row index within block (0..BLOCK_N-1)
             const int c = i % V_HEAD_DIM;  // c = head dim index (0..V_HEAD_DIM-1)
@@ -406,8 +427,12 @@ inline void flash_attn_coopmat_kernel(
             xmx_bfloat16 v_val = xmx_bfloat16(0.0f);
 
             if (k_row < N_kv) {  // Use N_kv for K/V bounds
-                const ptrdiff_t base = (ptrdiff_t)k_row * V_HEAD_DIM;
-                v_val = xmx_bfloat16(V[v_offset + base + c]);
+                // V_ROW_STRIDE is HEAD_DIM when V_FROM_K, else V_HEAD_DIM
+                // When V_FROM_K, we read from K's base pointer with K's stride
+                const ptrdiff_t base = (ptrdiff_t)k_row * V_ROW_STRIDE;
+                // When V_FROM_K, K is passed as the V source (via v_offset pointing to k_offset)
+                // c is always < V_HEAD_DIM, so we just read directly
+                v_val = V_FROM_K ? xmx_bfloat16(K[v_offset + base + c]) : xmx_bfloat16(V[v_offset + base + c]);
             }
 
             // Store V row-major
@@ -611,7 +636,8 @@ inline void flash_attn_coopmat_kernel(
 }
 
 // Wrapper for DG2 (reports nsize=8, uses 8x16x16 tiles)
-template <int64_t HEAD_DIM, int64_t V_HEAD_DIM>
+// V_FROM_K: when true, V is read from K's memory (MLA zero-copy optimization)
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, bool V_FROM_K = false>
 inline void flash_attn_coopmat_kernel_n8(
     sycl::nd_item<2> it,
     const float * Q, const float * K, const float * V,
@@ -621,14 +647,15 @@ inline void flash_attn_coopmat_kernel_n8(
     const float * mask, const int64_t mask_stride, float * shmem
 ) {
     // Both n8 and n16 use 8x16x16 tiles (TM=8, TN=16, TK=16)
-    flash_attn_coopmat_kernel<HEAD_DIM, V_HEAD_DIM, 8, 16, 16>(
+    flash_attn_coopmat_kernel<HEAD_DIM, V_HEAD_DIM, V_FROM_K, 8, 16, 16>(
         it, Q, K, V, O, l_d, m_d, N, N_kv, n_heads, n_kv_heads,
         gqa_ratio, scale, mask, mask_stride, shmem
     );
 }
 
 // Wrapper for PVC/B60 (reports nsize=16, uses 8x16x16 tiles)
-template <int64_t HEAD_DIM, int64_t V_HEAD_DIM>
+// V_FROM_K: when true, V is read from K's memory (MLA zero-copy optimization)
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, bool V_FROM_K = false>
 inline void flash_attn_coopmat_kernel_n16(
     sycl::nd_item<2> it,
     const float * Q, const float * K, const float * V,
@@ -638,7 +665,7 @@ inline void flash_attn_coopmat_kernel_n16(
     const float * mask, const int64_t mask_stride, float * shmem
 ) {
     // PVC also uses 8x16x16 tiles
-    flash_attn_coopmat_kernel<HEAD_DIM, V_HEAD_DIM, 8, 16, 16>(
+    flash_attn_coopmat_kernel<HEAD_DIM, V_HEAD_DIM, V_FROM_K, 8, 16, 16>(
         it, Q, K, V, O, l_d, m_d, N, N_kv, n_heads, n_kv_heads,
         gqa_ratio, scale, mask, mask_stride, shmem
     );
@@ -651,13 +678,14 @@ inline void flash_attn_coopmat_kernel_n16(
 // - V_HEAD_DIM: actual head dimension for V/O (e.g., 40, can differ from HEAD_DIM)
 // - PADDED_HEAD_DIM: padded head dimension for Q/K XMX (e.g., 64)
 // - PADDED_V_HEAD_DIM: padded head dimension for V/O XMX (e.g., 64, can differ from PADDED_HEAD_DIM)
+// - V_FROM_K: if true, V is extracted from K's first V_HEAD_DIM columns (MLA zero-copy)
 // - TM, TN, TK: joint matrix tile sizes
-template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, int64_t PADDED_HEAD_DIM, int64_t PADDED_V_HEAD_DIM, int TM = 8, int TN = 16, int TK = 16>
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, int64_t PADDED_HEAD_DIM, int64_t PADDED_V_HEAD_DIM, bool V_FROM_K = false, int TM = 8, int TN = 16, int TK = 16>
 inline void flash_attn_coopmat_kernel_padded(
     sycl::nd_item<2> it,
     const float * Q,
     const float * K,
-    const float * V,
+    const float * V,  // When V_FROM_K=true, this is ignored and V is read from K
     float * O,
     float * l_d,
     float * m_d,
@@ -723,8 +751,12 @@ inline void flash_attn_coopmat_kernel_padded(
     // Use PADDED_HEAD_DIM for Q/K XMX operations, PADDED_V_HEAD_DIM for V/O XMX operations
     const ptrdiff_t q_offset = (ptrdiff_t)(head_idx * N + row0) * HEAD_DIM;
     const ptrdiff_t k_offset = (ptrdiff_t)(kv_head_idx * N_kv) * HEAD_DIM;  // K uses N_kv and HEAD_DIM
-    const ptrdiff_t v_offset = (ptrdiff_t)(kv_head_idx * N_kv) * V_HEAD_DIM;  // V uses N_kv and V_HEAD_DIM
+    // When V_FROM_K is true, V is read from K's memory (first V_HEAD_DIM columns per row)
+    const ptrdiff_t v_offset = V_FROM_K ? k_offset : (ptrdiff_t)(kv_head_idx * N_kv) * V_HEAD_DIM;
     const ptrdiff_t o_offset = (ptrdiff_t)(head_idx * N + row0) * V_HEAD_DIM;  // O uses V_HEAD_DIM
+    
+    // For V_FROM_K mode, V data is interleaved in K's layout with HEAD_DIM stride
+    constexpr ptrdiff_t V_ROW_STRIDE = V_FROM_K ? HEAD_DIM : V_HEAD_DIM;
 
     // Bfloat16 shared memory for XMX tiles
     xmx_bfloat16 * shQ = reinterpret_cast<xmx_bfloat16*>(shmem);
@@ -788,6 +820,7 @@ inline void flash_attn_coopmat_kernel_padded(
         }
 
         // Load V tiles separately with V_HEAD_DIM and PADDED_V_HEAD_DIM
+        // When V_FROM_K is true, read V from K's memory with HEAD_DIM stride (zero-copy MLA)
         for (int i = lid; i < BLOCK_N * PADDED_V_HEAD_DIM; i += THREADS) {
             const int r = i / PADDED_V_HEAD_DIM;
             const int c = i % PADDED_V_HEAD_DIM;
@@ -796,8 +829,10 @@ inline void flash_attn_coopmat_kernel_padded(
             xmx_bfloat16 v_val = xmx_bfloat16(0.0f);
 
             if (k_row < N_kv && c < V_HEAD_DIM) {  // Use N_kv for bounds check
-                const ptrdiff_t base = (ptrdiff_t)k_row * V_HEAD_DIM;
-                v_val = xmx_bfloat16(V[v_offset + base + c]);
+                // V_ROW_STRIDE is HEAD_DIM when V_FROM_K, else V_HEAD_DIM
+                const ptrdiff_t base = (ptrdiff_t)k_row * V_ROW_STRIDE;
+                // When V_FROM_K, read from K's base pointer with K's stride
+                v_val = V_FROM_K ? xmx_bfloat16(K[v_offset + base + c]) : xmx_bfloat16(V[v_offset + base + c]);
             }
 
             // Store V row-major
@@ -981,7 +1016,8 @@ inline void flash_attn_coopmat_kernel_padded(
 }
 
 // Wrapper for DG2 (nsize=8) with padding support
-template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, int64_t PADDED_HEAD_DIM, int64_t PADDED_V_HEAD_DIM>
+// V_FROM_K: when true, V is read from K's memory (MLA zero-copy optimization)
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, int64_t PADDED_HEAD_DIM, int64_t PADDED_V_HEAD_DIM, bool V_FROM_K = false>
 inline void flash_attn_coopmat_kernel_n8_padded(
     sycl::nd_item<2> it,
     const float * Q, const float * K, const float * V,
@@ -990,14 +1026,15 @@ inline void flash_attn_coopmat_kernel_n8_padded(
     const int gqa_ratio, const float scale,
     const float * mask, const int64_t mask_stride, const int o_row_stride, float * shmem
 ) {
-    flash_attn_coopmat_kernel_padded<HEAD_DIM, V_HEAD_DIM, PADDED_HEAD_DIM, PADDED_V_HEAD_DIM, 8, 16, 16>(
+    flash_attn_coopmat_kernel_padded<HEAD_DIM, V_HEAD_DIM, PADDED_HEAD_DIM, PADDED_V_HEAD_DIM, V_FROM_K, 8, 16, 16>(
         it, Q, K, V, O, l_d, m_d, N, N_kv, n_heads, n_kv_heads,
         gqa_ratio, scale, mask, mask_stride, o_row_stride, shmem
     );
 }
 
 // Wrapper for PVC/B60 (nsize=16) with padding support
-template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, int64_t PADDED_HEAD_DIM, int64_t PADDED_V_HEAD_DIM>
+// V_FROM_K: when true, V is read from K's memory (MLA zero-copy optimization)
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, int64_t PADDED_HEAD_DIM, int64_t PADDED_V_HEAD_DIM, bool V_FROM_K = false>
 inline void flash_attn_coopmat_kernel_n16_padded(
     sycl::nd_item<2> it,
     const float * Q, const float * K, const float * V,
@@ -1006,9 +1043,369 @@ inline void flash_attn_coopmat_kernel_n16_padded(
     const int gqa_ratio, const float scale,
     const float * mask, const int64_t mask_stride, const int o_row_stride, float * shmem
 ) {
-    flash_attn_coopmat_kernel_padded<HEAD_DIM, V_HEAD_DIM, PADDED_HEAD_DIM, PADDED_V_HEAD_DIM, 8, 16, 16>(
+    flash_attn_coopmat_kernel_padded<HEAD_DIM, V_HEAD_DIM, PADDED_HEAD_DIM, PADDED_V_HEAD_DIM, V_FROM_K, 8, 16, 16>(
         it, Q, K, V, O, l_d, m_d, N, N_kv, n_heads, n_kv_heads,
         gqa_ratio, scale, mask, mask_stride, o_row_stride, shmem
+    );
+}
+
+// ============================================================================
+// Stride-Aware Direct Loading Kernel
+// ============================================================================
+// This kernel loads Q/K/V directly from ggml's strided tensor layout, avoiding
+// the need for intermediate F32 repack buffers. This reduces memory bandwidth
+// by 2x and eliminates temporary allocations.
+//
+// The kernel accepts stride parameters that describe the original tensor layout:
+// - q_stride_seq: elements between consecutive Q sequence positions
+// - q_stride_head: elements between consecutive Q heads
+// - k_stride_seq, k_stride_head: same for K
+// - v_stride_seq, v_stride_head: same for V
+// - o_stride_seq, o_stride_head: same for output O
+//
+// For F16 inputs, the kernel converts to bf16 during shared memory loading.
+// ============================================================================
+
+// Input type tag for template dispatch
+enum class fattn_input_type { f32, f16 };
+
+// Stride-aware flash attention kernel with direct loading from ggml layout
+// InputType: fattn_input_type::f32 or fattn_input_type::f16
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, fattn_input_type InputType, bool V_FROM_K = false, int TM = 8, int TN = 8, int TK = 16>
+inline void flash_attn_coopmat_kernel_strided(
+    sycl::nd_item<2> it,
+    const void * Q_raw,           // Q data (float* or sycl::half*)
+    const void * K_raw,           // K data
+    const void * V_raw,           // V data (ignored if V_FROM_K)
+    float * O,                    // Output (always float)
+    float * l_d,                  // Unused (for API compat)
+    float * m_d,                  // Unused
+    const int64_t N,              // Query sequence length
+    const int64_t N_kv,           // Key/Value sequence length
+    const int n_heads,
+    const int n_kv_heads,
+    const int gqa_ratio,
+    const float scale,
+    const float * mask,
+    const int64_t mask_stride,
+    const fattn_tensor_strides strides,  // Stride parameters for direct loading
+    float * shmem
+) {
+    using namespace sycl::ext::oneapi::experimental::matrix;
+
+    // Select input pointer type based on InputType
+    using input_t = std::conditional_t<InputType == fattn_input_type::f32, float, sycl::half>;
+    const input_t * Q = reinterpret_cast<const input_t *>(Q_raw);
+    const input_t * K = reinterpret_cast<const input_t *>(K_raw);
+    const input_t * V = reinterpret_cast<const input_t *>(V_raw);
+
+    constexpr int BLOCK_M = 32;
+    constexpr int BLOCK_N = 32;
+    constexpr int THREADS = 64;
+
+    constexpr int NUM_SG_M = BLOCK_M / TM;
+
+    constexpr int Q_STRIDE = HEAD_DIM + 8;
+    constexpr int K_STRIDE = HEAD_DIM + 8;
+    constexpr int V_STRIDE = V_HEAD_DIM + 8;
+    constexpr int V_T_STRIDE = BLOCK_N + 8;
+    constexpr int S_STRIDE = BLOCK_N + 8;
+    constexpr int P_STRIDE = BLOCK_N + 8;
+
+    static_assert(BLOCK_N % TK == 0, "BLOCK_N must be divisible by TK");
+    static_assert(HEAD_DIM % TN == 0, "HEAD_DIM must be divisible by TN");
+    static_assert(V_HEAD_DIM % TN == 0, "V_HEAD_DIM must be divisible by TN");
+
+    (void)l_d; (void)m_d; (void)n_heads; (void)n_kv_heads;
+
+    const int lid = it.get_local_id(0);
+    const int gid_x = it.get_group(0);
+    const int gid_y = it.get_group(1);
+    auto sg = it.get_sub_group();
+    const int sg_id = sg.get_group_linear_id();
+
+    if (sg_id >= NUM_SG_M) return;
+
+    const int row0 = gid_x * BLOCK_M;
+    if (row0 >= N) return;
+
+    const int head_idx = gid_y;
+    const int kv_head_idx = head_idx / gqa_ratio;
+
+    // Shared memory layout
+    xmx_bfloat16 * shQ = reinterpret_cast<xmx_bfloat16*>(shmem);
+    xmx_bfloat16 * shK = shQ + BLOCK_M * Q_STRIDE;
+    xmx_bfloat16 * shV = shK + BLOCK_N * K_STRIDE;
+    xmx_bfloat16 * shP = shV + BLOCK_N * V_STRIDE;
+    xmx_bfloat16 * shVT = shP + BLOCK_M * P_STRIDE;
+
+    float * shS = reinterpret_cast<float*>(shVT + V_HEAD_DIM * V_T_STRIDE);
+    float * rowMax = shS + BLOCK_M * S_STRIDE;
+    float * rowSum = rowMax + BLOCK_M;
+    float * rowAlpha = rowSum + BLOCK_M;
+    float * shAcc = rowAlpha + BLOCK_M;
+
+    // Initialize per-row stats
+    if (lid < BLOCK_M) {
+        rowMax[lid] = -1.0e20f;
+        rowSum[lid] = 0.0f;
+    }
+    for (int i = lid; i < BLOCK_M * V_HEAD_DIM; i += THREADS) {
+        shAcc[i] = 0.0f;
+    }
+
+    // Load Q tiles with DIRECT STRIDED ACCESS
+    // Q layout in ggml: [dim, seq, head] with strides [1, q_stride_seq, q_stride_head]
+    for (int i = lid; i < BLOCK_M * HEAD_DIM; i += THREADS) {
+        const int r = i / HEAD_DIM;  // row within block (0..BLOCK_M-1)
+        const int c = i % HEAD_DIM;  // column (head dim)
+        const int q_row = row0 + r;  // global sequence position
+
+        if (q_row < N) {
+            // Direct strided access: Q[dim + seq * q_stride_seq + head * q_stride_head]
+            const int64_t src_idx = c + (int64_t)q_row * strides.q_stride_seq + (int64_t)head_idx * strides.q_stride_head;
+            shQ[r * Q_STRIDE + c] = xmx_bfloat16(static_cast<float>(Q[src_idx]) * scale);
+        } else {
+            shQ[r * Q_STRIDE + c] = xmx_bfloat16(0.0f);
+        }
+    }
+
+    it.barrier(sycl::access::fence_space::local_space);
+
+    const int num_kv_blocks = (N_kv + BLOCK_N - 1) / BLOCK_N;
+
+    for (int kv_block = 0; kv_block < num_kv_blocks; ++kv_block) {
+        const int col0 = kv_block * BLOCK_N;
+
+        // Load K tiles with DIRECT STRIDED ACCESS
+        // K layout: [dim, seq, head] -> access as K[dim + seq * k_stride_seq + head * k_stride_head]
+        for (int i = lid; i < BLOCK_N * HEAD_DIM; i += THREADS) {
+            const int r = i / HEAD_DIM;
+            const int c = i % HEAD_DIM;
+            const int k_row = col0 + r;
+
+            xmx_bfloat16 k_val = xmx_bfloat16(0.0f);
+            if (k_row < N_kv) {
+                const int64_t src_idx = c + (int64_t)k_row * strides.k_stride_seq + (int64_t)kv_head_idx * strides.k_stride_head;
+                k_val = xmx_bfloat16(static_cast<float>(K[src_idx]));
+            }
+            // Store K^T col-major
+            shK[c + r * K_STRIDE] = k_val;
+        }
+
+        // Load V tiles with DIRECT STRIDED ACCESS
+        for (int i = lid; i < BLOCK_N * V_HEAD_DIM; i += THREADS) {
+            const int r = i / V_HEAD_DIM;
+            const int c = i % V_HEAD_DIM;
+            const int k_row = col0 + r;
+
+            xmx_bfloat16 v_val = xmx_bfloat16(0.0f);
+            if (k_row < N_kv) {
+                if constexpr (V_FROM_K) {
+                    // V from K: read first V_HEAD_DIM columns of K
+                    const int64_t src_idx = c + (int64_t)k_row * strides.k_stride_seq + (int64_t)kv_head_idx * strides.k_stride_head;
+                    v_val = xmx_bfloat16(static_cast<float>(K[src_idx]));
+                } else {
+                    const int64_t src_idx = c + (int64_t)k_row * strides.v_stride_seq + (int64_t)kv_head_idx * strides.v_stride_head;
+                    v_val = xmx_bfloat16(static_cast<float>(V[src_idx]));
+                }
+            }
+            shV[r * V_STRIDE + c] = v_val;
+        }
+
+        it.barrier(sycl::access::fence_space::local_space);
+
+        // ============ Q @ K^T computation ============
+        for (int j = 0; j < BLOCK_N; j += TN) {
+            joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN, layout::dynamic> matS;
+            joint_matrix_fill(sg, matS, 0.0f);
+
+            for (int k = 0; k < HEAD_DIM; k += TK) {
+                joint_matrix<sycl::sub_group, xmx_bfloat16, use::a, TM, TK, layout::row_major> mq;
+                joint_matrix<sycl::sub_group, xmx_bfloat16, use::b, TK, TN, layout::col_major> mk;
+
+                auto mq_ptr = sycl::address_space_cast<
+                    sycl::access::address_space::local_space,
+                    sycl::access::decorated::yes>(&shQ[(sg_id * TM) * Q_STRIDE + k]);
+                auto mk_ptr = sycl::address_space_cast<
+                    sycl::access::address_space::local_space,
+                    sycl::access::decorated::yes>(&shK[k + j * K_STRIDE]);
+
+                joint_matrix_load(sg, mq, mq_ptr, Q_STRIDE);
+                joint_matrix_load(sg, mk, mk_ptr, K_STRIDE);
+                joint_matrix_mad(sg, matS, mq, mk, matS);
+            }
+
+            auto shS_ptr = sycl::address_space_cast<
+                sycl::access::address_space::local_space,
+                sycl::access::decorated::yes>(&shS[(sg_id * TM) * S_STRIDE + j]);
+            joint_matrix_store(sg, matS, shS_ptr, S_STRIDE, layout::row_major);
+        }
+
+        it.barrier(sycl::access::fence_space::local_space);
+
+        // ============ Online Softmax ============
+        if (lid < BLOCK_M) {
+            const int row = lid;
+            const int q_row = row0 + row;
+            float m = -1.0e20f;
+
+            for (int c = 0; c < BLOCK_N; ++c) {
+                float s_val = shS[row * S_STRIDE + c];
+                const int kv_col = col0 + c;
+
+                if (mask != nullptr && kv_col < N_kv && q_row < N) {
+                    const float mask_val = mask[q_row * mask_stride + kv_col];
+                    s_val += mask_val;
+                }
+
+                shS[row * S_STRIDE + c] = s_val;
+                m = sycl::fmax(m, s_val);
+            }
+
+            float m_prev = rowMax[row];
+            float m_new = sycl::fmax(m_prev, m);
+            float alpha = sycl::exp(sycl::fmax(m_prev - m_new, -20.0f));
+            rowAlpha[row] = alpha;
+            rowMax[row] = m_new;
+
+            float s_sum = 0.0f;
+            for (int c = 0; c < BLOCK_N; ++c) {
+                float s_val = shS[row * S_STRIDE + c];
+                float val = sycl::exp(sycl::fmax(s_val - m_new, -20.0f));
+                shS[row * S_STRIDE + c] = val;
+                s_sum += val;
+            }
+            rowSum[row] = rowSum[row] * alpha + s_sum;
+        }
+
+        it.barrier(sycl::access::fence_space::local_space);
+
+        // ============ Scale previous output by alpha ============
+        for (int i = lid; i < BLOCK_M * V_HEAD_DIM; i += THREADS) {
+            const int row = i / V_HEAD_DIM;
+            shAcc[i] *= rowAlpha[row];
+        }
+
+        // ============ Convert P to bf16 ============
+        for (int i = lid; i < BLOCK_M * BLOCK_N; i += THREADS) {
+            const int row = i / BLOCK_N;
+            const int col = i % BLOCK_N;
+            shP[row * P_STRIDE + col] = xmx_bfloat16(shS[row * S_STRIDE + col]);
+        }
+
+        // ============ V transpose ============
+        for (int i = lid; i < BLOCK_N * V_HEAD_DIM; i += THREADS) {
+            const int row = i / V_HEAD_DIM;
+            const int col = i % V_HEAD_DIM;
+            if (col < V_HEAD_DIM) {
+                shVT[row + col * V_T_STRIDE] = shV[row * V_STRIDE + col];
+            } else {
+                shVT[row + col * V_T_STRIDE] = xmx_bfloat16(0.0f);
+            }
+        }
+
+        it.barrier(sycl::access::fence_space::local_space);
+
+        // ============ P @ V computation ============
+        constexpr int NUM_OUT_TILES = V_HEAD_DIM / TN;
+
+        for (int out_tile = 0; out_tile < NUM_OUT_TILES; ++out_tile) {
+            joint_matrix<sycl::sub_group, float, use::accumulator, TM, TN, layout::dynamic> matPV;
+            joint_matrix_fill(sg, matPV, 0.0f);
+
+            for (int k = 0; k < BLOCK_N; k += TK) {
+                joint_matrix<sycl::sub_group, xmx_bfloat16, use::a, TM, TK, layout::row_major> mp;
+                auto shP_ptr = sycl::address_space_cast<
+                    sycl::access::address_space::local_space,
+                    sycl::access::decorated::yes>(&shP[(sg_id * TM) * P_STRIDE + k]);
+                joint_matrix_load(sg, mp, shP_ptr, P_STRIDE);
+
+                joint_matrix<sycl::sub_group, xmx_bfloat16, use::b, TK, TN, layout::col_major> mv;
+                auto shV_ptr = sycl::address_space_cast<
+                    sycl::access::address_space::local_space,
+                    sycl::access::decorated::yes>(&shVT[k + out_tile * TN * V_T_STRIDE]);
+                joint_matrix_load(sg, mv, shV_ptr, V_T_STRIDE);
+
+                joint_matrix_mad(sg, matPV, mp, mv, matPV);
+            }
+
+            // Store to scratch and accumulate
+            const int scratch_offset = sg_id * TM * TN;
+            auto scratch_ptr = sycl::address_space_cast<
+                sycl::access::address_space::local_space,
+                sycl::access::decorated::yes>(&shS[scratch_offset]);
+            joint_matrix_store(sg, matPV, scratch_ptr, TN, layout::row_major);
+            it.barrier(sycl::access::fence_space::local_space);
+
+            const int sg_lane = sg.get_local_linear_id();
+            const int sg_size = sg.get_local_linear_range();
+            for (int idx = sg_lane; idx < TM * TN; idx += sg_size) {
+                const int local_row = idx / TN;
+                const int local_col = idx % TN;
+                const int global_row = sg_id * TM + local_row;
+                const int global_col = out_tile * TN + local_col;
+                if (global_row < BLOCK_M && global_col < V_HEAD_DIM) {
+                    shAcc[global_row * V_HEAD_DIM + global_col] += shS[scratch_offset + idx];
+                }
+            }
+
+            it.barrier(sycl::access::fence_space::local_space);
+        }
+    }
+
+    it.barrier(sycl::access::fence_space::local_space);
+
+    // ============ Final normalize and DIRECT STRIDED STORE ============
+    // O layout: [dim, seq, head] -> O[dim + seq * o_stride_seq + head * o_stride_head]
+    for (int i = lid; i < BLOCK_M * V_HEAD_DIM; i += THREADS) {
+        const int row = i / V_HEAD_DIM;
+        const int col = i % V_HEAD_DIM;
+        const int q_row = row0 + row;
+
+        if (q_row < N) {
+            float s = rowSum[row];
+            float acc_val = shAcc[row * V_HEAD_DIM + col];
+            float normalized = acc_val / (s > 1e-10f ? s : 1.0f);
+
+            // Direct strided store to output
+            const int64_t dst_idx = col + (int64_t)q_row * strides.o_stride_seq + (int64_t)head_idx * strides.o_stride_head;
+            O[dst_idx] = normalized;
+        }
+    }
+}
+
+// Wrapper for DG2 (nsize=8) with strided direct loading
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, fattn_input_type InputType, bool V_FROM_K = false>
+inline void flash_attn_coopmat_kernel_strided_n8(
+    sycl::nd_item<2> it,
+    const void * Q, const void * K, const void * V,
+    float * O, float * l_d, float * m_d,
+    const int64_t N, const int64_t N_kv, const int n_heads, const int n_kv_heads,
+    const int gqa_ratio, const float scale,
+    const float * mask, const int64_t mask_stride,
+    const fattn_tensor_strides strides, float * shmem
+) {
+    flash_attn_coopmat_kernel_strided<HEAD_DIM, V_HEAD_DIM, InputType, V_FROM_K, 8, 8, 16>(
+        it, Q, K, V, O, l_d, m_d, N, N_kv, n_heads, n_kv_heads,
+        gqa_ratio, scale, mask, mask_stride, strides, shmem
+    );
+}
+
+// Wrapper for PVC/B60 (nsize=16) with strided direct loading
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, fattn_input_type InputType, bool V_FROM_K = false>
+inline void flash_attn_coopmat_kernel_strided_n16(
+    sycl::nd_item<2> it,
+    const void * Q, const void * K, const void * V,
+    float * O, float * l_d, float * m_d,
+    const int64_t N, const int64_t N_kv, const int n_heads, const int n_kv_heads,
+    const int gqa_ratio, const float scale,
+    const float * mask, const int64_t mask_stride,
+    const fattn_tensor_strides strides, float * shmem
+) {
+    flash_attn_coopmat_kernel_strided<HEAD_DIM, V_HEAD_DIM, InputType, V_FROM_K, 8, 16, 16>(
+        it, Q, K, V, O, l_d, m_d, N, N_kv, n_heads, n_kv_heads,
+        gqa_ratio, scale, mask, mask_stride, strides, shmem
     );
 }
 
