@@ -28,6 +28,18 @@ Based on analysis of llama.cpp's SYCL flash attention and the flash-linear-atten
   - Eliminates intermediate F32 buffers
 - [ ] **3.2** Add varlen (cu_seqlens) support for variable-length sequences
 
+## Test Status
+
+| Test Case | Status | Notes |
+|-----------|--------|-------|
+| Backend ops (hsk=64/128, DQK==DV) | ✅ PASS | All f32/f16 variants |
+| Backend ops (hsk=40, DQK==DV) | ✅ PASS | Padded head size |
+| Backend ops (hsk=576, hsv=512) | ❌ FAIL | MLA case - XMX disabled |
+| llama-bench MKL flash attn | ✅ PASS | ~1450 t/s pp512 |
+| llama-bench default path | ✅ PASS | ~1450 t/s pp512 |
+
+**Note:** XMX cooperative matrix is disabled in CMakeLists.txt (line 155) due to memory faults on Arc B60. Without XMX, the 576/512 MLA case has no working path since MKL requires DQK==DV.
+
 ## Usage
 
 ### Enable Direct Loading (Task 1.1)
