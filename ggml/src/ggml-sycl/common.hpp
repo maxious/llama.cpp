@@ -78,8 +78,9 @@ extern int g_ggml_sycl_prioritize_dmmv;
 #define __SYCL_ARCH__ DPCT_COMPATIBILITY_TEMP
 #define VER_4VEC 610 // todo for hardward optimize.
 #define VER_GEN9 700 // todo for hardward optimize.
-#define VER_GEN12 1000000 // todo for hardward optimize.
-#define VER_GEN13 (VER_GEN12 + 1030) // todo for hardward optimize.
+#define VER_GEN12 1200 // todo for hardward optimize.
+#define VER_GEN13 1300 // todo for hardward optimize.
+#define VER_GEN20 2000 // Intel Xe2 (Battlemage)
 
 #define GGML_SYCL_MAX_NODES 8192 // TODO: adapt to hardwares
 
