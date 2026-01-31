@@ -1723,7 +1723,11 @@ static void ggml_mul_mat_q4_0_q8_1_sycl(const void *vx, const void *vy,
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
-    if (compute_capability >= VER_GEN13) {
+    if (compute_capability >= VER_GEN20) {
+        mmq_x  =  MMQ_X_Q4_0_RDNA2;
+        mmq_y  =  MMQ_Y_Q4_0_RDNA2;
+        nwarps = NWARPS_Q4_0_RDNA2;
+    } else if (compute_capability >= VER_GEN13) {
         mmq_x  =  MMQ_X_Q4_0_RDNA2;
         mmq_y  =  MMQ_Y_Q4_0_RDNA2;
         nwarps = NWARPS_Q4_0_RDNA2;
@@ -1838,7 +1842,11 @@ static void ggml_mul_mat_q4_1_q8_1_sycl(const void *vx, const void *vy,
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
-    if (compute_capability >= VER_GEN13) {
+    if (compute_capability >= VER_GEN20) {
+        mmq_x  =  MMQ_X_Q4_1_RDNA2;
+        mmq_y  =  MMQ_Y_Q4_1_RDNA2;
+        nwarps = NWARPS_Q4_1_RDNA2;
+    } else if (compute_capability >= VER_GEN13) {
         mmq_x  =  MMQ_X_Q4_1_RDNA2;
         mmq_y  =  MMQ_Y_Q4_1_RDNA2;
         nwarps = NWARPS_Q4_1_RDNA2;
@@ -1953,7 +1961,11 @@ static void ggml_mul_mat_q5_0_q8_1_sycl(const void *vx, const void *vy,
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
-    if (compute_capability >= VER_GEN13) {
+    if (compute_capability >= VER_GEN20) {
+        mmq_x  =  MMQ_X_Q5_0_RDNA2;
+        mmq_y  =  MMQ_Y_Q5_0_RDNA2;
+        nwarps = NWARPS_Q5_0_RDNA2;
+    } else if (compute_capability >= VER_GEN13) {
         mmq_x  =  MMQ_X_Q5_0_RDNA2;
         mmq_y  =  MMQ_Y_Q5_0_RDNA2;
         nwarps = NWARPS_Q5_0_RDNA2;
@@ -2068,7 +2080,11 @@ static void ggml_mul_mat_q5_1_q8_1_sycl(const void *vx, const void *vy,
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
-    if (compute_capability >= VER_GEN13) {
+    if (compute_capability >= VER_GEN20) {
+        mmq_x  =  MMQ_X_Q5_1_RDNA2;
+        mmq_y  =  MMQ_Y_Q5_1_RDNA2;
+        nwarps = NWARPS_Q5_1_RDNA2;
+    } else if (compute_capability >= VER_GEN13) {
         mmq_x  =  MMQ_X_Q5_1_RDNA2;
         mmq_y  =  MMQ_Y_Q5_1_RDNA2;
         nwarps = NWARPS_Q5_1_RDNA2;
@@ -2183,7 +2199,11 @@ static void ggml_mul_mat_q8_0_q8_1_sycl(const void *vx, const void *vy,
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
-    if (compute_capability >= VER_GEN13) {
+    if (compute_capability >= VER_GEN20) {
+        mmq_x  =  MMQ_X_Q8_0_RDNA2;
+        mmq_y  =  MMQ_Y_Q8_0_RDNA2;
+        nwarps = NWARPS_Q8_0_RDNA2;
+    } else if (compute_capability >= VER_GEN13) {
         mmq_x  =  MMQ_X_Q8_0_RDNA2;
         mmq_y  =  MMQ_Y_Q8_0_RDNA2;
         nwarps = NWARPS_Q8_0_RDNA2;
@@ -2298,7 +2318,11 @@ static void ggml_mul_mat_q2_K_q8_1_sycl(const void *vx, const void *vy,
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
-    if (compute_capability >= VER_GEN13) {
+    if (compute_capability >= VER_GEN20) {
+        mmq_x  =  MMQ_X_Q2_K_RDNA2;
+        mmq_y  =  MMQ_Y_Q2_K_RDNA2;
+        nwarps = NWARPS_Q2_K_RDNA2;
+    } else if (compute_capability >= VER_GEN13) {
         mmq_x  =  MMQ_X_Q2_K_RDNA2;
         mmq_y  =  MMQ_Y_Q2_K_RDNA2;
         nwarps = NWARPS_Q2_K_RDNA2;
@@ -2421,7 +2445,11 @@ static void ggml_mul_mat_q3_K_q8_1_sycl(const void *vx, const void *vy,
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
-    if (compute_capability >= VER_GEN13) {
+    if (compute_capability >= VER_GEN20) {
+        mmq_x  =  MMQ_X_Q3_K_RDNA2;
+        mmq_y  =  MMQ_Y_Q3_K_RDNA2;
+        nwarps = NWARPS_Q3_K_RDNA2;
+    } else if (compute_capability >= VER_GEN13) {
         mmq_x  =  MMQ_X_Q3_K_RDNA2;
         mmq_y  =  MMQ_Y_Q3_K_RDNA2;
         nwarps = NWARPS_Q3_K_RDNA2;
@@ -2549,7 +2577,11 @@ static void ggml_mul_mat_q4_K_q8_1_sycl(const void *vx, const void *vy,
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
-    if (compute_capability >= VER_GEN13) {
+    if (compute_capability >= VER_GEN20) {
+        mmq_x  =  MMQ_X_Q4_K_RDNA2;
+        mmq_y  =  MMQ_Y_Q4_K_RDNA2;
+        nwarps = NWARPS_Q4_K_RDNA2;
+    } else if (compute_capability >= VER_GEN13) {
         mmq_x  =  MMQ_X_Q4_K_RDNA2;
         mmq_y  =  MMQ_Y_Q4_K_RDNA2;
         nwarps = NWARPS_Q4_K_RDNA2;
@@ -2670,7 +2702,11 @@ static void ggml_mul_mat_q5_K_q8_1_sycl(const void *vx, const void *vy,
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
-    if (compute_capability >= VER_GEN13) {
+    if (compute_capability >= VER_GEN20) {
+        mmq_x  =  MMQ_X_Q5_K_RDNA2;
+        mmq_y  =  MMQ_Y_Q5_K_RDNA2;
+        nwarps = NWARPS_Q5_K_RDNA2;
+    } else if (compute_capability >= VER_GEN13) {
         mmq_x  =  MMQ_X_Q5_K_RDNA2;
         mmq_y  =  MMQ_Y_Q5_K_RDNA2;
         nwarps = NWARPS_Q5_K_RDNA2;
@@ -2791,7 +2827,11 @@ static void ggml_mul_mat_q6_K_q8_1_sycl(const void *vx, const void *vy,
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
-    if (compute_capability >= VER_GEN13) {
+    if (compute_capability >= VER_GEN20) {
+        mmq_x  =  MMQ_X_Q6_K_RDNA2;
+        mmq_y  =  MMQ_Y_Q6_K_RDNA2;
+        nwarps = NWARPS_Q6_K_RDNA2;
+    } else if (compute_capability >= VER_GEN13) {
         mmq_x  =  MMQ_X_Q6_K_RDNA2;
         mmq_y  =  MMQ_Y_Q6_K_RDNA2;
         nwarps = NWARPS_Q6_K_RDNA2;

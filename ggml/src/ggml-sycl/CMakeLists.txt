@@ -147,8 +147,17 @@ if (GGML_SYCL_BF16)
     add_compile_definitions(GGML_SYCL_BF16)
 endif()
 
+option(GGML_SYCL_XE2 "Optimize for Intel Xe2 (Battlemage) GPU" OFF)
+
 if (GGML_SYCL_TARGET STREQUAL "INTEL")
-    add_compile_definitions(GGML_SYCL_WARP_SIZE=16)
+    if (GGML_SYCL_XE2)
+        message(STATUS "GGML_SYCL_XE2: ON (Optimizing for Battlemage: Warp 32, XMX ON)")
+        add_compile_definitions(GGML_SYCL_WARP_SIZE=32)
+        set(GGML_SYCL_XMX ON)
+    else()
+        add_compile_definitions(GGML_SYCL_WARP_SIZE=16)
+    endif()
+
     if (GGML_SYCL_XMX)
         message(STATUS "GGML_SYCL_XMX: ON (cooperative matrix flash attention enabled)")
         add_compile_definitions(SYCL_EXT_COOPERATIVE_MATRICES)
