@@ -75,13 +75,6 @@ static ggml_sycl_device_info ggml_sycl_init() {
 
     GGML_ASSERT(info.device_count <= GGML_SYCL_MAX_DEVICES);
 
-    int64_t total_vram = 0;
-/* This is a bit misleading;  reserved for later */
-// #if defined(SYCL_USE_XMX)
-//     GGML_LOG_INFO("%s: SYCL_USE_XMX: yes\n", __func__);
-// #else
-//     GGML_LOG_INFO("%s: SYCL_USE_XMX: no\n", __func__);
-// #endif
     for (int i = 0; i < info.device_count; ++i) {
         info.devices[i].vmm = 0;
         dpct::device_info prop;
@@ -90,8 +83,7 @@ static ggml_sycl_device_info ggml_sycl_init() {
         SYCL_CHECK(CHECK_TRY_ERROR(dpct::get_device_info(
             prop, device)));
 
-        info.default_tensor_split[i] = total_vram;
-        total_vram += prop.get_global_mem_size();
+        info.default_tensor_split[i] = prop.get_global_mem_size();
 
         info.devices[i].cc =
             100 * prop.get_major_version() + 10 * prop.get_minor_version();
@@ -102,9 +94,6 @@ static ggml_sycl_device_info ggml_sycl_init() {
         info.max_work_group_sizes[i] = prop.get_max_work_group_size();
     }
 
-    for (int id = 0; id < info.device_count; ++id) {
-        info.default_tensor_split[id] /= total_vram;
-    }
     return info;
 }
 
@@ -1231,28 +1220,28 @@ static ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type_impl(const
     std::array<float, GGML_SYCL_MAX_DEVICES> tensor_split_arr = {};
 
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + GGML_SYCL_MAX_DEVICES, [](float x) { return x == 0.0f; });
+    const float * source_split = tensor_split;
     if (all_zero) {
-        tensor_split_arr = ggml_sycl_info().default_tensor_split;
-        GGML_SYCL_DEBUG("[SYCL] split_buffer_type using default_tensor_split: ");
-        for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
-            GGML_SYCL_DEBUG("[%d]=%.4f ", i, tensor_split_arr[i]);
-        }
-        GGML_SYCL_DEBUG("\n");
-    } else {
-        float split_sum = 0.0f;
-        for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
-            tensor_split_arr[i] = split_sum;
-            split_sum += tensor_split[i];
-        }
+        source_split = ggml_sycl_info().default_tensor_split.data();
+    }
+
+    float split_sum = 0.0f;
+    for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
+        tensor_split_arr[i] = split_sum;
+        split_sum += source_split[i];
+    }
+
+    if (split_sum > 0.0f) {
         for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
             tensor_split_arr[i] /= split_sum;
         }
-        GGML_SYCL_DEBUG("[SYCL] split_buffer_type computed cumulative tensor_split: ");
-        for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
-            GGML_SYCL_DEBUG("[%d]=%.4f ", i, tensor_split_arr[i]);
-        }
-        GGML_SYCL_DEBUG("\n");
     }
+
+    GGML_SYCL_DEBUG("[SYCL] split_buffer_type computed cumulative tensor_split: ");
+    for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
+        GGML_SYCL_DEBUG("[%d]=%.4f ", i, tensor_split_arr[i]);
+    }
+    GGML_SYCL_DEBUG("\n");
 
     auto it = buft_map.find(tensor_split_arr);
     if (it != buft_map.end()) {
