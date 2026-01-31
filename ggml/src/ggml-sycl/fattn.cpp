@@ -1485,7 +1485,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const sycl::half * Q_f16 = (const sycl::half *) Q->data;
         const int64_t q_stride_seq = Q->nb[1] / sizeof(sycl::half);
         const int64_t q_stride_head = Q->nb[2] / sizeof(sycl::half);
-        stream->submit([&](sycl::handler& cgh) {
+        sycl::event q_event = stream->submit([&](sycl::handler& cgh) {
             const int64_t total = N * DQK * n_heads;
             cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
                 const int idx = it.get_id(0);
@@ -1497,11 +1497,12 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 Q_d_f32_alloc[idx] = static_cast<float>(Q_f16[d + head * q_stride_head + n * q_stride_seq]);
             });
         });
+        q_event.wait();
     } else {
         const float * Q_f32 = (const float *) Q->data;
         const int64_t q_stride_seq = Q->nb[1] / sizeof(float);
         const int64_t q_stride_head = Q->nb[2] / sizeof(float);
-        stream->submit([&](sycl::handler& cgh) {
+        sycl::event q_event = stream->submit([&](sycl::handler& cgh) {
             const int64_t total = N * DQK * n_heads;
             cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
                 const int idx = it.get_id(0);
@@ -1513,6 +1514,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 Q_d_f32_alloc[idx] = Q_f32[d + head * q_stride_head + n * q_stride_seq];
             });
         });
+        q_event.wait();
     }
     Q_d_f32 = Q_d_f32_alloc;
 
@@ -1521,7 +1523,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const sycl::half * K_f16 = (const sycl::half *) K->data;
         const int64_t k_stride_seq = K->nb[1] / sizeof(sycl::half);
         const int64_t k_stride_head = K->nb[2] / sizeof(sycl::half);
-        stream->submit([&](sycl::handler& cgh) {
+        sycl::event k_event = stream->submit([&](sycl::handler& cgh) {
             const int64_t total = N_kv * DQK * n_kv_heads;
             cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
                 const int idx = it.get_id(0);
@@ -1533,11 +1535,12 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 K_d_f32_alloc[idx] = static_cast<float>(K_f16[d + head * k_stride_head + n * k_stride_seq]);
             });
         });
+        k_event.wait();
     } else {
         const float * K_f32 = (const float *) K->data;
         const int64_t k_stride_seq = K->nb[1] / sizeof(float);
         const int64_t k_stride_head = K->nb[2] / sizeof(float);
-        stream->submit([&](sycl::handler& cgh) {
+        sycl::event k_event = stream->submit([&](sycl::handler& cgh) {
             const int64_t total = N_kv * DQK * n_kv_heads;
             cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
                 const int idx = it.get_id(0);
@@ -1549,6 +1552,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 K_d_f32_alloc[idx] = K_f32[d + head * k_stride_head + n * k_stride_seq];
             });
         });
+        k_event.wait();
     }
     K_d_f32 = K_d_f32_alloc;
 
@@ -1560,7 +1564,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // K layout is [kv_lora_scaled (DV), pe (DQK-DV)] = DQK total
         // V uses only the first DV elements of each K row
         V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
-        stream->submit([&](sycl::handler& cgh) {
+        sycl::event v_event = stream->submit([&](sycl::handler& cgh) {
             const int64_t total = N_kv * DV * n_kv_heads;
             cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
                 const int idx = it.get_id(0);
@@ -1573,6 +1577,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 V_d_f32_alloc[idx] = K_d_f32[head * N_kv * DQK + n * DQK + d];
             });
         });
+        v_event.wait();
         V_d_f32 = V_d_f32_alloc;
     } else {
         V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
@@ -1580,7 +1585,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const sycl::half * V_f16 = (const sycl::half *) V->data;
             const int64_t v_stride_seq = V->nb[1] / sizeof(sycl::half);
             const int64_t v_stride_head = V->nb[2] / sizeof(sycl::half);
-            stream->submit([&](sycl::handler& cgh) {
+            sycl::event v_event = stream->submit([&](sycl::handler& cgh) {
                 const int64_t total = N_kv * DV * n_kv_heads;
                 cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
                     const int idx = it.get_id(0);
@@ -1592,11 +1597,12 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     V_d_f32_alloc[idx] = static_cast<float>(V_f16[d + head * v_stride_head + n * v_stride_seq]);
                 });
             });
+            v_event.wait();
         } else {
             const float * V_f32 = (const float *) V->data;
             const int64_t v_stride_seq = V->nb[1] / sizeof(float);
             const int64_t v_stride_head = V->nb[2] / sizeof(float);
-            stream->submit([&](sycl::handler& cgh) {
+            sycl::event v_event = stream->submit([&](sycl::handler& cgh) {
                 const int64_t total = N_kv * DV * n_kv_heads;
                 cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
                     const int idx = it.get_id(0);
@@ -1608,6 +1614,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     V_d_f32_alloc[idx] = V_f32[d + head * v_stride_head + n * v_stride_seq];
                 });
             });
+            v_event.wait();
         }
         V_d_f32 = V_d_f32_alloc;
     }
