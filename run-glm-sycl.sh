@@ -56,25 +56,22 @@ if ! groups | grep -qwE "(render|video)"; then
     echo "Then log out and back in."
 fi
 
-# Flash attention - try MKL path (XMX=0) to debug
-export GGML_SYCL_FLASH_ATTN_XMX=0
 
 # Debug logging
-export GGML_SYCL_DEBUG=1
-export GGML_SYCL_FLASH_ATTN_DEBUG=1
-export LLAMA_BATCH_DEBUG=1
-export LLAMA_KV_CACHE_DEBUG=1
-export LLAMA_GRAPH_INPUT_DEBUG=1
-export LLAMA_GRAPH_RESULT_DEBUG=1
+#export GGML_SYCL_DEBUG=1
+#export GGML_SYCL_FLASH_ATTN_DEBUG=1
+#export LLAMA_BATCH_DEBUG=1
+#export LLAMA_KV_CACHE_DEBUG=1
+#export LLAMA_GRAPH_INPUT_DEBUG=1
+#export LLAMA_GRAPH_RESULT_DEBUG=1
 
 echo "Starting llama-server in background..."
 echo "Log file: $LOG_FILE"
 echo "PID file: $PID_FILE"
 
 nohup ./build-sycl/bin/llama-server \
-    --model ../koboldcpp/GLM-4.7-Flash-SynthLabs-REAP-25-Q4_K_M.gguf \
+    --model models/koboldcpp/GLM-4.7-Flash-REAP-23B-A3B-Q8_0.gguf \
     --port 5000 --host 0.0.0.0 \
-    --ctx-size 512 --no-warmup --cache-ram 0 \
     --fit on --flash-attn on \
     --temp 0.7 --top-p 1.0 --min-p 0.01 \
     > "$LOG_FILE" 2>&1 &

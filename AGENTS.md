@@ -116,6 +116,41 @@ Top kernels:
 Diagnosis: Memory-bound. Model size (23GB) exceeds efficient memory bandwidth.
 Solution: Use smaller model (8B) or Q4_K quantization.
 
+## KV-Split Flash Attention (Flash Decoding) - Experimental
+
+### Status
+
+An experimental KV-split (Flash Decoding) path has been implemented in `ggml/src/ggml-sycl/fattn.cpp`:
+
+- **Function**: `ggml_sycl_op_flash_attn_mkl_kv_split<DQK, DV>()`
+- **Environment variable**: `GGML_SYCL_FLASH_ATTN_KV_SPLIT=1` to force enable, `=0` to disable
+- **Algorithm**: Splits KV dimension across multiple chunks, computes partial attention per chunk, then merges using online softmax reduction
+
+### Current Limitations
+
+The current implementation processes KV splits **sequentially** on the host (using a for-loop with stream->wait() between splits). This means:
+- No parallelism benefit yet - all splits run serially
+- Adds overhead from extra memory allocations and synchronization
+
+### Future Optimization
+
+To get actual parallelism benefits, the implementation needs:
+1. Launch all split kernels in parallel (different workgroups)
+2. Use a single reduction kernel after all splits complete
+3. Avoid host-side loops - everything should be GPU-side
+
+This would require significant restructuring to:
+- Create a kernel that takes (head, kv_split) as workgroup indices
+- Implement a separate reduction kernel
+- Manage dependencies properly with SYCL event DAG
+
+### When It Would Help
+
+The optimization is beneficial when:
+- N (query length) is small (decode phase, N=1-4)
+- N_kv (context length) is large (2K+ tokens)
+- n_heads is small/moderate (device is underutilized)
+
 ## Flash Attention: XMX vs MKL
 
 ### Summary
