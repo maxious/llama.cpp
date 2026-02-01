@@ -547,7 +547,46 @@ struct ggml_backend_sycl_context {
     }
 
     ggml_sycl_pool & host_pool() { return host_pool(device); }
+
+    struct staging_buffer_pool {
+        char* buffer;
+        size_t size;
+        size_t max_size;
+        sycl::event last_event;
+        bool in_use;
+        
+        staging_buffer_pool() : buffer(nullptr), size(0), max_size(0), in_use(false) {}
+        
+        ~staging_buffer_pool() {
+            if (buffer) {
+                sycl::free(buffer, dpct::get_default_queue());
+            }
+        }
+        
+        void ensure_size(size_t required_size, sycl::queue& q) {
+            if (buffer == nullptr || required_size > max_size) {
+                if (buffer) {
+                    sycl::free(buffer, q);
+                }
+                max_size = required_size * 2; // Allocate 2x to reduce reallocations
+                buffer = sycl::malloc_host<char>(max_size, q);
+                if (!buffer) {
+                    throw std::runtime_error("Failed to allocate staging buffer");
+                }
+            }
+            size = required_size;
+        }
+    };
+    
+    staging_buffer_pool staging_pools[GGML_SYCL_MAX_DEVICES];
 };
+
+// P3: XPTI correlation helper for command group naming
+// Usage: SYCL_NAMED_KERNEL(stream, "kernel_name") << [=](sycl::nd_item<3> item) { ... };
+#define SYCL_NAMED_KERNEL(queue, name) \
+    queue->submit([&](sycl::handler &h) { \
+        h.set_name(name); \
+        h.parallel_for
 
 // common device functions
 

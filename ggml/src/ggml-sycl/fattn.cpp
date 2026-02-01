@@ -575,6 +575,7 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
 template<int64_t DQK, int64_t DV>
 void ggml_sycl_op_flash_attn_coopmat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    GGML_SYCL_DEBUG("[SYCL] Flash attention coopmat kernel (padded)\n");
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
@@ -1311,6 +1312,7 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
 // ============================================================================
 template<int64_t DQK, int64_t DV>
 void ggml_sycl_op_flash_attn_coopmat_direct(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    GGML_SYCL_DEBUG("[SYCL] Flash attention coopmat_direct kernel: DQK=%d, DV=%d\n", DQK, DV);
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];

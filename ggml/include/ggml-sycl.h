@@ -33,6 +33,7 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type(void);
 
 GGML_BACKEND_API void ggml_backend_sycl_print_sycl_devices(void);
+GGML_BACKEND_API void ggml_sycl_print_copy_stats(void);
 GGML_BACKEND_API void ggml_backend_sycl_get_gpu_list(int *id_list, int max_len);
 GGML_BACKEND_API void ggml_backend_sycl_get_device_description(int device,
                                                        char *description,

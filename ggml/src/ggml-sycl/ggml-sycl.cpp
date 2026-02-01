@@ -63,6 +63,34 @@ int g_ggml_sycl_disable_graph = 0;
 int g_ggml_sycl_disable_dnn = 0;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
+int g_ggml_sycl_force_sync_copies = 0;
+
+static struct ggml_sycl_copy_stats {
+    size_t h2d_bytes;
+    size_t d2h_bytes;
+    size_t d2d_bytes;
+    size_t d2d_host_staged_bytes;
+    size_t d2d_p2p_bytes;
+    int wait_count;
+    int queues_wait_and_throw_count;
+    std::atomic<int> active_copies;
+    
+    ggml_sycl_copy_stats() : h2d_bytes(0), d2h_bytes(0), d2d_bytes(0),
+                             d2d_host_staged_bytes(0), d2d_p2p_bytes(0),
+                             wait_count(0), queues_wait_and_throw_count(0),
+                             active_copies(0) {}
+    
+    void reset() {
+        h2d_bytes = 0;
+        d2h_bytes = 0;
+        d2d_bytes = 0;
+        d2d_host_staged_bytes = 0;
+        d2d_p2p_bytes = 0;
+        wait_count = 0;
+        queues_wait_and_throw_count = 0;
+        active_copies = 0;
+    }
+} g_copy_stats;
 
 static ggml_sycl_device_info ggml_sycl_init() {
     ggml_sycl_device_info info = {};
@@ -201,6 +229,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_disable_graph = get_sycl_env("GGML_SYCL_DISABLE_GRAPH", 1);
         g_ggml_sycl_disable_dnn = get_sycl_env("GGML_SYCL_DISABLE_DNN", 0);
         g_ggml_sycl_prioritize_dmmv = get_sycl_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
+        g_ggml_sycl_force_sync_copies = get_sycl_env("GGML_SYCL_FORCE_SYNC_COPIES", 0);
         GGML_SYCL_DEBUG("[SYCL] call ggml_check_sycl\n");
         GGML_LOG_INFO("Running with Environment Variables:\n");
         GGML_LOG_INFO("  GGML_SYCL_DEBUG: %d\n", g_ggml_sycl_debug);
@@ -216,6 +245,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: DNN disabled by compile flag\n");
 #endif
         GGML_LOG_INFO("  GGML_SYCL_PRIORITIZE_DMMV: %d\n", g_ggml_sycl_prioritize_dmmv);
+        GGML_LOG_INFO("  GGML_SYCL_FORCE_SYNC_COPIES: %d\n", g_ggml_sycl_force_sync_copies);
         GGML_LOG_INFO("Build with Macros:\n");
 #if defined(GGML_SYCL_FORCE_MMQ)
         GGML_LOG_INFO("  GGML_SYCL_FORCE_MMQ: yes\n");
@@ -323,20 +353,83 @@ struct ggml_backend_sycl_buffer_context {
     optimize_feature opt_feature;
     std::vector<ggml_tensor_extra_gpu *> tensor_extras;
 
+    struct staging_buffer_pool {
+        char* buffer;
+        size_t size;
+        size_t max_size;
+        sycl::event last_event;
+        queue_ptr owner_stream;
+        size_t total_allocations;
+        size_t total_resizes;
+        size_t total_bytes_copied;
+
+        staging_buffer_pool(queue_ptr q) : buffer(nullptr), size(0), max_size(0), owner_stream(q),
+                                           total_allocations(0), total_resizes(0), total_bytes_copied(0) {}
+
+        ~staging_buffer_pool() {
+            if (buffer) {
+                GGML_SYCL_DEBUG("[SYCL] Staging pool cleanup: freeing %zu bytes (max_size=%zu, total_allocations=%zu, total_resizes=%zu, total_bytes_copied=%zu)\n",
+                                size, max_size, total_allocations, total_resizes, total_bytes_copied);
+                sycl::free(buffer, *owner_stream);
+            }
+        }
+
+        void ensure_size(size_t required_size) {
+            bool is_new_allocation = (buffer == nullptr);
+            bool is_resize = (required_size > max_size);
+
+            if (is_new_allocation || is_resize) {
+                if (buffer) {
+                    GGML_SYCL_DEBUG("[SYCL] Staging pool resize: %zu -> %zu bytes (required=%zu, 2x over-allocation)\n",
+                                    max_size, required_size * 2, required_size);
+                    sycl::free(buffer, *owner_stream);
+                    total_resizes++;
+                } else {
+                    GGML_SYCL_DEBUG("[SYCL] Staging pool initial allocation: %zu bytes (required=%zu, 2x over-allocation)\n",
+                                    required_size * 2, required_size);
+                    total_allocations++;
+                }
+                max_size = required_size * 2;
+                buffer = sycl::malloc_host<char>(max_size, *owner_stream);
+                if (!buffer) {
+                    throw std::runtime_error("Failed to allocate staging buffer");
+                }
+            } else {
+                GGML_SYCL_DEBUG("[SYCL] Staging pool reusing existing buffer: %zu bytes (max_size=%zu, required=%zu)\n",
+                                size, max_size, required_size);
+            }
+            size = required_size;
+        }
+
+        void record_copy(size_t bytes) {
+            total_bytes_copied += bytes;
+        }
+
+        void print_stats() {
+            GGML_SYCL_DEBUG("[SYCL] Staging pool stats: buffer=%p, size=%zu, max_size=%zu, total_allocations=%zu, total_resizes=%zu, total_bytes_copied=%zu\n",
+                            buffer, size, max_size, total_allocations, total_resizes, total_bytes_copied);
+        }
+    };
+    
+    staging_buffer_pool staging_pool;
+
     ggml_backend_sycl_buffer_context(int device, void * dev_ptr, queue_ptr stream) :
-        device(device), dev_ptr(dev_ptr), stream(stream) {
+        device(device), dev_ptr(dev_ptr), stream(stream), staging_pool(stream) {
             check_allow_gpu_index(device);
             name = (GGML_SYCL_NAME + std::to_string(device));
             opt_feature = ggml_sycl_info().devices[device].opt_feature;
         }
 
     ~ggml_backend_sycl_buffer_context() {
+        staging_pool.print_stats();
+
+        ggml_sycl_print_copy_stats();
+
         if (dev_ptr != nullptr) {
             ggml_sycl_set_device(device);
             SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(dev_ptr, *stream)));
         }
 
-        //release extra used by tensors
         for (ggml_tensor_extra_gpu * extra : tensor_extras) {
             release_extra_gpu(extra);
         }
@@ -415,17 +508,34 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
     ggml_sycl_set_device(ctx->device);
     auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
+    
+    g_copy_stats.queues_wait_and_throw_count++;
     SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
+    
+    g_copy_stats.active_copies++;
+    g_copy_stats.h2d_bytes += size;
+    
+    auto dst_ptr_type = sycl::get_pointer_type((char *)tensor->data + offset, stream->get_context());
+    const char* dst_type_str = 
+        dst_ptr_type == sycl::usm::alloc::device ? "device" :
+        dst_ptr_type == sycl::usm::alloc::shared ? "shared" :
+        dst_ptr_type == sycl::usm::alloc::host ? "host" : "unknown";
+    
+    GGML_SYCL_DEBUG("[SYCL] H→D copy: %zu bytes, dst=%s (device %d)\n", 
+                    size, dst_type_str, ctx->device);
+    
 #ifndef _WIN32
-    // Note: Use host buffer to save the data from mmap(), then copy to device. It's workaround for mmap() issue on PVC GPU.
-    // This function will be called during load model from disk. Use memory buffer replace dynamic won't save more time and brings potential memory leak risk here.
     char * host_buf = (char *) malloc(size);
     memcpy(host_buf, data, size);
+    g_copy_stats.wait_count++;
     SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, host_buf, size).wait()));
     free(host_buf);
 #else
+    g_copy_stats.wait_count++;
     SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
 #endif
+    
+    g_copy_stats.active_copies--;
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -444,10 +554,25 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
 
     ggml_sycl_set_device(ctx->device);
     auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
+    
+    g_copy_stats.active_copies++;
+    g_copy_stats.d2h_bytes += size;
+    
+    auto src_ptr_type = sycl::get_pointer_type((const char *)tensor->data + offset, stream.get_context());
+    const char* src_type_str = 
+        src_ptr_type == sycl::usm::alloc::device ? "device" :
+        src_ptr_type == sycl::usm::alloc::shared ? "shared" :
+        src_ptr_type == sycl::usm::alloc::host ? "host" : "unknown";
+    
+    GGML_SYCL_DEBUG("[SYCL] D→H copy: %zu bytes, src=%s (device %d)\n", 
+                    size, src_type_str, ctx->device);
 
+    g_copy_stats.wait_count++;
     SYCL_CHECK(CHECK_TRY_ERROR(
         stream.memcpy(data, (const char *)tensor->data + offset, size)
             .wait()));
+    
+    g_copy_stats.active_copies--;
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -471,68 +596,138 @@ static bool ggml_sycl_peer_access_is_enabled(const sycl::queue &q_dst, const syc
     return g_sycl_peer_access_enabled[dst_id][src_id];
 }
 
-static void dev2dev_memcpy(sycl::queue &q_dst, sycl::queue &q_src, void *ptr_dst,
+static void dev2dev_memcpy(ggml_backend_sycl_buffer_context * dst_ctx,
+                            sycl::queue &q_dst, sycl::queue &q_src, void *ptr_dst,
                     const void *ptr_src, size_t size) {
+    g_copy_stats.active_copies++;
+    g_copy_stats.d2d_bytes += size;
+    
+    int dst_id = ggml_sycl_get_device_id(q_dst.get_device());
+    int src_id = ggml_sycl_get_device_id(q_src.get_device());
+    
+    auto src_ptr_type = sycl::get_pointer_type(ptr_src, q_src.get_context());
+    auto dst_ptr_type = sycl::get_pointer_type(ptr_dst, q_dst.get_context());
+    
+    const char* src_type_str = 
+        src_ptr_type == sycl::usm::alloc::device ? "device" :
+        src_ptr_type == sycl::usm::alloc::shared ? "shared" :
+        src_ptr_type == sycl::usm::alloc::host ? "host" : "unknown";
+    const char* dst_type_str = 
+        dst_ptr_type == sycl::usm::alloc::device ? "device" :
+        dst_ptr_type == sycl::usm::alloc::shared ? "shared" :
+        dst_ptr_type == sycl::usm::alloc::host ? "host" : "unknown";
+    
     // Check if same device - simple case
     if (q_dst.get_device() == q_src.get_device()) {
+        GGML_SYCL_DEBUG("[SYCL] D→D same-device: %zu bytes, src=%s, dst=%s (device %d)\n",
+                        size, src_type_str, dst_type_str, dst_id);
+        g_copy_stats.wait_count++;
         q_dst.memcpy(ptr_dst, ptr_src, size).wait();
+        g_copy_stats.active_copies--;
         return;
     }
 
+    GGML_SYCL_DEBUG("[SYCL] D→D cross-device: %zu bytes, src=%s (device %d), dst=%s (device %d)\n",
+                    size, src_type_str, src_id, dst_type_str, dst_id);
+
     // If peer access is enabled, prefer direct device-to-device memcpy
     if (ggml_sycl_peer_access_is_enabled(q_dst, q_src)) {
+        GGML_SYCL_DEBUG("[SYCL]   Using P2P direct copy\n");
+        g_copy_stats.d2d_p2p_bytes += size;
+        g_copy_stats.wait_count++;
         q_dst.memcpy(ptr_dst, ptr_src, size).wait();
+        g_copy_stats.active_copies--;
         return;
     }
 
     // With shared USM, the runtime handles page migration - use direct memcpy
     if (ggml_sycl_use_shared_usm()) {
+        GGML_SYCL_DEBUG("[SYCL]   Using shared USM (runtime page migration)\n");
+        g_copy_stats.wait_count++;
         q_dst.memcpy(ptr_dst, ptr_src, size).wait();
+        g_copy_stats.active_copies--;
         return;
     }
 
     // Cross-device copy using host-mediated path
     // P2P direct copies can cause device timeouts on some systems (including Intel Arc B60)
     // This is slower but reliable
-    char *host_buf = (char *)malloc(size);
-    if (!host_buf) {
-        throw std::runtime_error("Failed to allocate host buffer for cross-device copy");
-    }
-    q_src.memcpy(host_buf, ptr_src, size).wait();
-    q_dst.memcpy(ptr_dst, host_buf, size).wait();
-    free(host_buf);
+    GGML_SYCL_DEBUG("[SYCL]   Using pooled staging buffer with async copies\n");
+    g_copy_stats.d2d_host_staged_bytes += size;
+
+    // Use pooled staging buffer for async copies
+    dst_ctx->staging_pool.ensure_size(size);
+
+    dst_ctx->staging_pool.record_copy(size);
+
+    // Async D→H copy
+    auto ev_src = q_src.memcpy(dst_ctx->staging_pool.buffer, ptr_src, size);
+
+    // Async H→D copy with dependency on source copy
+    auto ev_dst = q_dst.memcpy(ptr_dst, dst_ctx->staging_pool.buffer, size, {ev_src});
+
+    // Store event for potential synchronization
+    dst_ctx->staging_pool.last_event = ev_dst;
+    
+    g_copy_stats.active_copies--;
 }
 
 // 2D strided copy between devices using P2P access
 // Copies 'width' bytes per row, 'height' rows total, with strides
-static void dev2dev_memcpy_2d(sycl::queue &q_dst, sycl::queue &q_src,
+static void dev2dev_memcpy_2d(ggml_backend_sycl_buffer_context * dst_ctx,
+                              sycl::queue &q_dst, sycl::queue &q_src,
                               void *ptr_dst, size_t dst_pitch,
                               const void *ptr_src, size_t src_pitch,
                               size_t width, size_t height) {
+    (void)dst_ctx; // TODO: Use staging pool for 2D copies in future optimization
+
+    int dst_id = ggml_sycl_get_device_id(q_dst.get_device());
+    int src_id = ggml_sycl_get_device_id(q_src.get_device());
+    size_t total_bytes = width * height;
+
+    g_copy_stats.active_copies++;
+    g_copy_stats.d2d_bytes += total_bytes;
+
+    GGML_SYCL_DEBUG("[SYCL] D→D 2D copy: %zu bytes (%zux%zu), src=device %d, dst=device %d\n",
+                    total_bytes, width, height, src_id, dst_id);
+
     // Check if same device - simple case
     if (q_dst.get_device() == q_src.get_device()) {
+        GGML_SYCL_DEBUG("[SYCL]   2D same-device copy\n");
+        g_copy_stats.wait_count++;
         dpct::async_dpct_memcpy(ptr_dst, dst_pitch, ptr_src, src_pitch,
                                 width, height, dpct::device_to_device, q_dst);
         // Don't wait here - let final sync handle it
+        g_copy_stats.active_copies--;
         return;
     }
 
     // If peer access is enabled, try direct device-to-device copy
     if (ggml_sycl_peer_access_is_enabled(q_dst, q_src)) {
+        GGML_SYCL_DEBUG("[SYCL]   2D P2P direct copy\n");
+        g_copy_stats.d2d_p2p_bytes += total_bytes;
+        g_copy_stats.wait_count++;
         dpct::async_dpct_memcpy(ptr_dst, dst_pitch, ptr_src, src_pitch,
                                 width, height, dpct::device_to_device, q_dst);
+        g_copy_stats.active_copies--;
         return;
     }
 
     // With shared USM, the runtime handles page migration - use direct memcpy
     if (ggml_sycl_use_shared_usm()) {
+        GGML_SYCL_DEBUG("[SYCL]   2D shared USM copy\n");
+        g_copy_stats.wait_count++;
         dpct::async_dpct_memcpy(ptr_dst, dst_pitch, ptr_src, src_pitch,
                                 width, height, dpct::device_to_device, q_dst);
+        g_copy_stats.active_copies--;
         return;
     }
 
     // For cross-device copy, wait for source kernel to complete first
     // This is required before we can read from the source buffer
+    GGML_SYCL_DEBUG("[SYCL]   2D host-mediated copy (malloc/free per copy)\n");
+    g_copy_stats.d2d_host_staged_bytes += total_bytes;
+    g_copy_stats.wait_count++;
     q_src.wait();
 
     // For cross-device copy, use host-mediated copy for reliability
@@ -565,6 +760,7 @@ static void dev2dev_memcpy_2d(sycl::queue &q_dst, sycl::queue &q_src,
     q_dst.wait();
 
     free(host_buf);
+    g_copy_stats.active_copies--;
 }
 
 static bool
@@ -581,33 +777,29 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         ggml_backend_sycl_buffer_context * dst_ctx = (ggml_backend_sycl_buffer_context *)dst->buffer->context;
 
         ggml_sycl_set_device(src_ctx->device);
-        /*
-        DPCT1009:198: SYCL uses exceptions to report errors and does not use the
-        error codes. The original code was commented out and a warning string
-        was inserted. You need to rewrite this code.
-        */
-        SYCL_CHECK(CHECK_TRY_ERROR(
-            dpct::dev_mgr::instance().get_device(src_ctx->device).queues_wait_and_throw()));
+        
+        // Guardrail: Force sync copies for debugging (set GGML_SYCL_FORCE_SYNC_COPIES=1)
+        if (g_ggml_sycl_force_sync_copies) {
+            g_copy_stats.queues_wait_and_throw_count++;
+            SYCL_CHECK(CHECK_TRY_ERROR(
+                dpct::dev_mgr::instance().get_device(src_ctx->device).queues_wait_and_throw()));
+        }
+        
         ggml_sycl_set_device(dst_ctx->device);
-        /*
-        DPCT1009:199: SYCL uses exceptions to report errors and does not use the
-        error codes. The original code was commented out and a warning string
-        was inserted. You need to rewrite this code.
-        */
-        SYCL_CHECK(CHECK_TRY_ERROR(
-            dpct::dev_mgr::instance().get_device(dst_ctx->device).queues_wait_and_throw()));
-        /*
-        DPCT1009:200: SYCL uses exceptions to report errors and does not use the
-        error codes. The original code was commented out and a warning string
-        was inserted. You need to rewrite this code.
-        */
+        
+        // Guardrail: Force sync copies for debugging (set GGML_SYCL_FORCE_SYNC_COPIES=1)
+        if (g_ggml_sycl_force_sync_copies) {
+            g_copy_stats.queues_wait_and_throw_count++;
+            SYCL_CHECK(CHECK_TRY_ERROR(
+                dpct::dev_mgr::instance().get_device(dst_ctx->device).queues_wait_and_throw()));
+        }
 
         queue_ptr stream_dst = dst_ctx->stream;
         queue_ptr stream_src = src_ctx->stream;
         size_t size = ggml_nbytes(src);
 
-        //todo. it's dirty solutino to walkaroud known issue:device2device cross GPUs.
-        dev2dev_memcpy(*stream_dst, *stream_src, dst->data, src->data, size);
+        // Cross-device copy - use dev2dev_memcpy which handles P2P, shared USM, or host staging
+        dev2dev_memcpy(dst_ctx, *stream_dst, *stream_src, dst->data, src->data, size);
 
 //todo, it's known issue：error in device2device cross GPUs. reused when the issue is fixed. DON"T remove
 #if 0
@@ -2207,19 +2399,50 @@ static dpct::err0 ggml_sycl_cpy_tensor_2d(void *dst,
 
     const char * x = src_ptr + i1_low*nb1 + i2*nb2 + i3*nb3;
     if (nb0 == ts && nb1 == ts*ne0/bs) {
+        size_t copy_size = i1_diff * nb1;
+        GGML_SYCL_DEBUG("[SYCL] cpy_tensor_2d: kind=%d, size=%zu bytes\n", kind, copy_size);
+        g_copy_stats.active_copies++;
+        if (kind == dpct::host_to_device) {
+            g_copy_stats.h2d_bytes += copy_size;
+        } else if (kind == dpct::device_to_host) {
+            g_copy_stats.d2h_bytes += copy_size;
+        } else if (kind == dpct::device_to_device) {
+            g_copy_stats.d2d_bytes += copy_size;
+            g_copy_stats.d2d_p2p_bytes += copy_size;
+        }
+        g_copy_stats.wait_count++;
         // GGML_SYCL_DEBUG("stream->memcpy: dst_ptr=%p, x=%p, size=%lu\n", dst_ptr, x, i1_diff * nb1);
         // return CHECK_TRY_ERROR(stream->memcpy(dst_ptr, x, i1_diff * nb1));
-        return CHECK_TRY_ERROR(dpct::async_dpct_memcpy(dst_ptr, x, i1_diff * nb1,
+        dpct::err0 result = CHECK_TRY_ERROR(dpct::async_dpct_memcpy(dst_ptr, x, copy_size,
                                     kind, *stream));
+        g_copy_stats.active_copies--;
+        return result;
 
     } else if (nb0 == ts) {
-        return CHECK_TRY_ERROR(
+        size_t copy_size = ts * ne0 / bs * i1_diff;
+        GGML_SYCL_DEBUG("[SYCL] cpy_tensor_2d (2D): kind=%d, size=%zu bytes\n", kind, copy_size);
+        g_copy_stats.active_copies++;
+        if (kind == dpct::host_to_device) {
+            g_copy_stats.h2d_bytes += copy_size;
+        } else if (kind == dpct::device_to_host) {
+            g_copy_stats.d2h_bytes += copy_size;
+        } else if (kind == dpct::device_to_device) {
+            g_copy_stats.d2d_bytes += copy_size;
+            g_copy_stats.d2d_p2p_bytes += copy_size;
+        }
+        g_copy_stats.wait_count++;
+        dpct::err0 result = CHECK_TRY_ERROR(
             dpct::async_dpct_memcpy(dst_ptr, ts * ne0 / bs, x, nb1,
                                     ts * ne0 / bs, i1_diff, kind, *stream));
+        g_copy_stats.active_copies--;
+        return result;
     } else {
+        size_t total_copy_size = 0;
         for (int64_t i1 = 0; i1 < i1_diff; i1++) {
             const void * rx = (const void *) ((const char *) x + i1*nb1);
             void * rd = (void *) (dst_ptr + i1*ts*ne0/bs);
+            size_t row_copy_size = ts * ne0;
+            total_copy_size += row_copy_size;
             // pretend the row is a matrix with cols=1
             dpct::err0 r = CHECK_TRY_ERROR(dpct::async_dpct_memcpy(
                 rd, ts / bs, rx, nb0, ts / bs, ne0, kind, *stream));
@@ -2232,6 +2455,18 @@ static dpct::err0 ggml_sycl_cpy_tensor_2d(void *dst,
             */
             if (r != 0) return r;
         }
+        GGML_SYCL_DEBUG("[SYCL] cpy_tensor_2d (loop): kind=%d, size=%zu bytes\n", kind, total_copy_size);
+        g_copy_stats.active_copies++;
+        if (kind == dpct::host_to_device) {
+            g_copy_stats.h2d_bytes += total_copy_size;
+        } else if (kind == dpct::device_to_host) {
+            g_copy_stats.d2h_bytes += total_copy_size;
+        } else if (kind == dpct::device_to_device) {
+            g_copy_stats.d2d_bytes += total_copy_size;
+            g_copy_stats.d2d_p2p_bytes += total_copy_size;
+        }
+        g_copy_stats.wait_count++;
+        g_copy_stats.active_copies--;
         return 0;
     }
 }
@@ -2937,14 +3172,15 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                             GGML_SYCL_DEBUG("[SYCL] mul_mat: cross-device copy src1_ddq device %d->%d size=%zu src=%p dst=%p\n",
                                 ctx.device, i, copy_size, src1_ddq_i_source, src1_ddq_i);
                             // Use dev2dev_memcpy for cross-device copy (host-mediated for reliability)
-                            dev2dev_memcpy(*stream, *main_stream, src1_ddq_i, src1_ddq_i_source, copy_size);
+                            ggml_backend_sycl_buffer_context * dst_buf_ctx = (ggml_backend_sycl_buffer_context *)dst->buffer->context;
+                            dev2dev_memcpy(dst_buf_ctx, *stream, *main_stream, src1_ddq_i, src1_ddq_i_source, copy_size);
                             GGML_SYCL_DEBUG("[SYCL] mul_mat: cross-device copy complete\n");
                         } else {
                             float * src1_ddf_i_source = (float *) src1_extra->data_device[ctx.device];
                             src1_ddf_i_source += (i0 * ne11 + src1_col_0) * ne10;
 
-                            dev2dev_memcpy(*stream, *main_stream, src1_ddf_i, src1_ddf_i_source,
-                                           src1_ncols * ne10 * sizeof(float));
+dev2dev_memcpy((ggml_backend_sycl_buffer_context *)dst->buffer->context, *stream, *main_stream, src1_ddf_i, src1_ddf_i_source,
+                                            src1_ncols * ne10 * sizeof(float));
                         }
                     }
                 } else {
@@ -3009,7 +3245,8 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
 
                         GGML_SYCL_DEBUG("[SYCL] mul_mat: device %d calling dev2dev_memcpy_2d\n", i);
                         // Use cross-device 2D copy with fallback for multi-GPU
-                        dev2dev_memcpy_2d(*main_stream, *stream,
+                        ggml_backend_sycl_buffer_context * dst_buf_ctx = (ggml_backend_sycl_buffer_context *)dst->buffer->context;
+                        dev2dev_memcpy_2d(dst_buf_ctx, *main_stream, *stream,
                             dhf_dst_i, ne0 * sizeof(float),
                             dst_dd_i, row_diff * sizeof(float),
                             row_diff * sizeof(float), src1_ncols);
@@ -5379,6 +5616,30 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
     };
 
     return sycl_backend;
+}
+
+void ggml_sycl_print_copy_stats() {
+    fprintf(stderr, "\n========== SYCL Copy Statistics ==========\n");
+    fprintf(stderr, "Host → Device: %zu MB\n", g_copy_stats.h2d_bytes / (1024*1024));
+    fprintf(stderr, "Device → Host: %zu MB\n", g_copy_stats.d2h_bytes / (1024*1024));
+    fprintf(stderr, "Device → Device (total): %zu MB\n", g_copy_stats.d2d_bytes / (1024*1024));
+    fprintf(stderr, "  - P2P direct: %zu MB\n", g_copy_stats.d2d_p2p_bytes / (1024*1024));
+    fprintf(stderr, "  - Host-staged: %zu MB\n", g_copy_stats.d2d_host_staged_bytes / (1024*1024));
+    fprintf(stderr, "wait() calls: %d\n", g_copy_stats.wait_count);
+    fprintf(stderr, "queues_wait_and_throw() calls: %d\n", g_copy_stats.queues_wait_and_throw_count);
+    fprintf(stderr, "Active copies: %d\n", g_copy_stats.active_copies.load());
+    
+    if (g_copy_stats.d2d_bytes > 0) {
+        double p2p_ratio = (double)g_copy_stats.d2d_p2p_bytes / g_copy_stats.d2d_bytes * 100.0;
+        double staged_ratio = (double)g_copy_stats.d2d_host_staged_bytes / g_copy_stats.d2d_bytes * 100.0;
+        fprintf(stderr, "D2D breakdown: %.1f%% P2P, %.1f%% host-staged\n", p2p_ratio, staged_ratio);
+    }
+    
+    if (g_copy_stats.h2d_bytes + g_copy_stats.d2h_bytes + g_copy_stats.d2d_bytes > 0) {
+        size_t total_bytes = g_copy_stats.h2d_bytes + g_copy_stats.d2h_bytes + g_copy_stats.d2d_bytes;
+        fprintf(stderr, "Total copied: %zu MB\n", total_bytes / (1024*1024));
+    }
+    fprintf(stderr, "============================================\n\n");
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_sycl_reg)

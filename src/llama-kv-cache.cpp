@@ -123,6 +123,10 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+            
+            LLAMA_LOG_INFO("[KV-CACHE] Layer %3d offloaded to %s\n", il, dev_name);
+        } else {
+            LLAMA_LOG_DEBUG("[KV-CACHE] Layer %3d on CPU (not offloaded)\n", il);
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
