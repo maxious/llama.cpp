@@ -4,7 +4,7 @@
 #  SPDX-License-Identifier: MIT
 #
 # SYCL Build Script for llama.cpp
-# Usage: ./build-sycl.sh [--clean] [--no-f16] [--no-bf16] [--asan] [--ubsan] [--sanitize]
+# Usage: ./build-sycl.sh [--clean] [--no-f16] [--no-bf16] [--asan] [--ubsan] [--sanitize] [--aot <target>]
 
 set -e
 
@@ -17,6 +17,8 @@ ENABLE_F16=true
 ENABLE_BF16=true
 ENABLE_ASAN=false
 ENABLE_UBSAN=false
+ENABLE_AOT=""
+ENABLE_XE2=false
 BUILD_TYPE="Release"
 
 while [[ "$1" == --* ]]; do
@@ -57,9 +59,23 @@ while [[ "$1" == --* ]]; do
             BUILD_TYPE="RelWithDebInfo"
             shift
             ;;
+        --aot)
+            shift
+            if [[ -z "$1" || "$1" == --* ]]; then
+                # Default to BMG (Battlemage/Xe2) if no target specified
+                ENABLE_AOT="intel_gpu_bmg_g21"
+            else
+                ENABLE_AOT="$1"
+                shift
+            fi
+            ;;
+        --xe2)
+            ENABLE_XE2=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--clean] [--no-f16] [--no-bf16] [--asan] [--ubsan] [--sanitize]"
+            echo "Usage: $0 [--clean] [--no-f16] [--no-bf16] [--asan] [--ubsan] [--sanitize] [--aot <target>] [--xe2]"
             echo ""
             echo "Note: FP16 and BF16 are enabled by default for Intel GPUs."
             echo ""
@@ -68,8 +84,25 @@ while [[ "$1" == --* ]]; do
             echo "  --ubsan    Enable Undefined Behavior Sanitizer (UBSAN)"
             echo "  --sanitize Enable both ASAN and UBSAN (equivalent to --asan --ubsan)"
             echo ""
+            echo "XE2/XMX options:"
+            echo "  --xe2       Enable XE2 (XMX cooperative matrix) support with JIT compilation"
+            echo "              Use this with GGML_SYCL_FLASH_ATTN_FORCE_XMX=1 to test XMX kernels"
+            echo ""
+            echo "AOT (Ahead-of-Time) compilation:"
+            echo "  --aot [target]  Enable AOT compilation for specified Intel GPU target"
+            echo "                  Default: intel_gpu_bmg_g21 (Battlemage/Xe2)"
+            echo "                  Other options: intel_gpu_pvc, intel_gpu_acm_g10, etc."
+            echo "                  See: icpx --help for -fsycl-targets options"
+            echo ""
+            echo "Example with AOT for Battlemage:"
+            echo "  ./build-sycl.sh --aot"
+            echo ""
+            echo "Example with XE2 JIT for testing:"
+            echo "  ./build-sycl.sh --xe2"
+            echo "  GGML_SYCL_FLASH_ATTN_FORCE_XMX=1 ./build-sycl/bin/llama-completion ..."
+            echo ""
             echo "Example with sanitizers for debugging:"
-            echo "  ./build-sycl.sh --f16 --asan"
+            echo "  ./build-sycl.sh --asan"
             exit 1
             ;;
     esac
@@ -85,8 +118,8 @@ mkdir -p build-sycl
 cd build-sycl
 
 # Source oneAPI environment (required for SYCL and oneDNN)
-    echo "Loading oneAPI environment..."
-    source /opt/intel/oneapi/setvars.sh
+echo "Loading oneAPI environment..."
+source /opt/intel/oneapi/setvars.sh --force > /dev/null 2>&1 || true
 
 # Configure with SYCL backend
 echo "Configuring CMake..."
@@ -133,6 +166,17 @@ if [[ "$ENABLE_UBSAN" == true ]]; then
         CMAKE_OPTS+=(-DCMAKE_EXE_LINKER_FLAGS="-fsanitize=undefined")
     fi
     echo "Enabling Undefined Behavior Sanitizer (UBSAN)..."
+fi
+
+if [[ -n "$ENABLE_AOT" ]]; then
+    echo "Enabling AOT compilation for target: $ENABLE_AOT"
+    CMAKE_OPTS+=(-DGGML_SYCL_DEVICE_ARCH="$ENABLE_AOT")
+    CMAKE_OPTS+=(-DGGML_SYCL_XE2=ON)
+fi
+
+if [[ "$ENABLE_XE2" == "true" ]]; then
+    echo "Enabling XE2 (XMX cooperative matrix) support for JIT..."
+    CMAKE_OPTS+=(-DGGML_SYCL_XE2=ON)
 fi
 
 cmake .. "${CMAKE_OPTS[@]}"

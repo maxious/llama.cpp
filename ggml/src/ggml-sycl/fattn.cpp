@@ -1870,7 +1870,18 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     const bool use_mkl_for_sinks = (sinks != nullptr);
 
     // Use MKL for small batch sizes (N < 32) as it's often faster for small batches
-    const bool small_batch = (N < 32);
+    // Set GGML_SYCL_FLASH_ATTN_FORCE_XMX=1 to bypass this and use XMX for all batch sizes
+    static bool force_xmx = false;
+    static bool force_xmx_checked = false;
+    if (!force_xmx_checked) {
+        const char* env = getenv("GGML_SYCL_FLASH_ATTN_FORCE_XMX");
+        force_xmx = (env != nullptr && strcmp(env, "1") == 0);
+        force_xmx_checked = true;
+        if (force_xmx) {
+            GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention FORCED for all batch sizes by environment variable\n");
+        }
+    }
+    const bool small_batch = !force_xmx && (N < 32);
 
     if (sycl_use_mkl || use_mkl_for_sinks || small_batch) {
         if (DQK == 576 && DV == 512) {
