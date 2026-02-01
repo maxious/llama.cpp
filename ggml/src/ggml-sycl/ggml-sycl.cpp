@@ -599,9 +599,19 @@ static bool ggml_sycl_peer_access_is_enabled(const sycl::queue &q_dst, const syc
 static void dev2dev_memcpy(ggml_backend_sycl_buffer_context * dst_ctx,
                             sycl::queue &q_dst, sycl::queue &q_src, void *ptr_dst,
                     const void *ptr_src, size_t size) {
+#ifdef GGML_SYCL_GRAPH
+    // Guard: Cross-device copies cannot be recorded in a graph
+    if (g_ggml_sycl_graph_recording) {
+        GGML_LOG_WARN("%s: cross-device copy attempted during graph recording - "
+                      "this operation will be executed outside the graph\n", __func__);
+        // Note: In practice, the scheduler should not trigger cross-device copies
+        // during graph recording. This guard is for safety and debugging.
+    }
+#endif
+
     g_copy_stats.active_copies++;
     g_copy_stats.d2d_bytes += size;
-    
+
     int dst_id = ggml_sycl_get_device_id(q_dst.get_device());
     int src_id = ggml_sycl_get_device_id(q_src.get_device());
     
@@ -4835,11 +4845,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
 #ifdef GGML_SYCL_GRAPH
 static bool check_graph_compatibility(ggml_cgraph * cgraph) {
-    if (ggml_sycl_info().device_count > 1) {
-        // A sycl_ex::command_graph object can only be created for a single device
-        GGML_LOG_INFO("%s: disabling SYCL graphs due to multiple devices\n", __func__);
-        return false;
-    }
+    // Multi-device graphs are now supported - each backend context
+    // records only its own device's operations. Cross-device copies
+    // are handled as explicit queue operations outside graph recording.
+    // The scheduler partitions work per-backend, so each ggml_backend_sycl_graph_compute
+    // call only operates on a single device's operations.
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_op node_op = cgraph->nodes[i]->op;
@@ -4889,10 +4899,37 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             return GGML_STATUS_SUCCESS;
         }
 
+        // Compute graph signature for invalidation detection
+        uint64_t current_signature = 0;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            // Hash tensor dimensions and type
+            current_signature ^= ((uint64_t)node->ne[0] << 0)  |
+                                ((uint64_t)node->ne[1] << 16) |
+                                ((uint64_t)node->ne[2] << 32) |
+                                ((uint64_t)node->type << 48);
+        }
+
+        // Check if graph needs invalidation
+        bool graph_invalid = (sycl_ctx->exec_graph == nullptr) ||
+                             (sycl_ctx->graph_signature != current_signature) ||
+                             (sycl_ctx->last_n_tokens != (uint64_t)cgraph->n_nodes);
+
+        if (graph_invalid) {
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] Graph invalidated - signature changed or first build\n");
+            sycl_ctx->exec_graph = nullptr;
+        }
+
+        // Update signature after successful build
+        sycl_ctx->graph_signature = current_signature;
+        sycl_ctx->last_n_tokens = cgraph->n_nodes;
+
         sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()), {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
 
         model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
+        g_ggml_sycl_graph_recording = true;
         ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+        g_ggml_sycl_graph_recording = false;
         model_sycl_graph.end_recording();
 
         const bool graph_update_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_graph);

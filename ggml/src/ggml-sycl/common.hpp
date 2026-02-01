@@ -289,6 +289,10 @@ inline bool ggml_sycl_use_shared_usm() {
 static int g_all_sycl_device_count = -1;
 static bool g_ggml_backend_sycl_buffer_type_initialized = false;
 
+#ifdef GGML_SYCL_GRAPH
+static bool g_ggml_sycl_graph_recording = false;
+#endif
+
 static ggml_sycl_backend_gpu_mode g_ggml_sycl_backend_gpu_mode =
     SYCL_UNSET_GPU_MODE;
 
@@ -537,6 +541,12 @@ struct ggml_backend_sycl_context {
 
 #ifdef GGML_SYCL_GRAPH
     std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
+    bool graph_recording = false;
+    
+    // Graph signature for invalidation detection
+    uint64_t graph_signature = 0;
+    uint64_t last_n_tokens = 0;
+    uint64_t last_n_past = 0;
 #endif
 
     ggml_sycl_pool & host_pool(int device) {
