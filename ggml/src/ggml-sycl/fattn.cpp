@@ -1863,13 +1863,83 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
 
     const int64_t DQK = Q->ne[0];
     const int64_t DV = V->ne[0];
+    const int64_t N = Q->ne[1];
 
     // Sinks (attention sinks / StreamingLLM) only supported in MKL path
     // XMX cooperative matrix kernels don't support sinks yet
     const bool use_mkl_for_sinks = (sinks != nullptr);
 
-    if (sycl_use_mkl || use_mkl_for_sinks) {
-        GGML_ABORT("ggml_sycl: oneMKL flash attention path is disabled; XMX is required\n");
+    // Use MKL for small batch sizes (N < 32) as it's often faster for small batches
+    const bool small_batch = (N < 32);
+
+    if (sycl_use_mkl || use_mkl_for_sinks || small_batch) {
+        if (DQK == 576 && DV == 512) {
+            ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
+            return;
+        }
+
+        if (DQK == DV) {
+            switch (DQK) {
+                case 32:
+                    ggml_sycl_op_flash_attn_mkl<32, 32>(ctx, dst);
+                    return;
+                case 40:
+                    ggml_sycl_op_flash_attn_mkl<40, 40>(ctx, dst);
+                    return;
+                case 48:
+                    ggml_sycl_op_flash_attn_mkl<48, 48>(ctx, dst);
+                    return;
+                case 56:
+                    ggml_sycl_op_flash_attn_mkl<56, 56>(ctx, dst);
+                    return;
+                case 64:
+                    ggml_sycl_op_flash_attn_mkl<64, 64>(ctx, dst);
+                    return;
+                case 72:
+                    ggml_sycl_op_flash_attn_mkl<72, 72>(ctx, dst);
+                    return;
+                case 80:
+                    ggml_sycl_op_flash_attn_mkl<80, 80>(ctx, dst);
+                    return;
+                case 88:
+                    ggml_sycl_op_flash_attn_mkl<88, 88>(ctx, dst);
+                    return;
+                case 96:
+                    ggml_sycl_op_flash_attn_mkl<96, 96>(ctx, dst);
+                    return;
+                case 104:
+                    ggml_sycl_op_flash_attn_mkl<104, 104>(ctx, dst);
+                    return;
+                case 112:
+                    ggml_sycl_op_flash_attn_mkl<112, 112>(ctx, dst);
+                    return;
+                case 128:
+                    ggml_sycl_op_flash_attn_mkl<128, 128>(ctx, dst);
+                    return;
+                case 192:
+                    ggml_sycl_op_flash_attn_mkl<192, 192>(ctx, dst);
+                    return;
+                case 256:
+                    ggml_sycl_op_flash_attn_mkl<256, 256>(ctx, dst);
+                    return;
+                case 512:
+                    ggml_sycl_op_flash_attn_mkl<512, 512>(ctx, dst);
+                    return;
+                case 576:
+                    ggml_sycl_op_flash_attn_mkl<576, 576>(ctx, dst);
+                    return;
+                default:
+                    GGML_SYCL_DEBUG("ggml_sycl: oneMKL not implemented for head size DQK=%ld DV=%ld\n", DQK, DV);
+                    break;
+            }
+        } else {
+            GGML_SYCL_DEBUG("ggml_sycl: oneMKL path requires DQK==DV, got DQK=%ld DV=%ld\n", DQK, DV);
+        }
+
+        // If we get here and it was mandatory MKL, then we should probably abort or warn
+        if (sycl_use_mkl || use_mkl_for_sinks) {
+            GGML_ABORT("ggml_sycl: oneMKL flash attention path failed (unsupported head size); XMX is required but fallback failed\n");
+        }
     }
 #endif
 
@@ -1999,7 +2069,13 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
             // Fall back to non-XMX path for unsupported head sizes
             GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention not supported for head size DQK=%ld DV=%ld, falling back\n", actual_d, actual_dv);
         } catch (const std::exception& e) {
-            GGML_ABORT("ggml_sycl: XMX flash attention failed: %s\n", e.what());
+            GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention failed: %s, falling back to non-XMX path\n", e.what());
+#ifdef GGML_SYCL_USE_INTEL_ONEMKL
+            if (DQK == 576 && DV == 512) {
+                ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
+                return;
+            }
+#endif
         }
     }
 #endif
