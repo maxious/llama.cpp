@@ -455,10 +455,32 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+static bool g_sycl_peer_access_checked = false;
+static bool g_sycl_peer_access_enabled[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_DEVICES] = {};
+
+static int ggml_sycl_get_device_id(const sycl::device & device) {
+    return dpct::dev_mgr::instance().get_device_id(device);
+}
+
+static bool ggml_sycl_peer_access_is_enabled(const sycl::queue &q_dst, const sycl::queue &q_src) {
+    const int dst_id = ggml_sycl_get_device_id(q_dst.get_device());
+    const int src_id = ggml_sycl_get_device_id(q_src.get_device());
+    if (dst_id < 0 || src_id < 0) {
+        return false;
+    }
+    return g_sycl_peer_access_enabled[dst_id][src_id];
+}
+
 static void dev2dev_memcpy(sycl::queue &q_dst, sycl::queue &q_src, void *ptr_dst,
                     const void *ptr_src, size_t size) {
     // Check if same device - simple case
     if (q_dst.get_device() == q_src.get_device()) {
+        q_dst.memcpy(ptr_dst, ptr_src, size).wait();
+        return;
+    }
+
+    // If peer access is enabled, prefer direct device-to-device memcpy
+    if (ggml_sycl_peer_access_is_enabled(q_dst, q_src)) {
         q_dst.memcpy(ptr_dst, ptr_src, size).wait();
         return;
     }
@@ -492,6 +514,13 @@ static void dev2dev_memcpy_2d(sycl::queue &q_dst, sycl::queue &q_src,
         dpct::async_dpct_memcpy(ptr_dst, dst_pitch, ptr_src, src_pitch,
                                 width, height, dpct::device_to_device, q_dst);
         // Don't wait here - let final sync handle it
+        return;
+    }
+
+    // If peer access is enabled, try direct device-to-device copy
+    if (ggml_sycl_peer_access_is_enabled(q_dst, q_src)) {
+        dpct::async_dpct_memcpy(ptr_dst, dst_pitch, ptr_src, src_pitch,
+                                width, height, dpct::device_to_device, q_dst);
         return;
     }
 
@@ -2624,10 +2653,47 @@ inline bool ggml_sycl_can_access_peer(int device_id, int peer_device_id) {
 }
 
 static void ggml_sycl_set_peer_access(const int n_tokens, int main_device) {
-    // P2P access management disabled - causes device lost errors on Intel Arc
-    // Using host-mediated cross-device copies instead
     GGML_UNUSED(n_tokens);
     GGML_UNUSED(main_device);
+
+    if (g_sycl_peer_access_checked) {
+        return;
+    }
+    g_sycl_peer_access_checked = true;
+
+    const char * env = getenv("GGML_SYCL_ENABLE_P2P");
+    if (env == nullptr || strcmp(env, "1") != 0) {
+        GGML_SYCL_DEBUG("[SYCL] peer access disabled (set GGML_SYCL_ENABLE_P2P=1 to enable)\n");
+        return;
+    }
+
+#ifdef SYCL_EXT_ONEAPI_PEER_ACCESS
+    const int dev_count = ggml_sycl_info().device_count;
+    for (int i = 0; i < dev_count; ++i) {
+        auto dev_i = dpct::dev_mgr::instance().get_device(i);
+        for (int j = 0; j < dev_count; ++j) {
+            if (i == j) {
+                continue;
+            }
+            auto dev_j = dpct::dev_mgr::instance().get_device(j);
+            const bool can_access = dev_i.ext_oneapi_can_access_peer(
+                dev_j, sycl::ext::oneapi::peer_access::access_supported);
+            if (!can_access) {
+                GGML_SYCL_DEBUG("[SYCL] peer access not supported: %d -> %d\n", i, j);
+                continue;
+            }
+            try {
+                dev_i.ext_oneapi_enable_peer_access(dev_j);
+                g_sycl_peer_access_enabled[i][j] = true;
+                GGML_SYCL_DEBUG("[SYCL] peer access enabled: %d -> %d\n", i, j);
+            } catch (const sycl::exception & exc) {
+                GGML_SYCL_DEBUG("[SYCL] peer access enable failed: %d -> %d (%s)\n", i, j, exc.what());
+            }
+        }
+    }
+#else
+    GGML_SYCL_DEBUG("[SYCL] peer access extension not available in this SYCL toolchain\n");
+#endif
 }
 
 template <template <int> typename quantize_f>
@@ -3715,6 +3781,13 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 #ifdef SYCL_USE_XMX
     use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
 #endif // SYCL_USE_XMX
+
+    // MMQ kernels with need_check=true have issues when nrows < mmq_y due to
+    // tile index clamping causing shared memory write collisions. Fall back to
+    // ggml_sycl_op_mul_mat_sycl (cuBLAS/oneMKL path) for small row counts.
+    // MMQ_Y_Q4_K_XE2 = 128 is the tile size for Q4_K on Intel Xe2.
+    constexpr int64_t MMQ_MIN_NROWS = 128;
+    use_mul_mat_q = use_mul_mat_q && (src0->ne[1] >= MMQ_MIN_NROWS);
 
     // Dispatch becomes obscure with the reorder, MMVQ when the reorder optimization
     // is enabled takes precedence over DMMV, the current if-else implementation
@@ -5042,7 +5115,6 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_ARGSORT:
             return op->src[0]->ne[0] * sizeof(int) <=
                    ggml_sycl_info().devices[device].smpbo;
-<<<<<<< HEAD
         case GGML_OP_TOP_K: {
             const ggml_tensor * src0 = op->src[0];
             const int k = op->ne[0];
@@ -5052,10 +5124,8 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                 ggml_is_contiguous(src0) &&
                 k > 0 && k <= 32;
         }
-=======
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_sycl_flash_attn_ext_supported(op);
->>>>>>> c9f6dadc4 (sycl: initialize flash-attention implementation)
         case GGML_OP_POOL_2D:
         case GGML_OP_ACC:
             return true;
