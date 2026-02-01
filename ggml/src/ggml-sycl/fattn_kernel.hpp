@@ -183,6 +183,59 @@ inline void flash_attn_dequantize_fp16_kernel(
     dst[idx] = static_cast<float>(src[row * row_stride + col]);
 }
 
+// Kernel to combine partial results from KV splits
+template <int DV>
+inline void flash_attn_combine_splits_kernel(
+    sycl::nd_item<2> it,
+    const float * partials,
+    float * dst,
+    int n_splits,
+    int n_heads,
+    int N,
+    int partial_size,
+    int o_head_stride,
+    int o_row_stride
+) {
+    int q_idx = it.get_group(0);
+    int tid = it.get_local_id(1);
+
+    if (q_idx >= n_heads * N) return;
+
+    int head = q_idx / N;
+    int q = q_idx % N;
+
+    const float * q_partials = partials + (int64_t)q_idx * n_splits * partial_size;
+
+    float m_max = -1.0e20f;
+    for (int i = 0; i < n_splits; ++i) {
+        float m = q_partials[i * partial_size + 0];
+        m_max = sycl::fmax(m_max, m);
+    }
+
+    float l_final = 0.0f;
+    // Max splits is 32, hardcoded size for register array
+    float scales[32]; 
+
+    for (int i = 0; i < n_splits; ++i) {
+        float m = q_partials[i * partial_size + 0];
+        float l = q_partials[i * partial_size + 1];
+        float scale = sycl::exp(m - m_max);
+        scales[i] = scale;
+        l_final += l * scale;
+    }
+
+    for (int d = tid; d < DV; d += it.get_local_range(1)) {
+        float o_sum = 0.0f;
+        for (int i = 0; i < n_splits; ++i) {
+            float o_val = q_partials[i * partial_size + 2 + d];
+            o_sum += o_val * scales[i];
+        }
+        
+        float res = o_sum / (l_final > 1e-10f ? l_final : 1.0f);
+        dst[head * o_head_stride + q * o_row_stride + d] = res;
+    }
+}
+
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
 #include <sycl/ext/oneapi/matrix/matrix-intel.hpp>
 #include <sycl/ext/oneapi/group_local_memory.hpp>

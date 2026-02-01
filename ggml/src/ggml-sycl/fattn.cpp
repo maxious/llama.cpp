@@ -2133,27 +2133,27 @@ void ggml_sycl_op_flash_attn_mkl_kv_split(ggml_backend_sycl_context & ctx, ggml_
     stream->wait();
 
     // Allocate partials buffer: [n_heads, N, n_splits, 2 + DV]
-    // Layout per (head, query, split): [M_partial, L_partial, O_partial[DV]]
     const int64_t partial_size = 2 + DV;
     const int64_t partials_total = n_heads * N * n_splits * partial_size;
     float * partials = (float *) sycl::malloc_device(partials_total * sizeof(float), *stream);
 
-    // Temporary S buffer for each split (reused across splits)
-    // Size: n_heads * N * kv_per_split (max possible chunk size)
-    float * S_chunk = (float *) sycl::malloc_device(n_heads * N * kv_per_split * sizeof(float), *stream);
-    
-    // Temporary O buffer for each split
-    float * O_chunk = (float *) sycl::malloc_device(n_heads * N * DV * sizeof(float), *stream);
+    float * S_d = (float *) sycl::malloc_device(n_heads * N * N_kv * sizeof(float), *stream);
 
     const int64_t lda_q = DQK;
     const int64_t lda_k = DQK;
     const int64_t lda_v = DV;
 
     const int64_t stride_q = N * DQK;
-    const int64_t stride_k = N_kv * DQK;  // Full K stride
-    const int64_t stride_v = N_kv * DV;   // Full V stride
+    const int64_t stride_k = N_kv * DQK;
+    const int64_t stride_v = N_kv * DV;
+    
+    const int64_t lda_s = N_kv; 
+    const int64_t stride_s = N * N_kv;
 
-    // Process each KV split
+    const int64_t ldc_o = n_splits * partial_size;
+    const int64_t stride_o = N * ldc_o;
+
+    // Process all KV splits in parallel
     for (int64_t split = 0; split < n_splits; ++split) {
         const int64_t kv_start = split * kv_per_split;
         const int64_t kv_end = std::min(kv_start + kv_per_split, N_kv);
@@ -2161,21 +2161,16 @@ void ggml_sycl_op_flash_attn_mkl_kv_split(ggml_backend_sycl_context & ctx, ggml_
         
         if (kv_chunk_size <= 0) continue;
 
-        const int64_t lda_s = kv_chunk_size;
-        const int64_t stride_s = N * kv_chunk_size;
-        const int64_t stride_o_chunk = N * DV;
-
-        // Q @ K_chunk^T -> S_chunk
-        // K_chunk is K[:, kv_start:kv_end, :]
+        // Q @ K_chunk^T -> S_d (offset by kv_start)
         if (gqa_ratio == 1) {
             oneapi::mkl::blas::row_major::gemm_batch(*stream,
                 oneapi::mkl::transpose::N, oneapi::mkl::transpose::T,
                 N, kv_chunk_size, DQK,
                 scale,
                 Q_d_f32, lda_q, stride_q,
-                K_d_f32 + kv_start * DQK, lda_k, stride_k,  // Offset into K
+                K_d_f32 + kv_start * DQK, lda_k, stride_k,
                 0.0f,
-                S_chunk, lda_s, stride_s,
+                S_d + kv_start, lda_s, stride_s,
                 n_heads);
         } else {
             for (int64_t kv_head = 0; kv_head < n_kv_heads; ++kv_head) {
@@ -2187,21 +2182,18 @@ void ggml_sycl_op_flash_attn_mkl_kv_split(ggml_backend_sycl_context & ctx, ggml_
                     Q_d_f32 + q_head_start * stride_q, lda_q, stride_q,
                     K_d_f32 + kv_head * stride_k + kv_start * DQK, lda_k, 0,
                     0.0f,
-                    S_chunk + q_head_start * stride_s, lda_s, stride_s,
+                    S_d + q_head_start * stride_s + kv_start, lda_s, stride_s,
                     gqa_ratio);
             }
         }
 
-        stream->wait();
-
-        // Apply mask and compute softmax for this chunk, store partials
+        // Apply mask and compute softmax for this chunk, store M/L partials
         stream->submit([&](sycl::handler& cgh) {
             cgh.parallel_for(sycl::range<1>(n_heads * N), [=](sycl::id<1> idx) {
                 const int64_t head = idx[0] / N;
                 const int64_t q = idx[0] % N;
-                float * S_row = S_chunk + head * stride_s + q * kv_chunk_size;
+                float * S_row = S_d + head * stride_s + q * lda_s + kv_start;
                 
-                // Find max for this chunk
                 float row_max = -1.0e20f;
                 for (int64_t k = 0; k < kv_chunk_size; ++k) {
                     float s_val = S_row[k];
@@ -2213,7 +2205,7 @@ void ggml_sycl_op_flash_attn_mkl_kv_split(ggml_backend_sycl_context & ctx, ggml_
                     row_max = sycl::fmax(row_max, s_val);
                 }
                 
-                // Handle sinks (only add to first split to avoid double-counting)
+                // Handle sinks (only add to first split)
                 float sink_contrib = 0.0f;
                 if (split == 0 && sinks_d != nullptr) {
                     float sink_val = sinks_d[head];
@@ -2221,7 +2213,6 @@ void ggml_sycl_op_flash_attn_mkl_kv_split(ggml_backend_sycl_context & ctx, ggml_
                     sink_contrib = sycl::exp(sycl::fmax(sink_val - row_max, -20.0f));
                 }
                 
-                // Compute exp and sum for this chunk
                 float sum = sink_contrib;
                 for (int64_t k = 0; k < kv_chunk_size; ++k) {
                     float exp_val = sycl::exp(sycl::fmax(S_row[k] - row_max, -20.0f));
@@ -2229,150 +2220,56 @@ void ggml_sycl_op_flash_attn_mkl_kv_split(ggml_backend_sycl_context & ctx, ggml_
                     sum += exp_val;
                 }
                 
-                // Store M and L partials (don't normalize P yet - keep unnormalized for reduction)
                 float * partial = partials + (head * N + q) * n_splits * partial_size + split * partial_size;
-                partial[0] = row_max;  // M_partial
-                partial[1] = sum;      // L_partial (unnormalized sum)
+                partial[0] = row_max;
+                partial[1] = sum;
             });
         });
 
-        stream->wait();
-
-        // S_chunk @ V_chunk -> O_chunk (unnormalized)
+        // S_chunk @ V_chunk -> O (directly to partials)
+        float * O_ptr = partials + split * partial_size + 2;
+        
         if (gqa_ratio == 1) {
             oneapi::mkl::blas::row_major::gemm_batch(*stream,
                 oneapi::mkl::transpose::N, oneapi::mkl::transpose::N,
                 N, DV, kv_chunk_size,
                 1.0f,
-                S_chunk, lda_s, stride_s,
-                V_d_f32 + kv_start * DV, lda_v, stride_v,  // Offset into V
+                S_d + kv_start, lda_s, stride_s,
+                V_d_f32 + kv_start * DV, lda_v, stride_v,
                 0.0f,
-                O_chunk, DV, stride_o_chunk,
+                O_ptr, ldc_o, stride_o,
                 n_heads);
         } else {
-            for (int64_t kv_head = 0; kv_head < n_kv_heads; ++kv_head) {
+             for (int64_t kv_head = 0; kv_head < n_kv_heads; ++kv_head) {
                 const int64_t q_head_start = kv_head * gqa_ratio;
                 oneapi::mkl::blas::row_major::gemm_batch(*stream,
                     oneapi::mkl::transpose::N, oneapi::mkl::transpose::N,
                     N, DV, kv_chunk_size,
                     1.0f,
-                    S_chunk + q_head_start * stride_s, lda_s, stride_s,
+                    S_d + q_head_start * stride_s + kv_start, lda_s, stride_s,
                     V_d_f32 + kv_head * stride_v + kv_start * DV, lda_v, 0,
                     0.0f,
-                    O_chunk + q_head_start * stride_o_chunk, DV, stride_o_chunk,
+                    O_ptr + q_head_start * stride_o, ldc_o, stride_o,
                     gqa_ratio);
             }
         }
-
-        stream->wait();
-
-        // Copy O_chunk to partials
-        stream->submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(sycl::range<1>(n_heads * N * DV), [=](sycl::id<1> idx) {
-                const int64_t i = idx[0];
-                const int64_t head = i / (N * DV);
-                const int64_t rem = i % (N * DV);
-                const int64_t q = rem / DV;
-                const int64_t d = rem % DV;
-                
-                float * partial = partials + (head * N + q) * n_splits * partial_size + split * partial_size;
-                partial[2 + d] = O_chunk[i];  // O_partial[d]
-            });
-        });
-
-        stream->wait();
     }
-
-    // Reduction: merge all partials and write final output
-    // We allocate a temporary O_acc buffer on device to avoid VLA in kernel
-    float * O_acc_buf = (float *) sycl::malloc_device(n_heads * N * DV * sizeof(float), *stream);
     
     float * O_d = (float *) dst->data;
     const int64_t o_stride_head = dst->nb[1] / sizeof(float);
     const int64_t o_stride_seq = dst->nb[2] / sizeof(float);
-
-    // First pass: initialize O_acc with first split and compute merged M/L
-    // We also allocate M_acc and L_acc buffers
-    float * M_acc_buf = (float *) sycl::malloc_device(n_heads * N * sizeof(float), *stream);
-    float * L_acc_buf = (float *) sycl::malloc_device(n_heads * N * sizeof(float), *stream);
-
-    // Initialize accumulators with first split
-    stream->submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::range<1>(n_heads * N), [=](sycl::id<1> idx) {
-            const int64_t head = idx[0] / N;
-            const int64_t q = idx[0] % N;
-            const int64_t acc_idx = head * N + q;
-            
-            float * partial0 = partials + acc_idx * n_splits * partial_size;
-            M_acc_buf[acc_idx] = partial0[0];
-            L_acc_buf[acc_idx] = partial0[1];
-            
-            for (int64_t d = 0; d < DV; ++d) {
-                O_acc_buf[acc_idx * DV + d] = partial0[2 + d];
-            }
-        });
-    });
-    stream->wait();
-
-    // Merge remaining splits
-    for (int64_t split = 1; split < n_splits; ++split) {
-        stream->submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(sycl::range<1>(n_heads * N), [=](sycl::id<1> idx) {
-                const int64_t head = idx[0] / N;
-                const int64_t q = idx[0] % N;
-                const int64_t acc_idx = head * N + q;
-                
-                float * partial = partials + acc_idx * n_splits * partial_size + split * partial_size;
-                const float M_new = partial[0];
-                const float L_new = partial[1];
-                
-                if (L_new == 0.0f) return;  // Skip empty splits
-                
-                const float M_acc = M_acc_buf[acc_idx];
-                const float L_acc = L_acc_buf[acc_idx];
-                
-                const float M_max = sycl::fmax(M_acc, M_new);
-                const float scale_acc = sycl::exp(sycl::fmax(M_acc - M_max, -20.0f));
-                const float scale_new = sycl::exp(sycl::fmax(M_new - M_max, -20.0f));
-                
-                // Merge O_acc
-                for (int64_t d = 0; d < DV; ++d) {
-                    O_acc_buf[acc_idx * DV + d] = O_acc_buf[acc_idx * DV + d] * scale_acc + partial[2 + d] * scale_new;
-                }
-                
-                L_acc_buf[acc_idx] = L_acc * scale_acc + L_new * scale_new;
-                M_acc_buf[acc_idx] = M_max;
-            });
-        });
-        stream->wait();
-    }
-
-    // Final normalization and output
-    stream->submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::range<1>(n_heads * N * DV), [=](sycl::id<1> idx) {
-            const int64_t i = idx[0];
-            const int64_t head = i / (N * DV);
-            const int64_t rem = i % (N * DV);
-            const int64_t q = rem / DV;
-            const int64_t d = rem % DV;
-            const int64_t acc_idx = head * N + q;
-            
-            const float L_acc = L_acc_buf[acc_idx];
-            const float inv_L = (L_acc > 1e-10f) ? (1.0f / L_acc) : 0.0f;
-            O_d[d + head * o_stride_head + q * o_stride_seq] = O_acc_buf[acc_idx * DV + d] * inv_L;
-        });
-    });
-
-    stream->wait();
     
-    sycl::free(O_acc_buf, *stream);
-    sycl::free(M_acc_buf, *stream);
-    sycl::free(L_acc_buf, *stream);
+    stream->submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_heads * N, DV), sycl::range<2>(1, DV)), 
+            [=](sycl::nd_item<2> it) {
+            flash_attn_combine_splits_kernel<DV>(it, partials, O_d, n_splits, n_heads, N, partial_size, o_stride_head, o_stride_seq);
+        });
+    });
 
-    // Cleanup
+    stream->wait();
+
     sycl::free(partials, *stream);
-    sycl::free(S_chunk, *stream);
-    sycl::free(O_chunk, *stream);
+    sycl::free(S_d, *stream);
     sycl::free(Q_d_f32, *stream);
     sycl::free(K_d_f32, *stream);
     if (mask_d_f32_alloc) sycl::free(mask_d_f32_alloc, *stream);
