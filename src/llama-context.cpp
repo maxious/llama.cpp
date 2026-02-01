@@ -2092,15 +2092,23 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer;
-        if (ubatch.n_tokens < 32 || full_offload) {
-            if (il != -1 && strcmp(name, "norm") == 0) {
+        if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, LLAMA_TENSOR_NAME_FATTN) == 0)) {
+            const bool is_fattn = strcmp(name, LLAMA_TENSOR_NAME_FATTN) == 0;
+            const bool should_pin = is_fattn || (ubatch.n_tokens < 32 || full_offload);
+            if (should_pin) {
                 const auto & dev_layer = model.dev_layer(il);
+                bool pinned = false;
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
                             ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                            pinned = true;
                         }
                     }
+                }
+                if (is_fattn && pinned) {
+                    LLAMA_LOG_DEBUG("%s: pinned flash-attn layer %d to device %s\n",
+                                    __func__, il, ggml_backend_dev_name(dev_layer));
                 }
             }
         }
