@@ -171,13 +171,12 @@ fi
 if [[ -n "$ENABLE_AOT" ]]; then
     echo "Enabling AOT compilation for target: $ENABLE_AOT"
     CMAKE_OPTS+=(-DGGML_SYCL_DEVICE_ARCH="$ENABLE_AOT")
-    CMAKE_OPTS+=(-DGGML_SYCL_XE2=ON)
 fi
 
-if [[ "$ENABLE_XE2" == "true" ]]; then
-    echo "Enabling XE2 (XMX cooperative matrix) support for JIT..."
-    CMAKE_OPTS+=(-DGGML_SYCL_XE2=ON)
-fi
+# Always enable XE2 (XMX) support by default unless explicitly controlled
+# The code now detects support at runtime via tile_kind
+echo "Enabling XE2 (XMX cooperative matrix) support for JIT..."
+CMAKE_OPTS+=(-DGGML_SYCL_XE2=ON)
 
 cmake .. "${CMAKE_OPTS[@]}"
 

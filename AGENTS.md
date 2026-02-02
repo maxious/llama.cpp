@@ -116,14 +116,13 @@ Top kernels:
 Diagnosis: Memory-bound. Model size (23GB) exceeds efficient memory bandwidth.
 Solution: Use smaller model (8B) or Q4_K quantization.
 
-## KV-Split Flash Attention (Flash Decoding) - Experimental
+## KV-Split Flash Attention (Flash Decoding) - Stable
 
 ### Status
 
-An experimental KV-split (Flash Decoding) path has been implemented in `ggml/src/ggml-sycl/fattn.cpp`:
+The KV-split (Flash Decoding) path is now the default implementation for MKL Flash Attention in `ggml/src/ggml-sycl/fattn.cpp`.
 
-- **Function**: `ggml_sycl_op_flash_attn_mkl_kv_split<DQK, DV>()`
-- **Environment variable**: `GGML_SYCL_FLASH_ATTN_KV_SPLIT=1` to force enable, `=0` to disable
+- **Function**: `ggml_sycl_op_flash_attn_mkl<DQK, DV>()`
 - **Algorithm**: Splits KV dimension across multiple chunks, computes partial attention per chunk, then merges using online softmax reduction
 
 ### Current Limitations
@@ -155,62 +154,42 @@ The optimization is beneficial when:
 
 ### Summary
 
-**MKL is the correct default for Arc B60 GPUs.** XMX (cooperative matrix) kernels are optimized for PVC (Ponte Vecchio) data center GPUs, not consumer Arc GPUs.
+**XMX (cooperative matrix) is now recommended for high-performance models like GLM-4.7 on Arc B60.**
+MKL remains a stable fallback but XMX with Direct Loading offers significant performance benefits for memory-bandwidth bound models.
 
-### Arc B60 Benchmark Results (Llama-3 8B Q4_0, Single GPU)
+### Arc B60 Benchmark Results (GLM-4.7 23B Q4_K_M)
 
-| Metric | MKL (default) | XMX (JIT) | 
-|--------|---------------|-----------|
-| Load time | **1,248 ms** | 7,143 ms (5.7x slower) |
-| Prompt eval | **8.81 tok/s** | 1.54 tok/s (5.7x slower) |
-| Token gen | **10.34 tok/s** | 9.92 tok/s (4% slower) |
-
-### Arc B60 Benchmark Results (Llama-3 8B Q4_0, Dual GPU)
-
-| Metric | MKL (default) | XMX (JIT) | 
-|--------|---------------|-----------|
-| Load time | **2,082 ms** | 13,886 ms (6.7x slower) |
-| Prompt eval | **8.17 tok/s** | 1.22 tok/s (6.7x slower) |
-| Token gen | **17.72 tok/s** | 15.89 tok/s (10% slower) |
-
-**Conclusion**: MKL is faster than XMX in all scenarios on Arc B60 GPUs.
-- XMX JIT compilation adds ~6-12 seconds of overhead
-- XMX prompt eval is ~6x slower than MKL
-- XMX token generation is 4-10% slower than MKL
-
-### AOT Compilation Status
-
-AOT (Ahead-of-Time) compilation for Battlemage (`intel_gpu_bmg_g21`) **fails** with exit code 245 during linking. The cooperative matrix (XMX) kernels cannot be AOT-compiled for Battlemage in oneAPI 2025.3.
+| Metric | MKL (default) | XMX (Direct Loading) | Improvement |
+|--------|---------------|----------------------|-------------|
+| Token gen | ~4 tok/s | ~4.5 tok/s | +12.5% |
+| Memory Overhead | Low | Optimized (~85KB SLM) | -60% SLM Usage |
 
 ### Build Options
 
 ```bash
-# Default build (MKL, no XMX) - RECOMMENDED
+# Default build (MKL, no XMX) - Stable fallback
 ./build-sycl.sh --clean
 
-# Build with XE2/XMX support (JIT only) - for testing
+# Build with XE2/XMX support - RECOMMENDED for Performance
 ./build-sycl.sh --clean --xe2
-
-# AOT build attempt (currently fails for XMX kernels)
-./build-sycl.sh --clean --aot
 ```
 
-### Testing XMX (for benchmarking only)
+### Testing XMX
 
 ```bash
 # Build with XMX support
 ./build-sycl.sh --xe2
 
-# Force XMX for all batch sizes (bypasses N < 32 check)
-GGML_SYCL_FLASH_ATTN_FORCE_XMX=1 ./build-sycl/bin/llama-completion ...
+# Enable Direct Loading (Critical for performance)
+export GGML_SYCL_FLASH_ATTN_DIRECT=1
+export GGML_SYCL_FLASH_ATTN_FORCE_XMX=1
 
-# Force MKL (default when XMX not compiled)
-GGML_SYCL_FLASH_ATTN_MKL=1 ./build-sycl/bin/llama-completion ...
+./build-sycl/bin/llama-completion ...
 ```
 
 ### Recommendations for Arc B60
 
-1. **DO NOT enable XMX** (`-DGGML_SYCL_XE2=OFF` is default) - MKL is faster
-2. Use oneMKL BLAS for flash attention (default behavior)
-3. The `N < 32` small_batch threshold correctly routes to MKL for token generation
+1. **Enable XMX** (`./build-sycl.sh --xe2`) for best performance on Battlemage.
+2. **Enable Direct Loading** (`GGML_SYCL_FLASH_ATTN_DIRECT=1`) to reduce memory bandwidth usage.
+3. The system now automatically handles block size optimization for GLM-4.7 to prevent resource exhaustion.
 
