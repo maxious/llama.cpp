@@ -1360,9 +1360,11 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
 //
 // Enabled by setting GGML_SYCL_FLASH_ATTN_DIRECT=1
 // ============================================================================
-template<int64_t DQK, int64_t DV>
+template<int64_t DQK, int64_t DV, int BLOCK_M = 32, int BLOCK_N = 32>
 void ggml_sycl_op_flash_attn_coopmat_direct(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    GGML_SYCL_DEBUG("[SYCL] Flash attention coopmat_direct kernel: DQK=%d, DV=%d\n", DQK, DV);
+    if (getenv("GGML_SYCL_FLASH_ATTN_DEBUG")) {
+        GGML_SYCL_DEBUG("[SYCL] Flash attention coopmat_direct kernel: DQK=%ld, DV=%ld, BLOCK_M=%d, BLOCK_N=%d\n", DQK, DV, BLOCK_M, BLOCK_N);
+    }
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
@@ -1423,7 +1425,6 @@ void ggml_sycl_op_flash_attn_coopmat_direct(ggml_backend_sycl_context & ctx, ggm
         }
     }
 
-    constexpr int BLOCK_M = 32;
     constexpr int THREADS_PER_WG = 64;
 
     const int Tr = (N + BLOCK_M - 1) / BLOCK_M;
@@ -1441,18 +1442,18 @@ void ggml_sycl_op_flash_attn_coopmat_direct(ggml_backend_sycl_context & ctx, ggm
     constexpr int Q_STRIDE = DQK + 8;
     constexpr int K_STRIDE = DQK + 8;
     constexpr int V_STRIDE = DV + 8;
-    constexpr int P_STRIDE = 32 + 8;  // BLOCK_N + padding
-    constexpr int V_T_STRIDE = 32 + 8;
-    constexpr size_t BF16_BYTES = (BLOCK_M * Q_STRIDE + 32 * K_STRIDE +
-                                    32 * V_STRIDE + BLOCK_M * P_STRIDE +
+    constexpr int P_STRIDE = BLOCK_N + 8;  // BLOCK_N + padding
+    constexpr int V_T_STRIDE = BLOCK_N + 8;
+    constexpr size_t BF16_BYTES = (BLOCK_M * Q_STRIDE + BLOCK_N * K_STRIDE +
+                                    BLOCK_N * V_STRIDE + BLOCK_M * P_STRIDE +
                                     DV * V_T_STRIDE) * sizeof(sycl::half);
-    constexpr size_t FLOAT_BYTES = (BLOCK_M * (32 + 8) + BLOCK_M * 3 + BLOCK_M * DV) * sizeof(float);
+    constexpr size_t FLOAT_BYTES = (BLOCK_M * (BLOCK_N + 8) + BLOCK_M * 3 + BLOCK_M * DV) * sizeof(float);
     constexpr size_t SHMEM_SIZE = (BF16_BYTES + FLOAT_BYTES + sizeof(float) - 1) / sizeof(float);
 
     static bool first_call = true;
     if (first_call && getenv("GGML_SYCL_FLASH_ATTN_DEBUG")) {
-        GGML_SYCL_DEBUG("ggml_sycl: DIRECT XMX flash_attn N=%ld N_kv=%ld n_heads=%ld DQK=%ld DV=%ld is_f16=%d\n",
-                N, N_kv, n_heads, DQK, DV, is_f16);
+        GGML_SYCL_DEBUG("ggml_sycl: DIRECT XMX flash_attn N=%ld N_kv=%ld n_heads=%ld DQK=%ld DV=%ld is_f16=%d BLOCK_M=%d BLOCK_N=%d SHMEM_SIZE=%lu\n",
+                N, N_kv, n_heads, DQK, DV, is_f16, BLOCK_M, BLOCK_N, SHMEM_SIZE * sizeof(float));
         GGML_SYCL_DEBUG("ggml_sycl: Q strides: seq=%ld head=%ld\n", strides.q_stride_seq, strides.q_stride_head);
         GGML_SYCL_DEBUG("ggml_sycl: K strides: seq=%ld head=%ld\n", strides.k_stride_seq, strides.k_stride_head);
         GGML_SYCL_DEBUG("ggml_sycl: V strides: seq=%ld head=%ld\n", strides.v_stride_seq, strides.v_stride_head);
@@ -1467,7 +1468,7 @@ void ggml_sycl_op_flash_attn_coopmat_direct(ggml_backend_sycl_context & ctx, ggm
                 sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
 
                 cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                    flash_attn_coopmat_kernel_strided_n8<DQK, DV, fattn_input_type::f16, false>(
+                    flash_attn_coopmat_kernel_strided_n8<DQK, DV, fattn_input_type::f16, false, BLOCK_M, BLOCK_N>(
                         it,
                         Q_data, K_data, V_data, O_data,
                         l_d, m_d,
@@ -1482,7 +1483,7 @@ void ggml_sycl_op_flash_attn_coopmat_direct(ggml_backend_sycl_context & ctx, ggm
                 sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
 
                 cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                    flash_attn_coopmat_kernel_strided_n16<DQK, DV, fattn_input_type::f16, false>(
+                    flash_attn_coopmat_kernel_strided_n16<DQK, DV, fattn_input_type::f16, false, BLOCK_M, BLOCK_N>(
                         it,
                         Q_data, K_data, V_data, O_data,
                         l_d, m_d,
@@ -1500,7 +1501,7 @@ void ggml_sycl_op_flash_attn_coopmat_direct(ggml_backend_sycl_context & ctx, ggm
                 sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
 
                 cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                    flash_attn_coopmat_kernel_strided_n8<DQK, DV, fattn_input_type::f32, false>(
+                    flash_attn_coopmat_kernel_strided_n8<DQK, DV, fattn_input_type::f32, false, BLOCK_M, BLOCK_N>(
                         it,
                         Q_data, K_data, V_data, O_data,
                         l_d, m_d,
@@ -1515,7 +1516,7 @@ void ggml_sycl_op_flash_attn_coopmat_direct(ggml_backend_sycl_context & ctx, ggm
                 sycl::local_accessor<float, 1> shmem(sycl::range<1>(SHMEM_SIZE), cgh);
 
                 cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                    flash_attn_coopmat_kernel_strided_n16<DQK, DV, fattn_input_type::f32, false>(
+                    flash_attn_coopmat_kernel_strided_n16<DQK, DV, fattn_input_type::f32, false, BLOCK_M, BLOCK_N>(
                         it,
                         Q_data, K_data, V_data, O_data,
                         l_d, m_d,
@@ -2057,7 +2058,8 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         if (use_direct_loading && direct_supported_shape && can_use_direct_loading(Q, K, V, dst)) {
             try {
                 if (actual_d == 576 && actual_dv == 512) {
-                     ggml_sycl_op_flash_attn_coopmat_direct<576, 512>(ctx, dst);
+                     // Use smaller blocks (8x16) for GLM-4.7 to fit in SLM (DQK=576 needs large SLM)
+                     ggml_sycl_op_flash_attn_coopmat_direct<576, 512, 8, 16>(ctx, dst);
                      return;
                 }
                 switch (actual_d) {

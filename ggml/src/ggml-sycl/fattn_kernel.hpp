@@ -1485,7 +1485,7 @@ enum class fattn_input_type { f32, f16 };
 
 // Stride-aware flash attention kernel with direct loading from ggml layout
 // InputType: fattn_input_type::f32 or fattn_input_type::f16
-template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, fattn_input_type InputType, bool V_FROM_K = false, int TM = 8, int TN = 8, int TK = 16>
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, fattn_input_type InputType, bool V_FROM_K = false, int TM = 8, int TN = 8, int TK = 16, int BLOCK_M = 32, int BLOCK_N = 32>
 inline void flash_attn_coopmat_kernel_strided(
     sycl::nd_item<2> it,
     const void * Q_raw,           // Q data (float* or sycl::half*)
@@ -1513,8 +1513,6 @@ inline void flash_attn_coopmat_kernel_strided(
     const input_t * K = reinterpret_cast<const input_t *>(K_raw);
     const input_t * V = reinterpret_cast<const input_t *>(V_raw);
 
-    constexpr int BLOCK_M = 32;
-    constexpr int BLOCK_N = 32;
     constexpr int THREADS = 64;
 
     constexpr int NUM_SG_M = BLOCK_M / TM;
@@ -1790,7 +1788,7 @@ inline void flash_attn_coopmat_kernel_strided(
 }
 
 // Wrapper for DG2 (nsize=8) with strided direct loading
-template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, fattn_input_type InputType, bool V_FROM_K = false>
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, fattn_input_type InputType, bool V_FROM_K = false, int BLOCK_M = 32, int BLOCK_N = 32>
 inline void flash_attn_coopmat_kernel_strided_n8(
     sycl::nd_item<2> it,
     const void * Q, const void * K, const void * V,
@@ -1800,14 +1798,14 @@ inline void flash_attn_coopmat_kernel_strided_n8(
     const float * mask, const int64_t mask_stride,
     const fattn_tensor_strides strides, float * shmem
 ) {
-    flash_attn_coopmat_kernel_strided<HEAD_DIM, V_HEAD_DIM, InputType, V_FROM_K, 8, 8, 16>(
+    flash_attn_coopmat_kernel_strided<HEAD_DIM, V_HEAD_DIM, InputType, V_FROM_K, 8, 8, 16, BLOCK_M, BLOCK_N>(
         it, Q, K, V, O, l_d, m_d, N, N_kv, n_heads, n_kv_heads,
         gqa_ratio, scale, mask, mask_stride, strides, shmem
     );
 }
 
 // Wrapper for PVC/B60 (nsize=16) with strided direct loading
-template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, fattn_input_type InputType, bool V_FROM_K = false>
+template <int64_t HEAD_DIM, int64_t V_HEAD_DIM, fattn_input_type InputType, bool V_FROM_K = false, int BLOCK_M = 32, int BLOCK_N = 32>
 inline void flash_attn_coopmat_kernel_strided_n16(
     sycl::nd_item<2> it,
     const void * Q, const void * K, const void * V,
@@ -1817,7 +1815,7 @@ inline void flash_attn_coopmat_kernel_strided_n16(
     const float * mask, const int64_t mask_stride,
     const fattn_tensor_strides strides, float * shmem
 ) {
-    flash_attn_coopmat_kernel_strided<HEAD_DIM, V_HEAD_DIM, InputType, V_FROM_K, 8, 16, 16>(
+    flash_attn_coopmat_kernel_strided<HEAD_DIM, V_HEAD_DIM, InputType, V_FROM_K, 8, 16, 16, BLOCK_M, BLOCK_N>(
         it, Q, K, V, O, l_d, m_d, N, N_kv, n_heads, n_kv_heads,
         gqa_ratio, scale, mask, mask_stride, strides, shmem
     );
