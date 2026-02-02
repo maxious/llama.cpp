@@ -2093,11 +2093,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
             if (actual_d != actual_dv && padded_d > 0 && padded_dv > 0) {
                 // MLA case: DQK != DV (e.g., GLM-4.7-Flash with K=576, V=512)
                 // Use padded kernel with V_FROM_K optimization when V is a view of K
-                if (actual_d == 576 && actual_dv == 512) {
-                    // GLM-4.7: K=576 (native), V=512 (native)
-                    ggml_sycl_op_flash_attn_coopmat_padded<576, 512, 576, 512>(ctx, dst);
-                    return;
-                }
+                
                 // Add more MLA combinations here as needed
                 GGML_SYCL_DEBUG("ggml_sycl: XMX MLA not supported for DQK=%ld DV=%ld, falling back\n", actual_d, actual_dv);
             } else if (actual_d == padded_d && actual_dv == padded_dv) {
