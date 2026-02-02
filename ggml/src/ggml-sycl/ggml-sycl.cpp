@@ -689,7 +689,11 @@ static void dev2dev_memcpy_2d(ggml_backend_sycl_buffer_context * dst_ctx,
                               void *ptr_dst, size_t dst_pitch,
                               const void *ptr_src, size_t src_pitch,
                               size_t width, size_t height) {
-    (void)dst_ctx; // TODO: Use staging pool for 2D copies in future optimization
+    // Optimized staging buffer pool to avoid malloc/free per transfer
+    static thread_local std::vector<char> staging_buffer;
+    static thread_local size_t staging_capacity = 0;
+
+    (void)dst_ctx;
 
     int dst_id = ggml_sycl_get_device_id(q_dst.get_device());
     int src_id = ggml_sycl_get_device_id(q_src.get_device());
@@ -733,20 +737,21 @@ static void dev2dev_memcpy_2d(ggml_backend_sycl_buffer_context * dst_ctx,
         return;
     }
 
-    // For cross-device copy, wait for source kernel to complete first
-    // This is required before we can read from the source buffer
-    GGML_SYCL_DEBUG("[SYCL]   2D host-mediated copy (malloc/free per copy)\n");
+    // For cross-device copy, use host-mediated copy with reusable staging buffer
+    GGML_SYCL_DEBUG("[SYCL]   2D host-mediated copy (optimized)\n");
     g_copy_stats.d2d_host_staged_bytes += total_bytes;
+
+    // Align to 64 bytes for potential SIMD optimization and SYCL requirements
+    constexpr size_t ALIGNMENT = 64;
+    size_t needed_size = (total_bytes + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    if (staging_capacity < needed_size) {
+        staging_buffer.resize(needed_size);
+        staging_capacity = needed_size;
+    }
+
+    char *host_buf = staging_buffer.data();
     g_copy_stats.wait_count++;
     q_src.wait();
-
-    // For cross-device copy, use host-mediated copy for reliability
-    // 2D P2P copies are more prone to issues, so we don't attempt P2P here
-    size_t buf_size = width * height;
-    char *host_buf = (char *)malloc(buf_size);
-    if (!host_buf) {
-        throw std::runtime_error("Failed to allocate host buffer for 2D P2P fallback");
-    }
 
     // Copy from source to host (row by row due to stride)
     const char *src_ptr = (const char *)ptr_src;
@@ -766,10 +771,10 @@ static void dev2dev_memcpy_2d(ggml_backend_sycl_buffer_context * dst_ctx,
         dst_ptr += dst_pitch;
         host_ptr += width;
     }
-    // Must wait before freeing host buffer
+    // Must wait before reusing staging buffer
     q_dst.wait();
 
-    free(host_buf);
+    // Staging buffer reused (not freed) - pool persists across calls
     g_copy_stats.active_copies--;
 }
 
