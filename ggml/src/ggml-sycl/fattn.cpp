@@ -1549,7 +1549,7 @@ void ggml_sycl_op_flash_attn_coopmat_direct(ggml_backend_sycl_context & ctx, ggm
 // 3. Reduction kernel merges partials using online softmax math
 // ============================================================================
 template<int64_t DQK, int64_t DV>
-void ggml_sycl_op_flash_attn_mkl_kv_split(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -1950,59 +1950,59 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     // KV-split handles both short and long contexts efficiently (n_splits=1 for short contexts)
     if (sycl_use_mkl || use_mkl_for_sinks || small_batch) {
         if (DQK == 576 && DV == 512) {
-            ggml_sycl_op_flash_attn_mkl_kv_split<576, 512>(ctx, dst);
+            ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
             return;
         }
 
         if (DQK == DV) {
             switch (DQK) {
                 case 32:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<32, 32>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<32, 32>(ctx, dst);
                     return;
                 case 40:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<40, 40>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<40, 40>(ctx, dst);
                     return;
                 case 48:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<48, 48>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<48, 48>(ctx, dst);
                     return;
                 case 56:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<56, 56>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<56, 56>(ctx, dst);
                     return;
                 case 64:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<64, 64>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<64, 64>(ctx, dst);
                     return;
                 case 72:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<72, 72>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<72, 72>(ctx, dst);
                     return;
                 case 80:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<80, 80>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<80, 80>(ctx, dst);
                     return;
                 case 88:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<88, 88>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<88, 88>(ctx, dst);
                     return;
                 case 96:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<96, 96>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<96, 96>(ctx, dst);
                     return;
                 case 104:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<104, 104>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<104, 104>(ctx, dst);
                     return;
                 case 112:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<112, 112>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<112, 112>(ctx, dst);
                     return;
                 case 128:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<128, 128>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<128, 128>(ctx, dst);
                     return;
                 case 192:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<192, 192>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<192, 192>(ctx, dst);
                     return;
                 case 256:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<256, 256>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<256, 256>(ctx, dst);
                     return;
                 case 512:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<512, 512>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<512, 512>(ctx, dst);
                     return;
                 case 576:
-                    ggml_sycl_op_flash_attn_mkl_kv_split<576, 576>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl<576, 576>(ctx, dst);
                     return;
                 default:
                     GGML_SYCL_DEBUG("ggml_sycl: oneMKL not implemented for head size DQK=%ld DV=%ld\n", DQK, DV);
@@ -2052,9 +2052,14 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         const int64_t padded_dv = get_padded_head_size(actual_dv);
 
         // Try direct loading path first if enabled and compatible
-        if (use_direct_loading && actual_d == actual_dv && 
-            actual_d == padded_d && can_use_direct_loading(Q, K, V, dst)) {
+        bool direct_supported_shape = (actual_d == actual_dv && actual_d == padded_d) || (actual_d == 576 && actual_dv == 512);
+
+        if (use_direct_loading && direct_supported_shape && can_use_direct_loading(Q, K, V, dst)) {
             try {
+                if (actual_d == 576 && actual_dv == 512) {
+                     ggml_sycl_op_flash_attn_coopmat_direct<576, 512>(ctx, dst);
+                     return;
+                }
                 switch (actual_d) {
                     case 32:
                         ggml_sycl_op_flash_attn_coopmat_direct<32, 32>(ctx, dst);
