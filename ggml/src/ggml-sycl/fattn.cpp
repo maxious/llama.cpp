@@ -10,11 +10,11 @@
 #include <sycl/sycl.hpp>
 
 // ============================================================================
-// KV-Split Flash Attention for Decode (Flash Decoding)
+// Flash Attention with KV-Split (Flash Decoding)
 // ============================================================================
-// When N (query length) is small (decode phase), the standard flash attention
-// has limited parallelism - only n_heads workgroups. For long contexts (large N_kv),
-// this underutilizes the GPU.
+// The oneMKL flash attention implementation uses optional KV-dimension splitting
+// for improved GPU utilization. For short contexts (N_kv < 256), it uses a single
+// pass (n_splits=1). For longer contexts, it splits KV across multiple chunks.
 //
 // Flash Decoding splits the KV dimension across multiple workgroups:
 // 1. Each workgroup processes a chunk of KV and produces partial results:
@@ -30,60 +30,29 @@
 // Reference: https://pytorch.org/blog/flash-decoding/
 // ============================================================================
 
-// Heuristics for when to use KV-split decode path
-inline bool should_use_kv_split_decode(int64_t N, int64_t N_kv, int64_t n_heads) {
-    // Only use for decode (small N) with long context
-    if (N > 4) return false;           // Only for decode phase
-    
-    // Check environment variable to force enable/disable
-    static int kv_split_mode = -1;
-    static int64_t min_kv_threshold = 1024;
-    if (kv_split_mode < 0) {
-        const char* env = getenv("GGML_SYCL_FLASH_ATTN_KV_SPLIT");
-        if (env != nullptr) {
-            if (strcmp(env, "0") == 0) {
-                kv_split_mode = 0;  // Disabled
-                GGML_SYCL_DEBUG("ggml_sycl: KV-split flash attention DISABLED by environment variable\n");
-            } else if (strcmp(env, "1") == 0) {
-                kv_split_mode = 2;  // Force enabled with low threshold
-                min_kv_threshold = 64;  // Lower threshold when forced
-                GGML_SYCL_DEBUG("ggml_sycl: KV-split flash attention FORCED by environment variable (min_kv=%ld)\n", min_kv_threshold);
-            } else {
-                kv_split_mode = 1;  // Auto
-            }
-        } else {
-            kv_split_mode = 1;  // Auto (default)
-        }
+// Get optimal number of KV splits based on context length and device
+// Returns 1 for short contexts (no splitting needed), otherwise 2-16 splits
+inline int64_t get_kv_split_count(int64_t N_kv, int64_t n_heads) {
+    // For very short contexts, no splitting needed - single pass is optimal
+    constexpr int64_t MIN_KV_FOR_SPLIT = 256;
+    if (N_kv < MIN_KV_FOR_SPLIT) {
+        return 1;  // No splitting for short contexts
     }
     
-    if (N_kv < min_kv_threshold) return false;  // Not worth it for short contexts
-    
-    if (kv_split_mode == 0) return false;
-    if (kv_split_mode == 2) return true;
-    
-    // Auto mode: use when we have few heads but long context
-    // This is when standard path would underutilize the GPU
-    return (n_heads <= 64 && N_kv >= 2048);
-}
-
-// Get optimal number of KV splits based on context length and device
-inline int64_t get_kv_split_count(int64_t N_kv, int64_t n_heads) {
     // Target: enough splits to saturate GPU, but not too many to cause overhead
     // Each split should process at least 256 KV positions for efficiency
     constexpr int64_t MIN_KV_PER_SPLIT = 256;
-    constexpr int64_t MAX_SPLITS = 32;
+    constexpr int64_t MAX_SPLITS = 16;
     
     int64_t max_splits_by_kv = N_kv / MIN_KV_PER_SPLIT;
     int64_t splits = std::min(max_splits_by_kv, MAX_SPLITS);
-    
-    // Ensure at least 2 splits (otherwise no point in splitting)
-    splits = std::max(splits, (int64_t)2);
     
     // Round to power of 2 for cleaner division
     if (splits >= 16) splits = 16;
     else if (splits >= 8) splits = 8;
     else if (splits >= 4) splits = 4;
-    else splits = 2;
+    else if (splits >= 2) splits = 2;
+    else splits = 1;
     
     (void)n_heads; // May be used in future for more sophisticated heuristics
     return splits;
@@ -1566,369 +1535,15 @@ void ggml_sycl_op_flash_attn_coopmat_direct(ggml_backend_sycl_context & ctx, ggm
 #endif // SYCL_EXT_COOPERATIVE_MATRICES
 
 #ifdef GGML_SYCL_USE_INTEL_ONEMKL
-// Optimized oneMKL-based flash attention for Arc B60 (Xe2/Battlemage)
-template<int64_t DQK, int64_t DV>
-void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * Q = dst->src[0];
-    const ggml_tensor * K = dst->src[1];
-    const ggml_tensor * V = dst->src[2];
-    const ggml_tensor * mask = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
-
-    const int64_t N = Q->ne[1];
-    const int64_t N_kv = K->ne[1];
-    const int64_t n_heads = Q->ne[2];
-    const int64_t n_kv_heads = K->ne[2];
-    const int64_t gqa_ratio = n_heads / n_kv_heads;
-
-    dpct::queue_ptr stream = ctx.stream();
-
-    GGML_SYCL_DEBUG("[SYCL][OP] flash_attn_mkl<%ld,%ld> ENTRY: N=%ld N_kv=%ld n_heads=%ld n_kv_heads=%ld\n",
-            DQK, DV, N, N_kv, n_heads, n_kv_heads);
-
-    static bool first_mkl_call = true;
-    if (first_mkl_call && getenv("GGML_SYCL_FLASH_ATTN_DEBUG")) {
-        GGML_SYCL_DEBUG("ggml_sycl MKL path (OPTIMIZED): Q ne=[%ld,%ld,%ld,%ld] type=%d\n",
-                Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3], Q->type);
-        first_mkl_call = false;
-    }
-
-    const bool q_is_f16 = (Q->type == GGML_TYPE_F16);
-    const bool k_is_f16 = (K->type == GGML_TYPE_F16);
-    const bool v_is_f16 = (V->type == GGML_TYPE_F16);
-
-    const bool V_is_K_view = V->view_src && V->view_offs == 0 && (V->view_src == K || V->view_src == K->view_src);
-
-    const float * Q_d_f32;
-    const float * K_d_f32;
-    const float * V_d_f32;
-    float * Q_d_f32_alloc = nullptr;
-    float * K_d_f32_alloc = nullptr;
-    float * V_d_f32_alloc = nullptr;
-
-    Q_d_f32_alloc = (float *) sycl::malloc_device(N * DQK * n_heads * sizeof(float), *stream);
-    if (q_is_f16) {
-        const sycl::half * Q_f16 = (const sycl::half *) Q->data;
-        const int64_t q_stride_seq = Q->nb[1] / sizeof(sycl::half);
-        const int64_t q_stride_head = Q->nb[2] / sizeof(sycl::half);
-        sycl::event q_event = stream->submit([&](sycl::handler& cgh) {
-            const int64_t total = N * DQK * n_heads;
-            cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
-                const int idx = it.get_id(0);
-                if (idx >= total) return;
-                const int64_t head = idx / (N * DQK);
-                const int64_t rem = idx % (N * DQK);
-                const int64_t n = rem / DQK;
-                const int64_t d = rem % DQK;
-                Q_d_f32_alloc[idx] = static_cast<float>(Q_f16[d + head * q_stride_head + n * q_stride_seq]);
-            });
-        });
-        q_event.wait();
-    } else {
-        const float * Q_f32 = (const float *) Q->data;
-        const int64_t q_stride_seq = Q->nb[1] / sizeof(float);
-        const int64_t q_stride_head = Q->nb[2] / sizeof(float);
-        sycl::event q_event = stream->submit([&](sycl::handler& cgh) {
-            const int64_t total = N * DQK * n_heads;
-            cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
-                const int idx = it.get_id(0);
-                if (idx >= total) return;
-                const int64_t head = idx / (N * DQK);
-                const int64_t rem = idx % (N * DQK);
-                const int64_t n = rem / DQK;
-                const int64_t d = rem % DQK;
-                Q_d_f32_alloc[idx] = Q_f32[d + head * q_stride_head + n * q_stride_seq];
-            });
-        });
-        q_event.wait();
-    }
-    Q_d_f32 = Q_d_f32_alloc;
-
-    K_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DQK * n_kv_heads * sizeof(float), *stream);
-    if (k_is_f16) {
-        const sycl::half * K_f16 = (const sycl::half *) K->data;
-        const int64_t k_stride_seq = K->nb[1] / sizeof(sycl::half);
-        const int64_t k_stride_head = K->nb[2] / sizeof(sycl::half);
-        sycl::event k_event = stream->submit([&](sycl::handler& cgh) {
-            const int64_t total = N_kv * DQK * n_kv_heads;
-            cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
-                const int idx = it.get_id(0);
-                if (idx >= total) return;
-                const int64_t head = idx / (N_kv * DQK);
-                const int64_t rem = idx % (N_kv * DQK);
-                const int64_t n = rem / DQK;
-                const int64_t d = rem % DQK;
-                K_d_f32_alloc[idx] = static_cast<float>(K_f16[d + head * k_stride_head + n * k_stride_seq]);
-            });
-        });
-        k_event.wait();
-    } else {
-        const float * K_f32 = (const float *) K->data;
-        const int64_t k_stride_seq = K->nb[1] / sizeof(float);
-        const int64_t k_stride_head = K->nb[2] / sizeof(float);
-        sycl::event k_event = stream->submit([&](sycl::handler& cgh) {
-            const int64_t total = N_kv * DQK * n_kv_heads;
-            cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
-                const int idx = it.get_id(0);
-                if (idx >= total) return;
-                const int64_t head = idx / (N_kv * DQK);
-                const int64_t rem = idx % (N_kv * DQK);
-                const int64_t n = rem / DQK;
-                const int64_t d = rem % DQK;
-                K_d_f32_alloc[idx] = K_f32[d + head * k_stride_head + n * k_stride_seq];
-            });
-        });
-        k_event.wait();
-    }
-    K_d_f32 = K_d_f32_alloc;
-
-    if (V_is_K_view && DQK == DV) {
-        // V is a view of K and they have the same head dimension - can reuse directly
-        V_d_f32 = K_d_f32;
-    } else if (V_is_K_view && DQK != DV) {
-        // MLA case: V is a view of K but with different head dimension
-        // K layout is [kv_lora_scaled (DV), pe (DQK-DV)] = DQK total
-        // V uses only the first DV elements of each K row
-        V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
-        sycl::event v_event = stream->submit([&](sycl::handler& cgh) {
-            const int64_t total = N_kv * DV * n_kv_heads;
-            cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
-                const int idx = it.get_id(0);
-                if (idx >= total) return;
-                const int64_t head = idx / (N_kv * DV);
-                const int64_t rem = idx % (N_kv * DV);
-                const int64_t n = rem / DV;
-                const int64_t d = rem % DV;
-                // Read from K's reordered layout: K_d_f32[head * N_kv * DQK + n * DQK + d]
-                V_d_f32_alloc[idx] = K_d_f32[head * N_kv * DQK + n * DQK + d];
-            });
-        });
-        v_event.wait();
-        V_d_f32 = V_d_f32_alloc;
-    } else {
-        V_d_f32_alloc = (float *) sycl::malloc_device(N_kv * DV * n_kv_heads * sizeof(float), *stream);
-        if (v_is_f16) {
-            const sycl::half * V_f16 = (const sycl::half *) V->data;
-            const int64_t v_stride_seq = V->nb[1] / sizeof(sycl::half);
-            const int64_t v_stride_head = V->nb[2] / sizeof(sycl::half);
-            sycl::event v_event = stream->submit([&](sycl::handler& cgh) {
-                const int64_t total = N_kv * DV * n_kv_heads;
-                cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
-                    const int idx = it.get_id(0);
-                    if (idx >= total) return;
-                    const int64_t head = idx / (N_kv * DV);
-                    const int64_t rem = idx % (N_kv * DV);
-                    const int64_t n = rem / DV;
-                    const int64_t d = rem % DV;
-                    V_d_f32_alloc[idx] = static_cast<float>(V_f16[d + head * v_stride_head + n * v_stride_seq]);
-                });
-            });
-            v_event.wait();
-        } else {
-            const float * V_f32 = (const float *) V->data;
-            const int64_t v_stride_seq = V->nb[1] / sizeof(float);
-            const int64_t v_stride_head = V->nb[2] / sizeof(float);
-            sycl::event v_event = stream->submit([&](sycl::handler& cgh) {
-                const int64_t total = N_kv * DV * n_kv_heads;
-                cgh.parallel_for(sycl::range<1>((total + 255) / 256 * 256), [=](sycl::item<1> it) {
-                    const int idx = it.get_id(0);
-                    if (idx >= total) return;
-                    const int64_t head = idx / (N_kv * DV);
-                    const int64_t rem = idx % (N_kv * DV);
-                    const int64_t n = rem / DV;
-                    const int64_t d = rem % DV;
-                    V_d_f32_alloc[idx] = V_f32[d + head * v_stride_head + n * v_stride_seq];
-                });
-            });
-            v_event.wait();
-        }
-        V_d_f32 = V_d_f32_alloc;
-    }
-
-    float * O_d = (float *) dst->data;
-    // Note: variable names are swapped vs GGML convention for historical reasons
-    // o_stride_head is actually nb[1] (row stride), o_stride_seq is nb[2] (head stride)
-    // Usage: O_d[col + head * o_stride_head + row * o_stride_seq]
-    const int64_t o_stride_head = dst->nb[1] / sizeof(float);
-    const int64_t o_stride_seq = dst->nb[2] / sizeof(float);
-
-    float scale = 1.0f;
-    std::memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
-
-    const float * mask_d = nullptr;
-    float * mask_d_f32_alloc = nullptr;
-    int64_t mask_stride = N_kv;
-    if (mask != nullptr && mask->data != nullptr) {
-        if (mask->type == GGML_TYPE_F32) {
-            mask_d = (const float *) mask->data;
-            mask_stride = mask->nb[1] / sizeof(float);
-        } else if (mask->type == GGML_TYPE_F16) {
-            const int64_t mask_n_kv = mask->ne[0];
-            const int64_t mask_n_q = mask->ne[1];
-            const int64_t mask_elements = mask_n_kv * mask_n_q;
-            mask_d_f32_alloc = (float *) sycl::malloc_device(mask_elements * sizeof(float), *stream);
-            const sycl::half * mask_f16 = (const sycl::half *) mask->data;
-            const ptrdiff_t mask_row_stride_f16 = mask->nb[1] / sizeof(sycl::half);
-            stream->submit([&](sycl::handler& cgh) {
-                cgh.parallel_for(sycl::range<1>((mask_elements + 255) / 256 * 256), [=](sycl::item<1> it) {
-                    const int idx = it.get_id(0);
-                    if (idx < mask_elements) {
-                        const int64_t row = idx / mask_n_kv;
-                        const int64_t col = idx % mask_n_kv;
-                        mask_d_f32_alloc[idx] = static_cast<float>(mask_f16[row * mask_row_stride_f16 + col]);
-                    }
-                });
-            });
-            mask_d = mask_d_f32_alloc;
-            mask_stride = mask_n_kv;
-        }
-    }
-
-    const float * sinks_d = nullptr;
-    if (sinks != nullptr && sinks->data != nullptr) {
-        sinks_d = (const float *) sinks->data;
-    }
-
-    stream->wait();
-
-    float * S_scores = (float *) sycl::malloc_device(n_heads * N * N_kv * sizeof(float), *stream);
-    float * O_temp = (float *) sycl::malloc_device(n_heads * N * DV * sizeof(float), *stream);
-    stream->memset(S_scores, 0, n_heads * N * N_kv * sizeof(float));
-
-    const int64_t lda_q = DQK;
-    const int64_t lda_k = DQK;
-    const int64_t lda_s = N_kv;
-    const int64_t lda_v = DV;
-    const int64_t lda_o = DV;
-
-    const int64_t stride_q = N * DQK;
-    const int64_t stride_k = N_kv * DQK;
-    const int64_t stride_s = N * N_kv;
-    const int64_t stride_v = N_kv * DV;
-    const int64_t stride_o = N * DV;
-
-    if (gqa_ratio == 1) {
-        oneapi::mkl::blas::row_major::gemm_batch(*stream,
-            oneapi::mkl::transpose::N, oneapi::mkl::transpose::T,
-            N, N_kv, DQK,
-            scale,
-            Q_d_f32, lda_q, stride_q,
-            K_d_f32, lda_k, stride_k,
-            0.0f,
-            S_scores, lda_s, stride_s,
-            n_heads);
-    } else {
-        for (int64_t kv_head = 0; kv_head < n_kv_heads; ++kv_head) {
-            const int64_t q_head_start = kv_head * gqa_ratio;
-            oneapi::mkl::blas::row_major::gemm_batch(*stream,
-                oneapi::mkl::transpose::N, oneapi::mkl::transpose::T,
-                N, N_kv, DQK,
-                scale,
-                Q_d_f32 + q_head_start * stride_q, lda_q, stride_q,
-                K_d_f32 + kv_head * stride_k, lda_k, 0,
-                0.0f,
-                S_scores + q_head_start * stride_s, lda_s, stride_s,
-                gqa_ratio);
-        }
-    }
-
-    stream->wait();
-
-    stream->submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::range<1>(n_heads * N), [=](sycl::id<1> idx) {
-            const int64_t head = idx[0] / N;
-            const int64_t q = idx[0] % N;
-            float * S_row = S_scores + head * stride_s + q * N_kv;
-            float row_max = -1.0e20f;
-            for (int64_t k = 0; k < N_kv; ++k) {
-                float s_val = S_row[k];
-                if (mask_d != nullptr) {
-                    s_val += mask_d[q * mask_stride + k];
-                }
-                S_row[k] = s_val;
-                row_max = sycl::fmax(row_max, s_val);
-            }
-            float sink_val = 0.0f;
-            if (sinks_d != nullptr) {
-                sink_val = sinks_d[head];
-                row_max = sycl::fmax(row_max, sink_val);
-            }
-            float sum = 0.0f;
-            for (int64_t k = 0; k < N_kv; ++k) {
-                float exp_val = sycl::exp(sycl::fmax(S_row[k] - row_max, -20.0f));
-                S_row[k] = exp_val;
-                sum += exp_val;
-            }
-            if (sinks_d != nullptr) {
-                sum += sycl::exp(sycl::fmax(sink_val - row_max, -20.0f));
-            }
-            if (sum > 1.0e-10f) {
-                float inv_sum = 1.0f / sum;
-                for (int64_t k = 0; k < N_kv; ++k) {
-                    S_row[k] *= inv_sum;
-                }
-            }
-        });
-    });
-
-    stream->wait();
-
-    if (gqa_ratio == 1) {
-        oneapi::mkl::blas::row_major::gemm_batch(*stream,
-            oneapi::mkl::transpose::N, oneapi::mkl::transpose::N,
-            N, DV, N_kv,
-            1.0f,
-            S_scores, lda_s, stride_s,
-            V_d_f32, lda_v, stride_v,
-            0.0f,
-            O_temp, lda_o, stride_o,
-            n_heads);
-    } else {
-        for (int64_t kv_head = 0; kv_head < n_kv_heads; ++kv_head) {
-            const int64_t q_head_start = kv_head * gqa_ratio;
-            oneapi::mkl::blas::row_major::gemm_batch(*stream,
-                oneapi::mkl::transpose::N, oneapi::mkl::transpose::N,
-                N, DV, N_kv,
-                1.0f,
-                S_scores + q_head_start * stride_s, lda_s, stride_s,
-                V_d_f32 + kv_head * stride_v, lda_v, 0,
-                0.0f,
-                O_temp + q_head_start * stride_o, lda_o, stride_o,
-                gqa_ratio);
-        }
-    }
-
-    stream->wait();
-
-    stream->submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::range<1>(n_heads * N * DV), [=](sycl::id<1> idx) {
-            const int64_t i = idx[0];
-            const int64_t head = i / (N * DV);
-            const int64_t rem = i % (N * DV);
-            const int64_t row = rem / DV;
-            const int64_t col = rem % DV;
-            O_d[col + head * o_stride_head + row * o_stride_seq] = O_temp[i];
-        });
-    });
-
-    stream->wait();
-
-    sycl::free(S_scores, *stream);
-    sycl::free(O_temp, *stream);
-    if (mask_d_f32_alloc) sycl::free(mask_d_f32_alloc, *stream);
-    if (Q_d_f32_alloc) sycl::free(Q_d_f32_alloc, *stream);
-    if (K_d_f32_alloc) sycl::free(K_d_f32_alloc, *stream);
-    if (V_d_f32_alloc && !V_is_K_view) sycl::free(V_d_f32_alloc, *stream);
-}
-
 // ============================================================================
-// KV-Split Flash Attention Decode (Flash Decoding) - oneMKL Implementation
+// oneMKL Flash Attention with KV-Split (Flash Decoding)
 // ============================================================================
-// This variant splits the KV dimension across multiple parallel workgroups
-// for better GPU utilization during decode (when N is small but N_kv is large).
+// Optimized flash attention using oneMKL BLAS with optional KV dimension splitting.
+// For short contexts (N_kv < 256), uses single pass (n_splits=1).
+// For longer contexts, splits KV across multiple chunks for better parallelism.
 //
 // Algorithm:
-// 1. Split KV into n_splits chunks
+// 1. Split KV into n_splits chunks (n_splits=1 for short contexts)
 // 2. Each chunk computes partial attention: Q @ K_chunk^T -> softmax -> @ V_chunk
 //    Stores partial results: M_partial (max), L_partial (sum), O_partial (output)
 // 3. Reduction kernel merges partials using online softmax math
@@ -1941,8 +1556,8 @@ void ggml_sycl_op_flash_attn_mkl_kv_split(ggml_backend_sycl_context & ctx, ggml_
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
-    const int64_t N = Q->ne[1];        // Query sequence length (small during decode)
-    const int64_t N_kv = K->ne[1];     // KV sequence length (can be large)
+    const int64_t N = Q->ne[1];        // Query sequence length
+    const int64_t N_kv = K->ne[1];     // KV sequence length
     const int64_t n_heads = Q->ne[2];
     const int64_t n_kv_heads = K->ne[2];
     const int64_t gqa_ratio = n_heads / n_kv_heads;
@@ -1955,7 +1570,7 @@ void ggml_sycl_op_flash_attn_mkl_kv_split(ggml_backend_sycl_context & ctx, ggml_
 
     static bool first_call = true;
     if (first_call) {
-        fprintf(stderr, "ggml_sycl: KV-split flash attention ACTIVE: N=%ld N_kv=%ld n_heads=%ld n_splits=%ld kv_per_split=%ld\n",
+        fprintf(stderr, "ggml_sycl: oneMKL flash attention ACTIVE: N=%ld N_kv=%ld n_heads=%ld n_splits=%ld kv_per_split=%ld\n",
                 N, N_kv, n_heads, n_splits, kv_per_split);
         first_call = false;
     }
@@ -2331,98 +1946,63 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     }
     const bool small_batch = !force_xmx && (N < 32);
 
-    // Check if KV-split decode path should be used (Flash Decoding)
-    // Only for decode (small N) with long context, and when not using sinks
-    const bool use_kv_split = should_use_kv_split_decode(N, N_kv, n_heads) && !use_mkl_for_sinks;
-
-    if (use_kv_split) {
-        // KV-split decode path for better GPU utilization
+    // Use oneMKL KV-split path when MKL is available and needed
+    // KV-split handles both short and long contexts efficiently (n_splits=1 for short contexts)
+    if (sycl_use_mkl || use_mkl_for_sinks || small_batch) {
         if (DQK == 576 && DV == 512) {
             ggml_sycl_op_flash_attn_mkl_kv_split<576, 512>(ctx, dst);
             return;
         }
+
         if (DQK == DV) {
             switch (DQK) {
                 case 32:
                     ggml_sycl_op_flash_attn_mkl_kv_split<32, 32>(ctx, dst);
                     return;
+                case 40:
+                    ggml_sycl_op_flash_attn_mkl_kv_split<40, 40>(ctx, dst);
+                    return;
+                case 48:
+                    ggml_sycl_op_flash_attn_mkl_kv_split<48, 48>(ctx, dst);
+                    return;
+                case 56:
+                    ggml_sycl_op_flash_attn_mkl_kv_split<56, 56>(ctx, dst);
+                    return;
                 case 64:
                     ggml_sycl_op_flash_attn_mkl_kv_split<64, 64>(ctx, dst);
+                    return;
+                case 72:
+                    ggml_sycl_op_flash_attn_mkl_kv_split<72, 72>(ctx, dst);
                     return;
                 case 80:
                     ggml_sycl_op_flash_attn_mkl_kv_split<80, 80>(ctx, dst);
                     return;
+                case 88:
+                    ggml_sycl_op_flash_attn_mkl_kv_split<88, 88>(ctx, dst);
+                    return;
                 case 96:
                     ggml_sycl_op_flash_attn_mkl_kv_split<96, 96>(ctx, dst);
+                    return;
+                case 104:
+                    ggml_sycl_op_flash_attn_mkl_kv_split<104, 104>(ctx, dst);
+                    return;
+                case 112:
+                    ggml_sycl_op_flash_attn_mkl_kv_split<112, 112>(ctx, dst);
                     return;
                 case 128:
                     ggml_sycl_op_flash_attn_mkl_kv_split<128, 128>(ctx, dst);
                     return;
+                case 192:
+                    ggml_sycl_op_flash_attn_mkl_kv_split<192, 192>(ctx, dst);
+                    return;
                 case 256:
                     ggml_sycl_op_flash_attn_mkl_kv_split<256, 256>(ctx, dst);
                     return;
-                default:
-                    // Fall through to standard MKL path for unsupported head sizes
-                    break;
-            }
-        }
-    }
-
-    if (sycl_use_mkl || use_mkl_for_sinks || small_batch) {
-        if (DQK == 576 && DV == 512) {
-            ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
-            return;
-        }
-
-        if (DQK == DV) {
-            switch (DQK) {
-                case 32:
-                    ggml_sycl_op_flash_attn_mkl<32, 32>(ctx, dst);
-                    return;
-                case 40:
-                    ggml_sycl_op_flash_attn_mkl<40, 40>(ctx, dst);
-                    return;
-                case 48:
-                    ggml_sycl_op_flash_attn_mkl<48, 48>(ctx, dst);
-                    return;
-                case 56:
-                    ggml_sycl_op_flash_attn_mkl<56, 56>(ctx, dst);
-                    return;
-                case 64:
-                    ggml_sycl_op_flash_attn_mkl<64, 64>(ctx, dst);
-                    return;
-                case 72:
-                    ggml_sycl_op_flash_attn_mkl<72, 72>(ctx, dst);
-                    return;
-                case 80:
-                    ggml_sycl_op_flash_attn_mkl<80, 80>(ctx, dst);
-                    return;
-                case 88:
-                    ggml_sycl_op_flash_attn_mkl<88, 88>(ctx, dst);
-                    return;
-                case 96:
-                    ggml_sycl_op_flash_attn_mkl<96, 96>(ctx, dst);
-                    return;
-                case 104:
-                    ggml_sycl_op_flash_attn_mkl<104, 104>(ctx, dst);
-                    return;
-                case 112:
-                    ggml_sycl_op_flash_attn_mkl<112, 112>(ctx, dst);
-                    return;
-                case 128:
-                    ggml_sycl_op_flash_attn_mkl<128, 128>(ctx, dst);
-                    return;
-                case 192:
-                    ggml_sycl_op_flash_attn_mkl<192, 192>(ctx, dst);
-                    return;
-                case 256:
-                    ggml_sycl_op_flash_attn_mkl<256, 256>(ctx, dst);
-                    return;
                 case 512:
-                    ggml_sycl_op_flash_attn_mkl<512, 512>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl_kv_split<512, 512>(ctx, dst);
                     return;
                 case 576:
-                    ggml_sycl_op_flash_attn_mkl<576, 576>(ctx, dst);
+                    ggml_sycl_op_flash_attn_mkl_kv_split<576, 576>(ctx, dst);
                     return;
                 default:
                     GGML_SYCL_DEBUG("ggml_sycl: oneMKL not implemented for head size DQK=%ld DV=%ld\n", DQK, DV);
