@@ -1746,6 +1746,9 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
     }
 
     float * O_d = (float *) dst->data;
+    // Note: variable names are swapped vs GGML convention for historical reasons
+    // o_stride_head is actually nb[1] (row stride), o_stride_seq is nb[2] (head stride)
+    // Usage: O_d[col + head * o_stride_head + row * o_stride_seq]
     const int64_t o_stride_head = dst->nb[1] / sizeof(float);
     const int64_t o_stride_seq = dst->nb[2] / sizeof(float);
 
@@ -2256,8 +2259,10 @@ void ggml_sycl_op_flash_attn_mkl_kv_split(ggml_backend_sycl_context & ctx, ggml_
     }
     
     float * O_d = (float *) dst->data;
-    const int64_t o_stride_head = dst->nb[1] / sizeof(float);
-    const int64_t o_stride_seq = dst->nb[2] / sizeof(float);
+    // Flash attention output is permuted: [DV, n_heads, N, batch]
+    // nb[1] = stride between heads, nb[2] = stride between sequence positions
+    const int64_t o_stride_head = dst->nb[1] / sizeof(float);  // stride between heads = DV
+    const int64_t o_stride_seq = dst->nb[2] / sizeof(float);   // stride between rows = DV * n_heads
     
     stream->submit([&](sycl::handler& cgh) {
         cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_heads * N, DV), sycl::range<2>(1, DV)), 
