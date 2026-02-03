@@ -34,7 +34,7 @@ constexpr int GEMM_WG_M = GEMM_BM / GEMM_TM;
 constexpr int GEMM_WG_N = GEMM_BN / GEMM_TN;
 constexpr int GEMM_WG_SIZE = GEMM_WG_M * GEMM_WG_N;
 
-template <int BM, int BN, int BK, int TM, int TN, bool transpose_B = true>
+template <int BM, int BN, int BK, int TM, int TN, bool transpose_A = false, bool transpose_B = true>
 inline void gemm_tiled_kernel(
     sycl::nd_item<2> it,
     sycl::local_accessor<float, 1> tile_A,
@@ -97,7 +97,11 @@ inline void gemm_tiled_kernel(
                 
                 float val = 0.0f;
                 if (global_row < M && global_k < K) {
-                    val = A[global_row * lda + global_k];
+                    if constexpr (transpose_A) {
+                        val = A[global_k * lda + global_row];
+                    } else {
+                        val = A[global_row * lda + global_k];
+                    }
                 }
                 tile_A[tile_m * BK + tile_k] = val;
             }
@@ -215,7 +219,45 @@ inline void launch_gemm_tiled(
         sycl::local_accessor<float, 1> tile_B(sycl::range<1>(BN * BK), cgh);
         
         cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) {
-            gemm_tiled_kernel<BM, BN, BK, TM, TN, transpose_B>(
+            gemm_tiled_kernel<BM, BN, BK, TM, TN, false, transpose_B>(
+                it, tile_A, tile_B,
+                A, B, C,
+                M, N, K,
+                alpha, beta,
+                lda, ldb, ldc
+            );
+        });
+    });
+}
+
+// Variant for A^T * B (transpose_A = true, transpose_B = false)
+inline void launch_gemm_tiled_A_transposed(
+    sycl::queue * stream,
+    const float * A, const float * B, float * C,
+    const int M, const int N, const int K,
+    const float alpha, const float beta,
+    const int lda, const int ldb, const int ldc
+) {
+    constexpr int BM = GEMM_BM;
+    constexpr int BN = GEMM_BN;
+    constexpr int BK = GEMM_BK;
+    constexpr int TM = GEMM_TM;
+    constexpr int TN = GEMM_TN;
+    constexpr int WG_M = BM / TM;
+    constexpr int WG_N = BN / TN;
+    
+    const int grid_m = (M + BM - 1) / BM;
+    const int grid_n = (N + BN - 1) / BN;
+    
+    sycl::range<2> global(grid_m * WG_M, grid_n * WG_N);
+    sycl::range<2> local(WG_M, WG_N);
+    
+    stream->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> tile_A(sycl::range<1>(BM * BK), cgh);
+        sycl::local_accessor<float, 1> tile_B(sycl::range<1>(BN * BK), cgh);
+        
+        cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) {
+            gemm_tiled_kernel<BM, BN, BK, TM, TN, true, false>(
                 it, tile_A, tile_B,
                 A, B, C,
                 M, N, K,

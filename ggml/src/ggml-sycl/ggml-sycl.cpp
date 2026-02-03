@@ -47,6 +47,8 @@
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/gemm.hpp"
+#include "ggml-sycl/gemm_tiled.hpp"
+#include "ggml-sycl/gemm_f16_f32_tiled.hpp"
 #include "ggml-sycl/set_rows.hpp"
 #include "ggml-sycl/set.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
@@ -2976,6 +2978,7 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
     float *            dst_ddf  = static_cast<float *>(dst->data);
 
     const sycl::half * src1_f16       = static_cast<const sycl::half *>(src1->data);
+    const size_t       type_size_src0 = ggml_type_size(src0->type);
     const size_t       type_size_src1 = ggml_type_size(src1->type);
 
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
@@ -3485,6 +3488,8 @@ static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * 
            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 }
 
+
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
     const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
@@ -3548,6 +3553,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     } else if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1) {
         // KQ + KQV multi-batch
         ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
+    // NOTE: Experimental tiled GEMM for graph compatibility (F32/F32->F32) is disabled
+    // due to precision issues. The tiled kernel produces ~2.0 error vs threshold of 0.0005.
+    // Future work: fix the tiled GEMM kernel indexing/transpose handling.
+    // For now, F32 MUL_MAT falls through to oneMKL (graph-incompatible but correct).
     } else if (use_dequantize_mul_mat_vec) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::DMMV);
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);
@@ -3565,7 +3574,6 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);
     }
 }
-
 
 struct mmid_row_mapping {
     int32_t i1;
@@ -4430,6 +4438,11 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                         break;
                     }
 
+                    // Note: oneDNN Graph API (DnnlGraphWrapper) is NOT compatible with SYCL command graphs
+                    // because oneDNN Graph's cp.execute() creates internal SYCL events that break graph recording.
+                    // The error "Graph nodes cannot depend on events from outside the graph" occurs.
+                    // To enable SYCL graphs for F16/F32 GEMM, a custom graph-compatible kernel would be needed.
+
                     // oneMKL GEMM operations internally create events and call wait() which cannot
                     // be used during SYCL graph recording. This is a fundamental limitation of oneMKL.
                     //
@@ -4437,11 +4450,12 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                     // 1. Use quantized weights (Q4_K, Q8_0, etc.) with batch size 1 -> uses mul_mat_vec_q kernels
                     // 2. Use F16 weights with specific tensor layouts (see conditions above)
                     // 3. Implement a graph-compatible custom GEMM kernel (see ggml-sycl/gemm_tiled.hpp)
+                    // 4. Enable oneDNN with Graph API for F16/F32 -> uses DnnlGraphWrapper
                     //
                     // Current tensor: src0=%s [%ldx%ld], src1=F32 [%ldx%ld], batch=%ld
                     GGML_LOG_INFO("%s: disabling SYCL graphs - MUL_MAT requires oneMKL GEMM which is graph-incompatible. "
                                   "src0 type=%s ne=[%ld,%ld], src1 ne=[%ld,%ld], nrows=%ld. "
-                                  "Fix: use quantized model (Q4_K/Q8_0) or implement graph-compatible GEMM.\n",
+                                  "Fix: use quantized model (Q4_K/Q8_0), implement graph-compatible GEMM, or enable oneDNN Graph.\n",
                                   __func__, ggml_type_name(src0->type),
                                   (long)src0->ne[0], (long)src0->ne[1],
                                   (long)src1->ne[0], (long)src1->ne[1],
