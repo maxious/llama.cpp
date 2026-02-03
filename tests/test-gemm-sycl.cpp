@@ -1,5 +1,10 @@
-// SYCL GEMM Benchmark: Tiled vs oneMKL
-// Build: icpx -fsycl -O3 -DGGML_SYCL_USE_INTEL_ONEMKL tests/test-gemm-sycl.cpp -o test-gemm-sycl -lmkl_sycl -lmkl_intel_lp64 -lmkl_core -lmkl_sequential
+// SYCL GEMM Benchmark: Simple vs Tiled vs XMX vs oneMKL
+// Build (with XMX + MKL):
+//   icpx -fsycl -O3 -DGGML_SYCL_USE_INTEL_ONEMKL -DSYCL_EXT_ONEAPI_MATRIX \
+//     tests/test-gemm-sycl.cpp -o test-gemm-sycl \
+//     -lmkl_sycl -lmkl_intel_lp64 -lmkl_core -lmkl_sequential
+// Build (XMX only, no MKL):
+//   icpx -fsycl -O3 -DSYCL_EXT_ONEAPI_MATRIX tests/test-gemm-sycl.cpp -o test-gemm-sycl
 // Run: source /opt/intel/oneapi/setvars.sh intel64 && ./test-gemm-sycl
 
 #include <sycl/sycl.hpp>
@@ -14,6 +19,9 @@
 #ifdef GGML_SYCL_USE_INTEL_ONEMKL
 #include <oneapi/mkl.hpp>
 #endif
+
+// Include XMX GEMM implementation
+#include "../ggml/src/ggml-sycl/gemm_xmx.hpp"
 
 // ============================================================================
 // Tiled GEMM Implementation (standalone copy for benchmarking)
@@ -321,7 +329,36 @@ public:
         }
         
         std::cout << "  Max diff: " << max_diff << ", Errors: " << errors << "/" << M*N << "\n";
-        std::cout << (errors == 0 ? "  PASSED\n" : "  FAILED\n") << "\n";
+        std::cout << (errors == 0 ? "  Tiled PASSED\n" : "  Tiled FAILED\n");
+        
+#ifdef SYCL_EXT_ONEAPI_MATRIX
+        // Verify XMX GEMM (uses BF16 so has lower precision)
+        if (xmx_gemm_available(&q)) {
+            std::vector<float> h_C_xmx(M * N);
+            q.memset(d_C, 0, M * N * sizeof(float)).wait();
+            
+            launch_gemm_xmx<true>(&q, d_A, d_B, d_C, M, N, K, 1.0f, 0.0f, K, K, N);
+            q.wait();
+            
+            q.memcpy(h_C_xmx.data(), d_C, M * N * sizeof(float)).wait();
+            
+            float xmx_max_diff = 0.0f;
+            double xmx_sum_sq_err = 0.0;
+            double xmx_sum_sq_ref = 0.0;
+            // BF16 accumulates error across K dimension, so use NMSE metric
+            for (int i = 0; i < M * N; ++i) {
+                float diff = h_C_ref[i] - h_C_xmx[i];
+                xmx_max_diff = std::max(xmx_max_diff, std::abs(diff));
+                xmx_sum_sq_err += diff * diff;
+                xmx_sum_sq_ref += h_C_ref[i] * h_C_ref[i];
+            }
+            double xmx_nmse = xmx_sum_sq_err / (xmx_sum_sq_ref + 1e-10);
+            // BF16 NMSE should be < 1e-4 for reasonable accuracy
+            std::cout << "  XMX max diff: " << xmx_max_diff << ", NMSE: " << xmx_nmse << "\n";
+            std::cout << (xmx_nmse < 1e-3 ? "  XMX PASSED\n" : "  XMX FAILED (NMSE too high)\n");
+        }
+#endif
+        std::cout << "\n";
         
         sycl::free(d_A, q);
         sycl::free(d_B, q);
@@ -382,7 +419,21 @@ public:
         }, warmup, iters);
         double tiled_gflops = flops / (tiled_ms * 1e6);
         std::cout << "  Tiled:   " << tiled_ms << " ms (" << tiled_gflops << " GFLOPS)\n";
-        std::cout << "  Speedup: " << simple_ms / tiled_ms << "x\n";
+        std::cout << "  Speedup vs Simple: " << simple_ms / tiled_ms << "x\n";
+        
+#ifdef SYCL_EXT_ONEAPI_MATRIX
+        // XMX GEMM (BF16 intermediate, F32 accumulator)
+        if (xmx_gemm_available(&q)) {
+            double xmx_ms = benchmark_kernel("XMX", [&]() {
+                launch_gemm_xmx<true>(&q, d_A, d_B, d_C, M, N, K, 1.0f, 0.0f, K, K, N);
+            }, warmup, iters);
+            double xmx_gflops = flops / (xmx_ms * 1e6);
+            std::cout << "  XMX:     " << xmx_ms << " ms (" << xmx_gflops << " GFLOPS)\n";
+            std::cout << "  XMX vs Tiled: " << tiled_ms / xmx_ms << "x\n";
+        } else {
+            std::cout << "  XMX:     (not available on this device)\n";
+        }
+#endif
         
 #ifdef GGML_SYCL_USE_INTEL_ONEMKL
         // oneMKL GEMM for comparison
