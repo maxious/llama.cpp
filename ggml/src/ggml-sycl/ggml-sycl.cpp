@@ -4329,7 +4329,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 }
 
 #ifdef GGML_SYCL_GRAPH
-static bool check_graph_compatibility(ggml_cgraph * cgraph) {
+static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
     if (ggml_sycl_info().device_count > 1) {
         // A sycl_ex::command_graph object can only be created for a single device
         GGML_LOG_INFO("%s: disabling SYCL graphs due to multiple devices\n", __func__);
@@ -4337,7 +4337,8 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
     }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        const ggml_op node_op = cgraph->nodes[i]->op;
+        ggml_tensor * node = cgraph->nodes[i];
+        const ggml_op node_op = node->op;
         switch (node_op) {
             default:
                 break;
@@ -4354,12 +4355,56 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
                               ggml_op_name(node_op));
                 return false;
             case GGML_OP_MUL_MAT:
-                // oneMKL GEMM operations internally create events and call wait() which cannot
-                // be used during SYCL graph recording. This is fundamental to oneMKL, not just
-                // about async memory allocation.
-                GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
-                              ggml_op_name(node_op));
-                return false;
+                {
+                    ggml_tensor * src0 = node->src[0];
+                    ggml_tensor * src1 = node->src[1];
+                    ggml_tensor * dst  = node;
+
+                    // Optional debugging threshold
+                    static int max_ne = get_sycl_env("GGML_SYCL_GRAPH_MUL_MAT_MAX_NE", -1);
+                    if (max_ne != -1 && ggml_nelements(dst) > max_ne) {
+                        GGML_LOG_INFO("%s: disabling SYCL graphs due to MUL_MAT size %ld > %d\n", __func__, (long)ggml_nelements(dst), max_ne);
+                        return false;
+                    }
+
+                    bool use_dequantize_mul_mat_vec = can_use_dequantize_mul_mat_vec(src0, src1, dst);
+                    bool use_mul_mat_vec_q = can_use_mul_mat_vec_q(src0, src1, dst);
+                    bool use_mul_mat_q = ggml_sycl_supports_mmq(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+
+                    use_mul_mat_q = use_mul_mat_q && (src0->type != GGML_TYPE_IQ2_XXS);
+#ifdef SYCL_USE_XMX
+                    use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
+#endif
+
+                    if (!g_ggml_sycl_prioritize_dmmv && ((should_reorder_tensor(ctx, dst) && ggml_sycl_supports_reorder_mmvq(src0->type)))) {
+                        GGML_LOG_INFO("%s: disabling SYCL graphs to perform tensor reordering (src0 type=%s)\n", 
+                                __func__, ggml_type_name(src0->type));
+                        return false;
+                    }
+
+                    const bool split = src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer);
+
+                    if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1 && src0->ne[3] == 1 && src1->ne[3] == 1) {
+                         break;
+                    }
+                    if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && src1->ne[1] == 1 && src1->ne[3] == 1) {
+                        break;
+                    }
+                    if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1) {
+                        break;
+                    }
+
+                    if (use_dequantize_mul_mat_vec || use_mul_mat_vec_q || use_mul_mat_q) {
+                        break;
+                    }
+
+                    // oneMKL GEMM operations internally create events and call wait() which cannot
+                    // be used during SYCL graph recording. This is fundamental to oneMKL, not just
+                    // about async memory allocation.
+                    GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s (oneMKL fallback)\n", __func__,
+                                  ggml_op_name(node_op));
+                    return false;
+                }
         }
     }
     return true;
@@ -4370,8 +4415,12 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
 
 #ifdef GGML_SYCL_GRAPH
-    bool use_sycl_graph = !g_ggml_sycl_disable_graph && check_graph_compatibility(cgraph);
+    bool use_sycl_graph = !g_ggml_sycl_disable_graph && check_graph_compatibility(*sycl_ctx, cgraph);
     if (use_sycl_graph) {
+        // Ensure the queue is idle before recording to avoid "depend on events from outside" error.
+        // This is a workaround for SYCL graph implicit dependencies on in-order queues.
+        sycl_ctx->stream()->wait();
+
         const bool graph_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_limited_graph);
         if (!graph_support) {
             GGML_SYCL_DEBUG("[SYCL-GRAPH] can not use graphs on device:%d\n", sycl_ctx->device);
