@@ -269,6 +269,13 @@ inline void launch_gemm_simple(
     });
 }
 
+// Helper to convert float array to half array
+inline void float_to_half(const std::vector<float>& src, sycl::half* dst) {
+    for (size_t i = 0; i < src.size(); ++i) {
+        dst[i] = sycl::half(src[i]);
+    }
+}
+
 class GemmBenchmark {
 public:
     sycl::queue q;
@@ -424,12 +431,33 @@ public:
 #ifdef SYCL_EXT_ONEAPI_MATRIX
         // XMX GEMM (BF16 intermediate, F32 accumulator)
         if (xmx_gemm_available(&q)) {
-            double xmx_ms = benchmark_kernel("XMX", [&]() {
+            double xmx_ms = benchmark_kernel("XMX-BF16", [&]() {
                 launch_gemm_xmx<true>(&q, d_A, d_B, d_C, M, N, K, 1.0f, 0.0f, K, K, N);
             }, warmup, iters);
             double xmx_gflops = flops / (xmx_ms * 1e6);
-            std::cout << "  XMX:     " << xmx_ms << " ms (" << xmx_gflops << " GFLOPS)\n";
-            std::cout << "  XMX vs Tiled: " << tiled_ms / xmx_ms << "x\n";
+            std::cout << "  XMX-BF16: " << xmx_ms << " ms (" << xmx_gflops << " GFLOPS)\n";
+            std::cout << "  XMX-BF16 vs Tiled: " << tiled_ms / xmx_ms << "x\n";
+            
+            // F16 XMX GEMM - allocate F16 inputs
+            sycl::half *d_A_f16 = sycl::malloc_device<sycl::half>(M * K, q);
+            sycl::half *d_B_f16 = sycl::malloc_device<sycl::half>(N * K, q);
+            
+            // Convert F32 to F16 on host and copy
+            std::vector<sycl::half> h_A_f16(M * K), h_B_f16(N * K);
+            float_to_half(h_A, h_A_f16.data());
+            float_to_half(h_B, h_B_f16.data());
+            q.memcpy(d_A_f16, h_A_f16.data(), M * K * sizeof(sycl::half)).wait();
+            q.memcpy(d_B_f16, h_B_f16.data(), N * K * sizeof(sycl::half)).wait();
+            
+            double xmx_f16_ms = benchmark_kernel("XMX-F16", [&]() {
+                launch_gemm_xmx_f16<true>(&q, d_A_f16, d_B_f16, d_C, M, N, K, 1.0f, 0.0f, K, K, N);
+            }, warmup, iters);
+            double xmx_f16_gflops = flops / (xmx_f16_ms * 1e6);
+            std::cout << "  XMX-F16:  " << xmx_f16_ms << " ms (" << xmx_f16_gflops << " GFLOPS)\n";
+            std::cout << "  XMX-F16 vs XMX-BF16: " << xmx_ms / xmx_f16_ms << "x\n";
+            
+            sycl::free(d_A_f16, q);
+            sycl::free(d_B_f16, q);
         } else {
             std::cout << "  XMX:     (not available on this device)\n";
         }
