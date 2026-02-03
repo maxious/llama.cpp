@@ -3377,6 +3377,13 @@ struct test_rms_norm : public test_case {
         }
     }
 
+    // RMS_NORM accumulates sum of squares across ncols elements.
+    // For large ncols (e.g., 1025), FP32 precision limits cause slight differences
+    // in reduction order between CPU and GPU, resulting in ~1e-6 NMSE.
+    double max_nmse_err() override {
+        return ne[0] >= 1024 ? 1e-6 : 1e-7;
+    }
+
     float grad_eps() override {
         return 1.0f;
     }

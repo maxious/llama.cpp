@@ -3497,30 +3497,6 @@ static void k_compute_batched_ptrs(const sycl::half * src0_as_f16, const sycl::h
     ptrs_dst[0 * ne23 + i12 + i13 * ne12] = dst_bytes + i12 * nbd2 + i13 * nbd3;
 }
 
-static void k_compute_batched_ptrs_f32(const float * src0_f32, const float * src1_f32, float * dst,
-                                       const float ** ptrs_src0, const float ** ptrs_src1, float ** ptrs_dst,
-                                       int64_t ne12, int64_t ne13, int64_t ne23,
-                                       size_t nb02, size_t nb03, size_t nb12, size_t nb13, size_t nbd2, size_t nbd3,
-                                       int64_t r2, int64_t r3, const sycl::nd_item<3> & item_ct1) {
-    const int64_t i13 = item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
-    const int64_t i12 = item_ct1.get_group(1) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
-
-    if (i13 >= ne13 || i12 >= ne12) {
-        return;
-    }
-
-    const int64_t i03 = i13 / r3;
-    const int64_t i02 = i12 / r2;
-
-    const uint8_t * src0_bytes = reinterpret_cast<const uint8_t *>(src0_f32);
-    const uint8_t * src1_bytes = reinterpret_cast<const uint8_t *>(src1_f32);
-    uint8_t *       dst_bytes  = reinterpret_cast<uint8_t *>(dst);
-
-    ptrs_src0[i12 + i13 * ne12] = reinterpret_cast<const float *>(src0_bytes + i02 * nb02 + i03 * nb03);
-    ptrs_src1[i12 + i13 * ne12] = reinterpret_cast<const float *>(src1_bytes + i12 * nb12 + i13 * nb13);
-    ptrs_dst[i12 + i13 * ne12]  = reinterpret_cast<float *>(dst_bytes + i12 * nbd2 + i13 * nbd3);
-}
-
 static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
                                            const ggml_tensor * src1, ggml_tensor * dst) try {
     GGML_ASSERT(!ggml_is_transposed(src0));
@@ -3734,6 +3710,8 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
 
 static void reorder_qw_q4_0(uint8_t * data_device, const int ncols, const int nrows, size_t size, size_t offset,
                             ggml_backend_sycl_context & ctx) {
+    (void)ncols;
+    (void)nrows;
     auto stream = ctx.stream();
     ggml_sycl_pool_alloc<uint8_t> tmp_alloc(ctx.pool(), size);
     uint8_t * tmp_buf = tmp_alloc.get();
