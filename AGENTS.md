@@ -193,3 +193,68 @@ export GGML_SYCL_FLASH_ATTN_FORCE_XMX=1
 2. **Enable Direct Loading** (`GGML_SYCL_FLASH_ATTN_DIRECT=1`) to reduce memory bandwidth usage.
 3. The system now automatically handles block size optimization for GLM-4.7 to prevent resource exhaustion.
 
+## Graph-Compatible GEMM
+
+### Background
+
+oneMKL GEMM operations (`oneapi::mkl::blas::gemm`) are incompatible with SYCL command graphs because they create internal SYCL events that cannot be captured during graph recording. This causes exceptions when trying to use SYCL graphs for MUL_MAT operations.
+
+### Solution: Tiled Custom GEMM
+
+A graph-compatible tiled GEMM is implemented in `ggml/src/ggml-sycl/gemm_tiled.hpp`:
+- Uses shared memory tiling (64x64 output tiles, 32-element K tiles)
+- Each thread computes 4x4 output elements
+- 16x16 workgroup (256 threads)
+- No oneMKL dependencies - fully graph-recordable
+
+### Benchmark Results (Arc Pro B60)
+
+| Size | Simple (naive) | Tiled | oneMKL | Tiled Speedup |
+|------|----------------|-------|--------|---------------|
+| 512³ | 416 GFLOPS | 2720 GFLOPS | 9064 GFLOPS | 6.5x vs naive |
+| 1024³ | 445 GFLOPS | 2910 GFLOPS | 11365 GFLOPS | 6.5x vs naive |
+| 2048³ | 458 GFLOPS | 3480 GFLOPS | 11986 GFLOPS | 7.6x vs naive |
+
+**Performance vs oneMKL**: ~30% of oneMKL performance. This is a tradeoff for graph compatibility.
+
+### Why oneMKL is 3x Faster
+
+oneMKL achieves ~12000 GFLOPS vs our ~3500 GFLOPS because it uses:
+
+1. **XMX Hardware Matrix Units** - Intel XMX does 8x16x16 matrix ops per instruction using `joint_matrix`
+2. **Vectorized loads** - `float4`/`float8` instead of scalar loads (4-8x memory bandwidth)
+3. **Double buffering** - Prefetch next tile while computing current one
+4. **Optimal shared memory layout** - Avoids bank conflicts with padding
+5. **bf16 intermediate precision** - 2x smaller data movement
+
+### Future Optimization: XMX GEMM
+
+An XMX-accelerated GEMM skeleton is in `ggml/src/ggml-sycl/gemm_xmx.hpp`. To achieve oneMKL-level performance:
+
+1. Use `joint_matrix<sub_group, bfloat16, use::a/b, TM, TK/TN>` for inputs
+2. Use `joint_matrix<sub_group, float, use::accumulator, TM, TN>` for output
+3. Convert float->bf16 during shared memory loads
+4. Use `sycl::address_space_cast` for `joint_matrix_load/store`
+5. Requires `SYCL_EXT_COOPERATIVE_MATRICES` define (set in CMakeLists.txt)
+
+### Usage
+
+```cpp
+#include "gemm_tiled.hpp"
+
+// Single GEMM: C = alpha * A * B^T + beta * C
+launch_gemm_tiled<true>(stream, A, B, C, M, N, K, alpha, beta, lda, ldb, ldc);
+
+// Batched GEMM for flash attention
+launch_gemm_tiled_batched<true>(stream, A, B, C, M, N, K, alpha, beta, batch, lda, ldb, ldc, stride_A, stride_B, stride_C);
+```
+
+### Testing the GEMM benchmark
+
+```bash
+source /opt/intel/oneapi/setvars.sh intel64
+icpx -fsycl -O3 -DGGML_SYCL_USE_INTEL_ONEMKL tests/test-gemm-sycl.cpp -o test-gemm-sycl \
+  -lmkl_sycl -lmkl_intel_lp64 -lmkl_core -lmkl_sequential
+./test-gemm-sycl
+```
+
