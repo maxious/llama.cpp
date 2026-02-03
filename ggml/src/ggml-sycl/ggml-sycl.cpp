@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <regex>
+#include <sys/time.h>
 
 #include <sycl/sycl.hpp>
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
@@ -2975,7 +2976,6 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
     float *            dst_ddf  = static_cast<float *>(dst->data);
 
     const sycl::half * src1_f16       = static_cast<const sycl::half *>(src1->data);
-    const size_t       type_size_src0 = ggml_type_size(src0->type);
     const size_t       type_size_src1 = ggml_type_size(src1->type);
 
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
@@ -2992,6 +2992,7 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
         scope_op_debug_print    scope_dbg_print(__func__, "/to_fp16_nc_sycl", dst, /*num_src=*/2,
                                                 " : converting src1 to fp16");
 
+#if GGML_SYCL_DNNL
         // iterate tensor dims and find the slowest moving dim and stride
         int last_dim=0;
         int last_str=0;
@@ -3011,7 +3012,6 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
             }
 
         }
-#if GGML_SYCL_DNNL
         // oneDNN handles strided data and does not need overhead of get_to_fp16_nc_sycl
         const int64_t ne_src1 = src1->nb[last_str] * src1->ne[last_dim] / type_size_src1;
         src1_f16_alloc.alloc(ne_src1);
@@ -4336,6 +4336,13 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
         return false;
     }
 
+    // Heuristic: Disable graphs for very large compute graphs to avoid driver hang/compile explosion.
+    // The exact threshold may need tuning per device/driver.
+    if (cgraph->n_nodes > 500) {
+        GGML_LOG_INFO("%s: disabling SYCL graphs due to large graph size (%d nodes)\n", __func__, cgraph->n_nodes);
+        return false;
+    }
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         const ggml_op node_op = node->op;
@@ -4351,7 +4358,14 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
                 GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
                               ggml_op_name(node_op));
                 return false;
-            case GGML_OP_MUL_MAT:
+        case GGML_OP_SET_ROWS:
+            // SET_ROWS uses USM memory and has implicit data dependencies that are not
+            // automatically tracked by SYCL graphs, which can lead to out-of-order execution
+            // and race conditions when combined with other kernels (e.g., ROPE + SET_ROWS).
+            // Disable graphs for any graph containing SET_ROWS to ensure correctness.
+            GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__, ggml_op_name(node_op));
+            return false;
+        case GGML_OP_MUL_MAT:
                 {
                     ggml_tensor * src0 = node->src[0];
                     ggml_tensor * src1 = node->src[1];
@@ -4374,7 +4388,7 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
 #endif
 
                     if (!g_ggml_sycl_prioritize_dmmv && ((should_reorder_tensor(ctx, dst) && ggml_sycl_supports_reorder_mmvq(src0->type)))) {
-                        GGML_LOG_INFO("%s: disabling SYCL graphs to perform tensor reordering (src0 type=%s)\n", 
+                        GGML_LOG_INFO("%s: disabling SYCL graphs to perform tensor reordering (src0 type=%s)\n",
                                 __func__, ggml_type_name(src0->type));
                         return false;
                     }
@@ -4411,12 +4425,19 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
 
-#ifdef GGML_SYCL_GRAPH
+ #ifdef GGML_SYCL_GRAPH
     bool use_sycl_graph = !g_ggml_sycl_disable_graph && check_graph_compatibility(*sycl_ctx, cgraph);
     if (use_sycl_graph) {
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] Starting graph compute (n_nodes=%d)\n", cgraph->n_nodes);
+        struct timeval tv_start, tv_end;
+        gettimeofday(&tv_start, NULL);
+
         // Ensure the queue is idle before recording to avoid "depend on events from outside" error.
         // This is a workaround for SYCL graph implicit dependencies on in-order queues.
         sycl_ctx->stream()->wait();
+        gettimeofday(&tv_end, NULL);
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] Queue wait took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+        gettimeofday(&tv_start, NULL);
 
         const bool graph_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_limited_graph);
         if (!graph_support) {
@@ -4424,14 +4445,35 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
             return GGML_STATUS_SUCCESS;
         }
+        gettimeofday(&tv_end, NULL);
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] Graph support check took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+        gettimeofday(&tv_start, NULL);
 
         sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()), {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
+        gettimeofday(&tv_end, NULL);
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] Graph construction took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+        gettimeofday(&tv_start, NULL);
 
         model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
+        gettimeofday(&tv_end, NULL);
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] begin_recording took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+        gettimeofday(&tv_start, NULL);
+
         ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+        gettimeofday(&tv_end, NULL);
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] compute_impl took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+        gettimeofday(&tv_start, NULL);
+
         model_sycl_graph.end_recording();
+        gettimeofday(&tv_end, NULL);
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] end_recording took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+        gettimeofday(&tv_start, NULL);
 
         const bool graph_update_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_graph);
+        gettimeofday(&tv_end, NULL);
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] graph_update_support check took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+        gettimeofday(&tv_start, NULL);
+
         if (!sycl_ctx->exec_graph || !graph_update_support) {
             auto exec_graph = graph_update_support ? model_sycl_graph.finalize(sycl_ex::property::graph::updatable{}) :
                                                      model_sycl_graph.finalize();
@@ -4448,15 +4490,22 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                     sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec_graph);
             }
         }
+        gettimeofday(&tv_end, NULL);
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] finalize/update took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+        gettimeofday(&tv_start, NULL);
 
         sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
+        gettimeofday(&tv_end, NULL);
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] ext_oneapi_graph took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+        gettimeofday(&tv_start, NULL);
+
     } else
 #endif
     {
         ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
     }
     return GGML_STATUS_SUCCESS;
-}
+ }
 
 static void ggml_backend_sycl_event_record(ggml_backend_t backend, ggml_backend_event_t event)
 try
