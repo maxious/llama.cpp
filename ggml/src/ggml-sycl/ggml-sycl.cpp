@@ -702,12 +702,6 @@ static void dev2dev_memcpy_2d(ggml_backend_sycl_buffer_context * dst_ctx,
                               void *ptr_dst, size_t dst_pitch,
                               const void *ptr_src, size_t src_pitch,
                               size_t width, size_t height) {
-    // Optimized staging buffer pool to avoid malloc/free per transfer
-    static thread_local std::vector<char> staging_buffer;
-    static thread_local size_t staging_capacity = 0;
-
-    (void)dst_ctx;
-
     int dst_id = ggml_sycl_get_device_id(q_dst.get_device());
     int src_id = ggml_sycl_get_device_id(q_src.get_device());
     size_t total_bytes = width * height;
@@ -722,9 +716,15 @@ static void dev2dev_memcpy_2d(ggml_backend_sycl_buffer_context * dst_ctx,
     if (q_dst.get_device() == q_src.get_device()) {
         GGML_SYCL_DEBUG("[SYCL]   2D same-device copy\n");
         g_copy_stats.wait_count++;
-        dpct::async_dpct_memcpy(ptr_dst, dst_pitch, ptr_src, src_pitch,
+        // Use async copy, wait only if not recording
+        if (g_ggml_sycl_graph_recording) {
+            dpct::async_dpct_memcpy(ptr_dst, dst_pitch, ptr_src, src_pitch,
                                 width, height, dpct::device_to_device, q_dst);
-        // Don't wait here - let final sync handle it
+        } else {
+            dpct::async_dpct_memcpy(ptr_dst, dst_pitch, ptr_src, src_pitch,
+                                width, height, dpct::device_to_device, q_dst);
+             q_dst.wait();
+        }
         g_copy_stats.active_copies--;
         return;
     }
@@ -736,6 +736,7 @@ static void dev2dev_memcpy_2d(ggml_backend_sycl_buffer_context * dst_ctx,
         g_copy_stats.wait_count++;
         dpct::async_dpct_memcpy(ptr_dst, dst_pitch, ptr_src, src_pitch,
                                 width, height, dpct::device_to_device, q_dst);
+        if (!g_ggml_sycl_graph_recording) q_dst.wait();
         g_copy_stats.active_copies--;
         return;
     }
@@ -746,54 +747,37 @@ static void dev2dev_memcpy_2d(ggml_backend_sycl_buffer_context * dst_ctx,
         g_copy_stats.wait_count++;
         dpct::async_dpct_memcpy(ptr_dst, dst_pitch, ptr_src, src_pitch,
                                 width, height, dpct::device_to_device, q_dst);
+        if (!g_ggml_sycl_graph_recording) q_dst.wait();
         g_copy_stats.active_copies--;
         return;
     }
 
-    // For cross-device copy, use host-mediated copy with reusable staging buffer
-    GGML_SYCL_DEBUG("[SYCL]   2D host-mediated copy (optimized)\n");
+    // For cross-device copy, use host-mediated copy with reusable staging buffer from context
+    GGML_SYCL_DEBUG("[SYCL]   2D host-mediated copy (optimized pool)\n");
     g_copy_stats.d2d_host_staged_bytes += total_bytes;
 
-    // Align to 64 bytes for potential SIMD optimization and SYCL requirements
-    constexpr size_t ALIGNMENT = 64;
-    size_t needed_size = (total_bytes + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-    if (staging_capacity < needed_size) {
-        staging_buffer.resize(needed_size);
-        staging_capacity = needed_size;
-    }
+    dst_ctx->staging_pool.ensure_size(total_bytes);
+    char *host_buf = (char*)dst_ctx->staging_pool.buffer;
 
-    char *host_buf = staging_buffer.data();
-    g_copy_stats.wait_count++;
-    if (!g_ggml_sycl_graph_recording) {
-        q_src.wait();
-    }
-
-    // Copy from source to host (row by row due to stride)
     const char *src_ptr = (const char *)ptr_src;
-    char *host_ptr = host_buf;
-    for (size_t row = 0; row < height; ++row) {
-        q_src.memcpy(host_ptr, src_ptr, width);
-        src_ptr += src_pitch;
-        host_ptr += width;
-    }
-    if (!g_ggml_sycl_graph_recording) {
-        q_src.wait();
-    }
-
-    // Copy from host to destination (row by row due to stride)
     char *dst_ptr = (char *)ptr_dst;
-    host_ptr = host_buf;
+    char *host_ptr = host_buf;
+
+    // Chained copy loop
     for (size_t row = 0; row < height; ++row) {
-        q_dst.memcpy(dst_ptr, host_ptr, width);
+        auto e_src = q_src.memcpy(host_ptr, src_ptr, width);
+        q_dst.memcpy(dst_ptr, host_ptr, width, {e_src});
+        
+        src_ptr += src_pitch;
         dst_ptr += dst_pitch;
         host_ptr += width;
     }
-    // Must wait before reusing staging buffer
+    
+    // No explicit wait needed for graph
     if (!g_ggml_sycl_graph_recording) {
         q_dst.wait();
     }
 
-    // Staging buffer reused (not freed) - pool persists across calls
     g_copy_stats.active_copies--;
 }
 
