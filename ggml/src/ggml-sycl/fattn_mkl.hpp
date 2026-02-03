@@ -1,6 +1,7 @@
 #ifdef GGML_SYCL_USE_INTEL_ONEMKL
 #include "fattn_common.hpp"
 #include "common.hpp"
+#include "gemm_tiled.hpp"
 #include <oneapi/mkl.hpp>
 #include <cmath>
 #include <cstring>
@@ -293,29 +294,29 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const int64_t kv_chunk_size = kv_end - kv_start;
         if (kv_chunk_size <= 0) continue;
 
-        // Q @ K_chunk^T
+        // Q @ K_chunk^T - use tiled GEMM for graph compatibility
         if (gqa_ratio == 1) {
-            oneapi::mkl::blas::row_major::gemm_batch(*stream,
-                oneapi::mkl::transpose::N, oneapi::mkl::transpose::T,
+            launch_gemm_tiled_batched<true>(stream,
+                Q_d_f32,
+                K_d_f32 + kv_start * DQK,
+                S_d + kv_start,
                 N, kv_chunk_size, DQK,
-                scale,
-                Q_d_f32, lda_q, stride_q,
-                K_d_f32 + kv_start * DQK, lda_k, stride_k,
-                0.0f,
-                S_d + kv_start, lda_s, stride_s,
-                n_heads);
+                scale, 0.0f,
+                n_heads,
+                lda_q, lda_k, lda_s,
+                stride_q, stride_k, stride_s);
         } else {
             for (int64_t kv_head = 0; kv_head < n_kv_heads; ++kv_head) {
                 const int64_t q_head_start = kv_head * gqa_ratio;
-                oneapi::mkl::blas::row_major::gemm_batch(*stream,
-                    oneapi::mkl::transpose::N, oneapi::mkl::transpose::T,
+                launch_gemm_tiled_batched<true>(stream,
+                    Q_d_f32 + q_head_start * stride_q,
+                    K_d_f32 + kv_head * stride_k + kv_start * DQK,
+                    S_d + q_head_start * stride_s + kv_start,
                     N, kv_chunk_size, DQK,
-                    scale,
-                    Q_d_f32 + q_head_start * stride_q, lda_q, stride_q,
-                    K_d_f32 + kv_head * stride_k + kv_start * DQK, lda_k, 0,
-                    0.0f,
-                    S_d + q_head_start * stride_s + kv_start, lda_s, stride_s,
-                    gqa_ratio);
+                    scale, 0.0f,
+                    gqa_ratio,
+                    lda_q, lda_k, lda_s,
+                    stride_q, 0, stride_s);  // B stride = 0: same K matrix for all batches
             }
         }
 
@@ -353,30 +354,30 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
             });
         });
 
-        // S @ V to partials
+        // S @ V to partials - use tiled GEMM (transpose_B = false)
         float * O_ptr = partials + split * partial_size + 2;
         if (gqa_ratio == 1) {
-            oneapi::mkl::blas::row_major::gemm_batch(*stream,
-                oneapi::mkl::transpose::N, oneapi::mkl::transpose::N,
+            launch_gemm_tiled_batched<false>(stream,
+                S_d + kv_start,
+                V_d_f32 + kv_start * DV,
+                O_ptr,
                 N, DV, kv_chunk_size,
-                1.0f,
-                S_d + kv_start, lda_s, stride_s,
-                V_d_f32 + kv_start * DV, lda_v, stride_v,
-                0.0f,
-                O_ptr, ldc_o, stride_o,
-                n_heads);
+                1.0f, 0.0f,
+                n_heads,
+                lda_s, lda_v, ldc_o,
+                stride_s, stride_v, stride_o);
         } else {
             for (int64_t kv_head = 0; kv_head < n_kv_heads; ++kv_head) {
                 const int64_t q_head_start = kv_head * gqa_ratio;
-                oneapi::mkl::blas::row_major::gemm_batch(*stream,
-                    oneapi::mkl::transpose::N, oneapi::mkl::transpose::N,
+                launch_gemm_tiled_batched<false>(stream,
+                    S_d + q_head_start * stride_s + kv_start,
+                    V_d_f32 + kv_head * stride_v + kv_start * DV,
+                    O_ptr + q_head_start * stride_o,
                     N, DV, kv_chunk_size,
-                    1.0f,
-                    S_d + q_head_start * stride_s + kv_start, lda_s, stride_s,
-                    V_d_f32 + kv_head * stride_v + kv_start * DV, lda_v, 0,
-                    0.0f,
-                    O_ptr + q_head_start * stride_o, ldc_o, stride_o,
-                    gqa_ratio);
+                    1.0f, 0.0f,
+                    gqa_ratio,
+                    lda_s, lda_v, ldc_o,
+                    stride_s, 0, stride_o);  // B stride = 0: same V matrix for all batches
             }
         }
     }
