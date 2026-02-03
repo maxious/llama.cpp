@@ -29,9 +29,6 @@ static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __r
     static_assert(blocks_per_subgroup > 0);
     static_assert(block_elements_per_subgroup > 0);
 
-    // Q8_1 blocks in standard layout (ds followed by qs within each block)
-    const block_q8_1 * y = (const block_q8_1 *) vy;
-
     float partial_sum = 0.0f;
     for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
         const int ibx = row * blocks_per_row + i;  // x block index
@@ -40,13 +37,15 @@ static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __r
         const auto         d_offset       = block_type::get_d_offset(nrows, ncols, ibx);
         // Y block index that aligns with ibx
         const int iby = i * block_type::block_to_q8_1_ratio();
+        const int8_t* q8_1_quant_ptr = (const int8_t*)vy + iby * QK8_1;
+        const sycl::half2* q8_1_ds_ptr = (const sycl::half2*)((const char*)vy + ncols + iby * sizeof(sycl::half2));
 
 #pragma unroll
         for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
             // x block quant index when casting the quants to int
             const int iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
 
-            partial_sum += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, &y[iby], iqs);
+            partial_sum += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
         }
     }
 
@@ -556,7 +555,6 @@ static void reorder_mul_mat_vec_q4_0_q8_1_sycl(const void * vx, const void * vy,
 
 static void mul_mat_vec_q4_0_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols, const int nrows,
                                        dpct::queue_ptr stream) {
-    GGML_SYCL_DEBUG("[SYCL] Kernel launch: mul_mat_vec_q4_0_q8_1 (ncols=%d, nrows=%d)\n", ncols, nrows);
     GGML_ASSERT(ncols % QK4_0 == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);

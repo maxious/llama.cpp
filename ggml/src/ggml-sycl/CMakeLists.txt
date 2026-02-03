@@ -27,15 +27,6 @@ file(GLOB   GGML_HEADERS_SYCL "*.hpp")
 file(GLOB   GGML_SOURCES_SYCL "*.cpp")
 target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
 
-# Include flash-attn sources (SYCL optimized flash attention implementation)
-file(GLOB GGML_HEADERS_SYCL_FLASH "fattn*.h" "fattn*.hpp")
-file(GLOB GGML_SOURCES_SYCL_FLASH "fattn*.cpp" "fattn*.c")
-target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL_FLASH} ${GGML_SOURCES_SYCL_FLASH})
-
-# Also include kernel headers under flash-attn/kernels
-file(GLOB GGML_HEADERS_SYCL_FLASH_KERNELS "fattn_kernel*.h" "fattn_kernel*.hpp")
-target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL_FLASH_KERNELS})
-
 if (WIN32)
     # To generate a Visual Studio solution, using Intel C++ Compiler for ggml-sycl is mandatory
     if( ${CMAKE_GENERATOR} MATCHES "Visual Studio" AND NOT (${CMAKE_GENERATOR_TOOLSET} MATCHES "Intel C"))
@@ -135,42 +126,15 @@ target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_DNNL=${GGML_SYCL_DNNL})
 
 if (GGML_SYCL_F16)
     add_compile_definitions(GGML_SYCL_F16)
-else()
-    message(STATUS "GGML_SYCL_F16: OFF (using FP32 for dequantize/compute)")
 endif()
-
-if (GGML_SYCL_BF16)
-    add_compile_definitions(GGML_SYCL_BF16)
-endif()
-
-option(GGML_SYCL_XE2 "Optimize for Intel Xe2 (Battlemage) GPU" OFF)
 
 if (GGML_SYCL_TARGET STREQUAL "INTEL")
     add_compile_definitions(GGML_SYCL_WARP_SIZE=16)
-    add_compile_definitions(SYCL_EXT_COOPERATIVE_MATRICES)
-    add_compile_definitions(SYCL_USE_XMX)
     target_link_options(ggml-sycl PRIVATE  -Xs   -ze-intel-greater-than-4GB-buffer-required)
 
     # Link against Intel oneMKL
     if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         set(SYCL_COMPILER ON)
-    if (GGML_SYCL_XE2)
-        message(STATUS "GGML_SYCL_XE2: ON (Optimizing for Battlemage: Warp 32, XMX ON)")
-        add_compile_definitions(GGML_SYCL_WARP_SIZE=32)
-        set(GGML_SYCL_XMX ON)
-    else()
-        add_compile_definitions(GGML_SYCL_WARP_SIZE=16)
-    endif()
-
-    if (GGML_SYCL_XMX)
-        message(STATUS "GGML_SYCL_XMX: ON (cooperative matrix flash attention enabled)")
-        add_compile_definitions(SYCL_EXT_COOPERATIVE_MATRICES)
-        add_compile_definitions(SYCL_USE_XMX)
-    else()
-        message(STATUS "GGML_SYCL_XMX: OFF (cooperative matrix flash attention disabled)")
-        # XMX (cooperative matrix) flash attention disabled by default - causes memory faults on Arc B60
-        # The XMX kernel has issues with subgroup size mismatch (B60 supports 16 and 32)
-        # Use oneMKL BLAS path instead which is stable and produces correct results
     endif()
     find_package(MKL REQUIRED)
     target_link_libraries(ggml-sycl PRIVATE MKL::MKL_SYCL::BLAS)
@@ -185,12 +149,7 @@ if (GGML_SYCL_GRAPH)
 endif()
 
 if (GGML_SYCL_DEVICE_ARCH)
-    if (GGML_SYCL_TARGET STREQUAL "INTEL")
-        message(STATUS "GGML_SYCL_DEVICE_ARCH: ${GGML_SYCL_DEVICE_ARCH} (Intel AOT compilation)")
-        target_compile_options(ggml-sycl PRIVATE "-fsycl-targets=${GGML_SYCL_DEVICE_ARCH}")
-        target_link_options(ggml-sycl PRIVATE "-fsycl-targets=${GGML_SYCL_DEVICE_ARCH}")
-    else()
-        target_compile_options(ggml-sycl PRIVATE -Xsycl-target-backend --offload-arch=${GGML_SYCL_DEVICE_ARCH})
-        target_link_options(ggml-sycl PRIVATE -Xsycl-target-backend --offload-arch=${GGML_SYCL_DEVICE_ARCH})
-    endif()
+    target_compile_options(ggml-sycl PRIVATE -Xsycl-target-backend --offload-arch=${GGML_SYCL_DEVICE_ARCH})
+    target_link_options(ggml-sycl PRIVATE -Xsycl-target-backend --offload-arch=${GGML_SYCL_DEVICE_ARCH})
 endif()
+

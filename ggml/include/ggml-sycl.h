@@ -25,15 +25,12 @@ GGML_BACKEND_API bool ggml_backend_is_sycl(ggml_backend_t backend);
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device);
 
 // split tensor buffer that splits matrices by rows across multiple devices
-// main_device: the primary device index (for ggml_backend_split_buffer_type_t compatibility)
-// tensor_split: per-device tensor split proportions (can be nullptr for default even split)
-GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(int main_device, const float * tensor_split);
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(const float * tensor_split);
 
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type(void);
 
 GGML_BACKEND_API void ggml_backend_sycl_print_sycl_devices(void);
-GGML_BACKEND_API void ggml_sycl_print_copy_stats(void);
 GGML_BACKEND_API void ggml_backend_sycl_get_gpu_list(int *id_list, int max_len);
 GGML_BACKEND_API void ggml_backend_sycl_get_device_description(int device,
                                                        char *description,

@@ -18,13 +18,6 @@
 #include <oneapi/mkl.hpp>
 
 #include <map>
-// Allow to use the same namespace for Intel oneMKL and oneMath
-namespace oneapi {
-    namespace math = mkl;
-}
-#else
-#include <syclcompat/math.hpp>
-#endif
 
 #include "ggml.h"
 
@@ -1825,32 +1818,10 @@ namespace dpct
         return id;
     }
 
-    // Use standard SYCL 2020 permute_group_by_xor for subgroup shuffle operations.
-    // Default logical_sub_group_size to 0 which means "use physical subgroup size".
-    // This works correctly for all kernels regardless of their reqd_sub_group_size attribute.
-    //
-    // Previously defaulted to 32 (CUDA warp size) which broke Intel GPUs with 16-wide subgroups.
-    // Using physical size as default ensures correct behavior without requiring callers to specify.
     template <typename T>
     T permute_sub_group_by_xor(sycl::sub_group g, T x, unsigned int mask,
-                               unsigned int logical_sub_group_size = 0)
+                               unsigned int logical_sub_group_size = 32)
     {
-        const unsigned int physical_size = g.get_local_linear_range();
-        
-        // If logical_sub_group_size is 0 or matches physical size, use optimized path
-        // This avoids using sycl::select_from_group which requires GroupNonUniformArithmetic
-        // capability that can cause IGC compiler crashes on some Intel GPUs (Arc B60/DG2).
-        if ((logical_sub_group_size == 0 || logical_sub_group_size == physical_size) 
-            && mask < physical_size) {
-            return sycl::permute_group_by_xor(g, x, mask);
-        }
-        
-        // Use physical size if logical size not specified
-        if (logical_sub_group_size == 0) {
-            logical_sub_group_size = physical_size;
-        }
-        
-        // Fallback for logical sub-groups different from physical sub-group, or large masks
         unsigned int id = g.get_local_linear_id();
         unsigned int start_index =
             id / logical_sub_group_size * logical_sub_group_size;

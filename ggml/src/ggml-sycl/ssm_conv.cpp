@@ -67,20 +67,9 @@ void ggml_sycl_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
 
-    // Support F16, BF16, and F32
-    const bool is_f16 = (src0->type == GGML_TYPE_F16);
-    const bool is_bf16 = (src0->type == GGML_TYPE_BF16);
-    const bool is_f32 = (src0->type == GGML_TYPE_F32);
-
-#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
-    GGML_ASSERT(is_f32 || is_f16 || is_bf16);
-    GGML_ASSERT(src1->type == src0->type);
-    GGML_ASSERT(dst->type == src0->type);
-#else
-    GGML_ASSERT(is_f32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-#endif
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
     const int d_conv   = src1->ne[0];
     const int ncs      = src0->ne[0];
@@ -96,10 +85,10 @@ void ggml_sycl_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->ne[1] == n_t);
     GGML_ASSERT(dst->ne[2] == n_s);
 
-    GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
-    GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
 
-    GGML_ASSERT(src0->nb[1] == (size_t)src0->ne[0] * (int)ggml_type_size(src0->type));
+    GGML_ASSERT(src0->nb[1] == src0->ne[0] * sizeof(float));
 
     const int src_stride_inner = ncs;
     const int src_stride_seq   = ncs * d_inner;
@@ -109,51 +98,9 @@ void ggml_sycl_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     try {
         queue *q = ctx.stream();
 
-        // Allocate temporary F32 buffers for F16/BF16 input/output
-        const size_t nbytes0 = ggml_nbytes(src0);
-        const size_t nbytes1 = ggml_nbytes(src1);
-        const size_t nbytes_dst = ggml_nbytes(dst);
-        float *src_data = nullptr;
-        float *weights  = nullptr;
-        float *dst_data = nullptr;
-        bool need_temp_buffers = false;
-
-        if (is_f16 || is_bf16) {
-            src_data = (float *)sycl::malloc_device(nbytes0, *q);
-            weights  = (float *)sycl::malloc_device(nbytes1, *q);
-            dst_data = (float *)sycl::malloc_device(nbytes_dst, *q);
-            need_temp_buffers = true;
-
-            // Dequantize src0
-            const int64_t n_elements0 = ggml_nelements(src0);
-            q->parallel_for(sycl::range<1>(n_elements0), [=](sycl::item<1> it) {
-                const int idx = it.get_id(0);
-                if (is_f16) {
-                    const sycl::half * src = (const sycl::half *)src0->data;
-                    src_data[idx] = static_cast<float>(src[idx]);
-                } else {
-                    const bfloat16 * src = (const bfloat16 *)src0->data;
-                    src_data[idx] = bf16_to_fp32(src[idx]);
-                }
-            }).wait();
-
-            // Dequantize src1
-            const int64_t n_elements1 = ggml_nelements(src1);
-            q->parallel_for(sycl::range<1>(n_elements1), [=](sycl::item<1> it) {
-                const int idx = it.get_id(0);
-                if (is_f16) {
-                    const sycl::half * src = (const sycl::half *)src1->data;
-                    weights[idx] = static_cast<float>(src[idx]);
-                } else {
-                    const bfloat16 * src = (const bfloat16 *)src1->data;
-                    weights[idx] = bf16_to_fp32(src[idx]);
-                }
-            }).wait();
-        } else {
-            src_data = const_cast<float *>(static_cast<const float *>(src0->data));
-            weights  = const_cast<float *>(static_cast<const float *>(src1->data));
-            dst_data = static_cast<float *>(dst->data);
-        }
+        const float *src_data = static_cast<const float *>(src0->data);
+        const float *weights  = static_cast<const float *>(src1->data);
+        float *dst_data       = static_cast<float *>(dst->data);
 
         GGML_ASSERT(src_data && weights && dst_data);
 
@@ -172,22 +119,6 @@ void ggml_sycl_ssm_conv(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
             dst_stride_token,
             dst_stride_seq
         );
-
-        if (need_temp_buffers) {
-            const int64_t n_elements = ggml_nelements(dst);
-            q->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
-                const int idx = it.get_id(0);
-                float val = dst_data[idx];
-                if (is_f16) {
-                    ((sycl::half *)dst->data)[idx] = static_cast<sycl::half>(val);
-                } else {
-                    ((bfloat16 *)dst->data)[idx] = fp32_to_bf16(val);
-                }
-            }).wait();
-            sycl::free(src_data, *q);
-            sycl::free(weights, *q);
-            sycl::free(dst_data, *q);
-        }
 
     } catch (const std::exception &e) {
         std::fprintf(stderr, "[SYCL-SSM_CONV] ERROR: %s\n", e.what());

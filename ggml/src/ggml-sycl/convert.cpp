@@ -139,13 +139,13 @@ static void dequantize_row_q4_0_sycl_reorder(const void *vx, dst_t *y, const int
     dpct::has_capability_or_fail(stream->get_device(),
                                     {sycl::aspect::fp16});
 
-    int constexpr WARP_K = QK_WARP_SIZE * QK4_0;
+    int constexpr WARP_K = WARP_SIZE * QK4_0;
     const int n_warp = (k + WARP_K - 1) / WARP_K;
     GGML_ASSERT(k % 2 == 0);
     stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, n_warp) *
-        sycl::range<3>(1, 1, QK_WARP_SIZE),
-        sycl::range<3>(1, 1, QK_WARP_SIZE)),
-        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]]{
+        sycl::range<3>(1, 1, WARP_SIZE),
+        sycl::range<3>(1, 1, WARP_SIZE)),
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]]{
             dequantize_block_q4_0_reorder(vx, y, k, item_ct1);
         });
 
@@ -202,7 +202,7 @@ static void dequantize_row_q4_K_sycl_reorder(const void * vx, dst_t * y, const i
         sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(12), cgh);
 
         cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(local_size)),
-                         [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
+                         [=](sycl::nd_item<1> item_ct1) {
                              dequantize_block_q4_K_reorder(vx, y, get_pointer(scale_local_acc), item_ct1, nb);
                          });
     });
@@ -280,7 +280,7 @@ static void dequantize_row_q6_K_sycl_reorder(const void * vx, dst_t * y, const i
 
     stream->parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 64), sycl::range<3>(1, 1, 64)),
-        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] { dequantize_block_q6_K_reorder(vx, y, item_ct1, nb); });
+        [=](sycl::nd_item<3> item_ct1) { dequantize_block_q6_K_reorder(vx, y, item_ct1, nb); });
 }
 
 template <typename dst_t>
@@ -528,55 +528,6 @@ static void convert_unary_sycl(const void * vx, dst_t * y, const int64_t k, dpct
     convert_unary_nc_sycl<src_t>(vx, y, k, 1, 1, 1, k, k, k, queue);
 }
 
-// BF16 to FP32 conversion kernel
-template <typename dst_t>
-static void convert_unary_nc_bf16(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t ne00, const int64_t ne01,
-                          const int64_t ne02, const int64_t s01, const int64_t s02, const int64_t s03,
-                          const sycl::nd_item<3> & item_ct1) {
-
-    const int64_t work_group_size = item_ct1.get_local_range(2);
-    const int64_t global_id       = item_ct1.get_local_id(2) + work_group_size * item_ct1.get_group(2);
-
-    const int64_t i01 = item_ct1.get_group(1);
-    const int64_t i02 = item_ct1.get_group(0) % ne02;
-    const int64_t i03 = item_ct1.get_group(0) / ne02;
-
-    const bfloat16 * x = static_cast<const bfloat16 *>(vx);
-    const int64_t ix = i03 * s03 + i02 * s02 + i01 * s01;
-    const int64_t iy = ((i03 * ne02 + i02) * ne01 + i01) * ne00;
-
-#pragma unroll
-    for (int64_t i00 = global_id; i00 < ne00; i00 += work_group_size * item_ct1.get_group_range(2)) {
-        y[iy + i00] = static_cast<dst_t>(bf16_to_fp32(x[ix + i00]));
-    }
-}
-
-template <typename dst_t>
-static void convert_unary_nc_bf16_sycl(const void * __restrict__ vx, dst_t * __restrict__ y,
-                                  const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
-                                  const int64_t s01, const int64_t s02, const int64_t s03, dpct::queue_ptr queue) {
-#ifdef GGML_SYCL_BF16
-    // Note: bfloat16 support is enabled at compile time via GGML_SYCL_BF16
-    // Runtime capability is assumed available when this flag is set
-
-    sycl::range<3> global_size(ne02 * ne03, ne01, ceil_div(ne00, SYCL_DEQUANTIZE_BLOCK_SIZE));
-
-    // decrease global range when it exceeds the max int
-    int64_t        downsized_workgroup = downsample_sycl_global_range(global_size[0], SYCL_DEQUANTIZE_BLOCK_SIZE);
-    sycl::range<3> workgroup_size(1, 1, downsized_workgroup);
-
-    queue->parallel_for(sycl::nd_range<3>(global_size * workgroup_size, workgroup_size), [=](sycl::nd_item<3> item_ct1) {
-        convert_unary_nc_bf16<dst_t>(vx, y, ne00, ne01, ne02, s01, s02, s03, item_ct1);
-    });
-#else
-    (void)vx; (void)y; (void)ne00; (void)ne01; (void)ne02; (void)ne03; (void)s01; (void)s02; (void)s03; (void)queue;
-#endif
-}
-
-template <typename dst_t>
-static void convert_unary_bf16_sycl(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr queue) {
-    convert_unary_nc_bf16_sycl<dst_t>(vx, y, k, 1, 1, 1, k, k, k, queue);
-}
 
 to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
     switch (type) {
@@ -702,9 +653,9 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
             return dequantize_row_mxfp4_sycl;
         case GGML_TYPE_F16:
             return convert_unary_sycl<sycl::half>;
-#ifdef GGML_SYCL_BF16
+#ifdef GGML_SYCL_HAS_BF16
         case GGML_TYPE_BF16:
-            return convert_unary_bf16_sycl<float>;
+            return convert_unary_sycl<sycl::ext::oneapi::bfloat16>;
 #endif
         default:
             return nullptr;

@@ -52,18 +52,8 @@ void ggml_sycl_op_pad_reflect_1d(ggml_backend_sycl_context &ctx,
     const ggml_tensor *src0 = dst->src[0];
     dpct::queue_ptr stream = ctx.stream();
 
-    // Support F16, BF16, and F32
-    const bool is_f16 = (src0->type == GGML_TYPE_F16);
-    const bool is_bf16 = (src0->type == GGML_TYPE_BF16);
-    const bool is_f32 = (src0->type == GGML_TYPE_F32);
-
-#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
-    GGML_ASSERT(is_f32 || is_f16 || is_bf16);
-    GGML_ASSERT(dst->type == src0->type);
-#else
-    GGML_ASSERT(is_f32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
-#endif
 
     const int32_t *opts = (const int32_t *)dst->op_params;
     const int p0 = opts[0];
@@ -85,36 +75,9 @@ void ggml_sycl_op_pad_reflect_1d(ggml_backend_sycl_context &ctx,
                                (unsigned)ne03);
     const dpct::dim3 block_dims((unsigned)bx, 1, 1);
 
-    // Allocate temporary F32 buffers for F16/BF16 input/output
-    const size_t nbytes = ggml_nbytes(src0);
-    float * src0_f32 = nullptr;
-    float * dst_f32 = nullptr;
-    bool need_temp_buffers = false;
-
-    if (is_f16 || is_bf16) {
-        src0_f32 = (float *)sycl::malloc_device(nbytes, *stream);
-        dst_f32 = (float *)sycl::malloc_device(nbytes, *stream);
-        need_temp_buffers = true;
-
-        const int64_t n_elements = ggml_nelements(src0);
-        stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
-            const int idx = it.get_id(0);
-            if (is_f16) {
-                const sycl::half * src = (const sycl::half *)src0->data;
-                src0_f32[idx] = static_cast<float>(src[idx]);
-            } else {
-                const bfloat16 * src = (const bfloat16 *)src0->data;
-                src0_f32[idx] = bf16_to_fp32(src[idx]);
-            }
-        });
-    }
-
-    const void * src0_data = is_f32 ? src0->data : src0_f32;
-    void * dst_data = is_f32 ? dst->data : dst_f32;
-
     stream->submit([&](sycl::handler &cgh) {
-        auto src0_data_ct0 = const_cast<void *>(src0_data);
-        auto dst_data_ct1 = dst_data;
+        auto src0_data_ct0 = src0->data;
+        auto dst_data_ct1 = dst->data;
         auto src0_nb_ct7 = src0->nb[0];
         auto src0_nb_ct8 = src0->nb[1];
         auto src0_nb_ct9 = src0->nb[2];
@@ -134,19 +97,4 @@ void ggml_sycl_op_pad_reflect_1d(ggml_backend_sycl_context &ctx,
                                  dst_nb_ct14, p0, p1, item_ct1);
                          });
     });
-
-    if (need_temp_buffers) {
-        const int64_t n_elements = ggml_nelements(dst);
-        stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
-            const int idx = it.get_id(0);
-            float val = dst_f32[idx];
-            if (is_f16) {
-                ((sycl::half *)dst->data)[idx] = static_cast<sycl::half>(val);
-            } else {
-                ((bfloat16 *)dst->data)[idx] = fp32_to_bf16(val);
-            }
-        });
-        sycl::free(src0_f32, *stream);
-        sycl::free(dst_f32, *stream);
-    }
 }

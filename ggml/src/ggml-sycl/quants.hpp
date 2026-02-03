@@ -42,7 +42,7 @@ template <ggml_type type> struct block_q_t;
 template <> struct block_q_t<GGML_TYPE_Q4_0> {
     struct traits {
         static constexpr uint32_t qk       = QK4_0;
-        static constexpr uint32_t qi       = 4;
+        static constexpr uint32_t qi       = QI4_0;
         static constexpr uint32_t qr       = QR4_0;
         static constexpr uint32_t vdr_mmvq = 2;
     };
@@ -82,8 +82,8 @@ template <> struct block_q_t<GGML_TYPE_Q4_K> {
 template <> struct block_q_t<GGML_TYPE_Q6_K> {
     struct traits {
         static constexpr uint32_t qk       = QK_K;
-        static constexpr uint32_t qi       = 32;
-        static constexpr uint32_t qr       = 2;
+        static constexpr uint32_t qi       = QI6_K;
+        static constexpr uint32_t qr       = QR6_K;
         static constexpr uint32_t vdr_mmvq = 1;
     };
 

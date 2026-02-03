@@ -12,7 +12,6 @@
 
 #include "mmq.hpp"
 #include "vecdotq.hpp"
-#include "mmq_xmx_int8.hpp"
 
 typedef void (*allocate_tiles_sycl_t)(
     int** x_ql,
@@ -1335,20 +1334,21 @@ mul_mat_q(const void *__restrict__ vx, const void *__restrict__ vy,
     }
 }
 
-// Intel Xe2 (Battlemage) - primary target for SYCL backend
-#define  MMQ_X_Q4_0_XE2    64
-#define  MMQ_Y_Q4_0_XE2    128
-#define NWARPS_Q4_0_XE2    4
-// Legacy architecture constants (kept for reference, not used in SYCL)
 #define  MMQ_X_Q4_0_RDNA2  64
 #define  MMQ_Y_Q4_0_RDNA2  128
 #define NWARPS_Q4_0_RDNA2  8
 #define  MMQ_X_Q4_0_RDNA1  64
 #define  MMQ_Y_Q4_0_RDNA1  64
 #define NWARPS_Q4_0_RDNA1  8
+#if defined(SYCL_USE_XMX)
+#define  MMQ_X_Q4_0_AMPERE 4
+#define  MMQ_Y_Q4_0_AMPERE 32
+#define NWARPS_Q4_0_AMPERE 4
+#else
 #define  MMQ_X_Q4_0_AMPERE 64
 #define  MMQ_Y_Q4_0_AMPERE 128
 #define NWARPS_Q4_0_AMPERE 4
+#endif
 #define  MMQ_X_Q4_0_PASCAL 64
 #define  MMQ_Y_Q4_0_PASCAL 64
 #define NWARPS_Q4_0_PASCAL 8
@@ -1364,10 +1364,11 @@ template <bool need_check> static void
     int   * tile_x_qh = nullptr;
     int   * tile_x_sc = nullptr;
 
-    // Use Intel Xe2 tuning parameters
-    const int mmq_x  =  MMQ_X_Q4_0_XE2;
-    const int mmq_y  =  MMQ_Y_Q4_0_XE2;
-    const int nwarps = NWARPS_Q4_0_XE2;
+//sycl_todo: change according to hardware
+
+    const int mmq_x  =  MMQ_X_Q4_0_AMPERE;
+    const int mmq_y  =  MMQ_Y_Q4_0_AMPERE;
+    const int nwarps = NWARPS_Q4_0_AMPERE;
     allocate_tiles_q4_0<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc,
                                tile_x_qs_q4_0, tile_x_d_q4_0);
     mul_mat_q<QK4_0, QR4_0, QI4_0, true, block_q4_0, mmq_x, mmq_y, nwarps,
@@ -1377,20 +1378,21 @@ template <bool need_check> static void
         tile_x_dm, tile_x_qh, tile_x_sc, item_ct1, tile_y_qs, tile_y_ds);
 }
 
-// Intel Xe2 (Battlemage) - primary target for SYCL backend
-#define  MMQ_X_Q4_1_XE2    64
-#define  MMQ_Y_Q4_1_XE2    128
-#define NWARPS_Q4_1_XE2    4
-// Legacy architecture constants (kept for reference, not used in SYCL)
 #define  MMQ_X_Q4_1_RDNA2  64
 #define  MMQ_Y_Q4_1_RDNA2  128
 #define NWARPS_Q4_1_RDNA2  8
 #define  MMQ_X_Q4_1_RDNA1  64
 #define  MMQ_Y_Q4_1_RDNA1  64
 #define NWARPS_Q4_1_RDNA1  8
+#if defined(SYCL_USE_XMX)
+#define  MMQ_X_Q4_1_AMPERE 4
+#define  MMQ_Y_Q4_1_AMPERE 32
+#define NWARPS_Q4_1_AMPERE 4
+#else
 #define  MMQ_X_Q4_1_AMPERE 64
 #define  MMQ_Y_Q4_1_AMPERE 128
 #define NWARPS_Q4_1_AMPERE 4
+#endif
 #define  MMQ_X_Q4_1_PASCAL 64
 #define  MMQ_Y_Q4_1_PASCAL 64
 #define NWARPS_Q4_1_PASCAL 8
@@ -1406,10 +1408,10 @@ template <bool need_check> static void
     int   * tile_x_qh = nullptr;
     int   * tile_x_sc = nullptr;
 
-    // Use Intel Xe2 tuning parameters
-    const int mmq_x  =  MMQ_X_Q4_1_XE2;
-    const int mmq_y  =  MMQ_Y_Q4_1_XE2;
-    const int nwarps = NWARPS_Q4_1_XE2;
+//sycl_todo: change according to hardware
+    const int mmq_x  =  MMQ_X_Q4_1_AMPERE;
+    const int mmq_y  =  MMQ_Y_Q4_1_AMPERE;
+    const int nwarps = NWARPS_Q4_1_AMPERE;
     allocate_tiles_q4_1<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc,
                                tile_x_qs_q4_1, tile_x_dm_q4_1);
     mul_mat_q<QK4_1, QR4_1, QI4_1, true, block_q4_1, mmq_x, mmq_y, nwarps,
@@ -1419,20 +1421,21 @@ template <bool need_check> static void
         tile_x_dm, tile_x_qh, tile_x_sc, item_ct1, tile_y_qs, tile_y_ds);
 }
 
-// Intel Xe2 (Battlemage) - primary target for SYCL backend
-#define  MMQ_X_Q5_0_XE2    64
-#define  MMQ_Y_Q5_0_XE2    128
-#define NWARPS_Q5_0_XE2    4
-// Legacy architecture constants (kept for reference, not used in SYCL)
 #define  MMQ_X_Q5_0_RDNA2  64
 #define  MMQ_Y_Q5_0_RDNA2  128
 #define NWARPS_Q5_0_RDNA2  8
 #define  MMQ_X_Q5_0_RDNA1  64
 #define  MMQ_Y_Q5_0_RDNA1  64
 #define NWARPS_Q5_0_RDNA1  8
+#if defined(SYCL_USE_XMX)
+#define  MMQ_X_Q5_0_AMPERE 4
+#define  MMQ_Y_Q5_0_AMPERE 32
+#define NWARPS_Q5_0_AMPERE 4
+#else
 #define  MMQ_X_Q5_0_AMPERE 128
 #define  MMQ_Y_Q5_0_AMPERE 64
 #define NWARPS_Q5_0_AMPERE 4
+#endif
 #define  MMQ_X_Q5_0_PASCAL 64
 #define  MMQ_Y_Q5_0_PASCAL 64
 #define NWARPS_Q5_0_PASCAL 8
@@ -1448,10 +1451,10 @@ template <bool need_check> static void
     int   * tile_x_qh = nullptr;
     int   * tile_x_sc = nullptr;
 
-    // Use Intel Xe2 tuning parameters
-    const int mmq_x  =  MMQ_X_Q5_0_XE2;
-    const int mmq_y  =  MMQ_Y_Q5_0_XE2;
-    const int nwarps = NWARPS_Q5_0_XE2;
+//sycl_todo: change according to hardware
+    const int mmq_x  =  MMQ_X_Q5_0_AMPERE;
+    const int mmq_y  =  MMQ_Y_Q5_0_AMPERE;
+    const int nwarps = NWARPS_Q5_0_AMPERE;
     allocate_tiles_q5_0<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc,
                                tile_x_ql_q5_0, tile_x_d_q5_0);
     mul_mat_q<QK5_0, QR5_0, QI5_0, false, block_q5_0, mmq_x, mmq_y, nwarps,
@@ -1461,20 +1464,21 @@ template <bool need_check> static void
         tile_x_dm, tile_x_qh, tile_x_sc, item_ct1, tile_y_qs, tile_y_ds);
 }
 
-// Intel Xe2 (Battlemage) - primary target for SYCL backend
-#define  MMQ_X_Q5_1_XE2    64
-#define  MMQ_Y_Q5_1_XE2    128
-#define NWARPS_Q5_1_XE2    4
-// Legacy architecture constants (kept for reference, not used in SYCL)
 #define  MMQ_X_Q5_1_RDNA2  64
 #define  MMQ_Y_Q5_1_RDNA2  128
 #define NWARPS_Q5_1_RDNA2  8
 #define  MMQ_X_Q5_1_RDNA1  64
 #define  MMQ_Y_Q5_1_RDNA1  64
 #define NWARPS_Q5_1_RDNA1  8
+#if defined(SYCL_USE_XMX)
+#define  MMQ_X_Q5_1_AMPERE 4
+#define  MMQ_Y_Q5_1_AMPERE 32
+#define NWARPS_Q5_1_AMPERE 4
+#else
 #define  MMQ_X_Q5_1_AMPERE 128
 #define  MMQ_Y_Q5_1_AMPERE 64
 #define NWARPS_Q5_1_AMPERE 4
+#endif
 #define  MMQ_X_Q5_1_PASCAL 64
 #define  MMQ_Y_Q5_1_PASCAL 64
 #define NWARPS_Q5_1_PASCAL 8
@@ -1490,10 +1494,10 @@ mul_mat_q5_1(
     int   * tile_x_qh = nullptr;
     int   * tile_x_sc = nullptr;
 
-    // Use Intel Xe2 tuning parameters
-    const int mmq_x  =  MMQ_X_Q5_1_XE2;
-    const int mmq_y  =  MMQ_Y_Q5_1_XE2;
-    const int nwarps = NWARPS_Q5_1_XE2;
+//sycl_todo: change according to hardware
+    const int mmq_x  =  MMQ_X_Q5_1_AMPERE;
+    const int mmq_y  =  MMQ_Y_Q5_1_AMPERE;
+    const int nwarps = NWARPS_Q5_1_AMPERE;
     allocate_tiles_q5_1<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc,
                                tile_x_ql_q5_1, tile_x_dm_q5_1);
     mul_mat_q<QK5_1, QR5_1, QI5_1, true, block_q5_1, mmq_x, mmq_y, nwarps,
@@ -1503,20 +1507,21 @@ mul_mat_q5_1(
         tile_x_dm, tile_x_qh, tile_x_sc, item_ct1, tile_y_qs, tile_y_ds);
 }
 
-// Intel Xe2 (Battlemage) - primary target for SYCL backend
-#define  MMQ_X_Q8_0_XE2    64
-#define  MMQ_Y_Q8_0_XE2    128
-#define NWARPS_Q8_0_XE2    4
-// Legacy architecture constants (kept for reference, not used in SYCL)
 #define  MMQ_X_Q8_0_RDNA2  64
 #define  MMQ_Y_Q8_0_RDNA2  128
 #define NWARPS_Q8_0_RDNA2  8
 #define  MMQ_X_Q8_0_RDNA1  64
 #define  MMQ_Y_Q8_0_RDNA1  64
 #define NWARPS_Q8_0_RDNA1  8
+#if defined(SYCL_USE_XMX)
+#define  MMQ_X_Q8_0_AMPERE 4
+#define  MMQ_Y_Q8_0_AMPERE 32
+#define NWARPS_Q8_0_AMPERE 4
+#else
 #define  MMQ_X_Q8_0_AMPERE 128
 #define  MMQ_Y_Q8_0_AMPERE 64
 #define NWARPS_Q8_0_AMPERE 4
+#endif
 #define  MMQ_X_Q8_0_PASCAL 64
 #define  MMQ_Y_Q8_0_PASCAL 64
 #define NWARPS_Q8_0_PASCAL 8
@@ -1532,10 +1537,10 @@ template <bool need_check> static void
     int   * tile_x_qh = nullptr;
     int   * tile_x_sc = nullptr;
 
-    // Use Intel Xe2 tuning parameters
-    const int mmq_x  =  MMQ_X_Q8_0_XE2;
-    const int mmq_y  =  MMQ_Y_Q8_0_XE2;
-    const int nwarps = NWARPS_Q8_0_XE2;
+//sycl_todo: change according to hardware
+    const int mmq_x  =  MMQ_X_Q8_0_AMPERE;
+    const int mmq_y  =  MMQ_Y_Q8_0_AMPERE;
+    const int nwarps = NWARPS_Q8_0_AMPERE;
     allocate_tiles_q8_0<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc,
                                tile_x_qs_q8_0, tile_x_d_q8_0);
     mul_mat_q<QK8_0, QR8_0, QI8_0, false, block_q8_0, mmq_x, mmq_y, nwarps,
@@ -1545,20 +1550,21 @@ template <bool need_check> static void
         tile_x_dm, tile_x_qh, tile_x_sc, item_ct1, tile_y_qs, tile_y_ds);
 }
 
-// Intel Xe2 (Battlemage) - primary target for SYCL backend
-#define  MMQ_X_Q2_K_XE2    64
-#define  MMQ_Y_Q2_K_XE2    128
-#define NWARPS_Q2_K_XE2    4
-// Legacy architecture constants (kept for reference, not used in SYCL)
 #define  MMQ_X_Q2_K_RDNA2  64
 #define  MMQ_Y_Q2_K_RDNA2  128
 #define NWARPS_Q2_K_RDNA2  8
 #define  MMQ_X_Q2_K_RDNA1  128
 #define  MMQ_Y_Q2_K_RDNA1  32
 #define NWARPS_Q2_K_RDNA1  8
+#if defined(SYCL_USE_XMX)
+#define  MMQ_X_Q2_K_AMPERE 4
+#define  MMQ_Y_Q2_K_AMPERE 32
+#define NWARPS_Q2_K_AMPERE 4
+#else
 #define  MMQ_X_Q2_K_AMPERE 64
 #define  MMQ_Y_Q2_K_AMPERE 128
 #define NWARPS_Q2_K_AMPERE 4
+#endif
 #define  MMQ_X_Q2_K_PASCAL 64
 #define  MMQ_Y_Q2_K_PASCAL 64
 #define NWARPS_Q2_K_PASCAL 8
@@ -1575,10 +1581,10 @@ mul_mat_q2_K(
     int   * tile_x_qh = nullptr;
     int   * tile_x_sc = nullptr;
 
-    // Use Intel Xe2 tuning parameters
-    const int mmq_x  =  MMQ_X_Q2_K_XE2;
-    const int mmq_y  =  MMQ_Y_Q2_K_XE2;
-    const int nwarps = NWARPS_Q2_K_XE2;
+//sycl_todo: change according to hardware
+    const int mmq_x  =  MMQ_X_Q2_K_AMPERE;
+    const int mmq_y  =  MMQ_Y_Q2_K_AMPERE;
+    const int nwarps = NWARPS_Q2_K_AMPERE;
     allocate_tiles_q2_K<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc,
                                tile_x_ql_q2_K, tile_x_dm_q2_K, tile_x_sc_q2_K);
     mul_mat_q<QK_K, QR2_K, QI2_K, false, block_q2_K, mmq_x, mmq_y, nwarps,
@@ -1588,20 +1594,21 @@ mul_mat_q2_K(
         tile_x_dm, tile_x_qh, tile_x_sc, item_ct1, tile_y_qs, tile_y_ds);
 }
 
-// Intel Xe2 (Battlemage) - primary target for SYCL backend
-#define  MMQ_X_Q3_K_XE2    128
-#define  MMQ_Y_Q3_K_XE2    128
-#define NWARPS_Q3_K_XE2    4
-// Legacy architecture constants (kept for reference, not used in SYCL)
 #define  MMQ_X_Q3_K_RDNA2  128
 #define  MMQ_Y_Q3_K_RDNA2  64
 #define NWARPS_Q3_K_RDNA2  8
 #define  MMQ_X_Q3_K_RDNA1  32
 #define  MMQ_Y_Q3_K_RDNA1  128
 #define NWARPS_Q3_K_RDNA1  8
+#if defined(SYCL_USE_XMX)
+#define  MMQ_X_Q3_K_AMPERE 4
+#define  MMQ_Y_Q3_K_AMPERE 32
+#define NWARPS_Q3_K_AMPERE 4
+#else
 #define  MMQ_X_Q3_K_AMPERE 128
 #define  MMQ_Y_Q3_K_AMPERE 128
 #define NWARPS_Q3_K_AMPERE 4
+#endif
 #define  MMQ_X_Q3_K_PASCAL 64
 #define  MMQ_Y_Q3_K_PASCAL 64
 #define NWARPS_Q3_K_PASCAL 8
@@ -1618,10 +1625,10 @@ mul_mat_q3_K(
     int   * tile_x_qh = nullptr;
     int   * tile_x_sc = nullptr;
 
-    // Use Intel Xe2 tuning parameters
-    const int mmq_x  =  MMQ_X_Q3_K_XE2;
-    const int mmq_y  =  MMQ_Y_Q3_K_XE2;
-    const int nwarps = NWARPS_Q3_K_XE2;
+//sycl_todo: change according to hardware
+    const int mmq_x  =  MMQ_X_Q3_K_AMPERE;
+    const int mmq_y  =  MMQ_Y_Q3_K_AMPERE;
+    const int nwarps = NWARPS_Q3_K_AMPERE;
     allocate_tiles_q3_K<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc,
                                tile_x_ql_q3_K, tile_x_dm_q3_K, tile_x_qh_q3_K,
                                tile_x_sc_q3_K);
@@ -1632,20 +1639,21 @@ mul_mat_q3_K(
         tile_x_dm, tile_x_qh, tile_x_sc, item_ct1, tile_y_qs, tile_y_ds);
 }
 
-// Intel Xe2 (Battlemage) - primary target for SYCL backend
-#define  MMQ_X_Q4_K_XE2    64
-#define  MMQ_Y_Q4_K_XE2    128
-#define NWARPS_Q4_K_XE2    4
-// Legacy architecture constants (kept for reference, not used in SYCL)
 #define  MMQ_X_Q4_K_RDNA2  64
 #define  MMQ_Y_Q4_K_RDNA2  128
 #define NWARPS_Q4_K_RDNA2  8
 #define  MMQ_X_Q4_K_RDNA1  32
 #define  MMQ_Y_Q4_K_RDNA1  64
 #define NWARPS_Q4_K_RDNA1  8
+#if defined(SYCL_USE_XMX)
+#define  MMQ_X_Q4_K_AMPERE 4
+#define  MMQ_Y_Q4_K_AMPERE 32
+#define NWARPS_Q4_K_AMPERE 4
+#else
 #define  MMQ_X_Q4_K_AMPERE 64
 #define  MMQ_Y_Q4_K_AMPERE 128
 #define NWARPS_Q4_K_AMPERE 4
+#endif
 #define  MMQ_X_Q4_K_PASCAL 64
 #define  MMQ_Y_Q4_K_PASCAL 64
 #define NWARPS_Q4_K_PASCAL 8
@@ -1662,10 +1670,10 @@ template <bool need_check> static void
     int   * tile_x_qh = nullptr;
     int   * tile_x_sc = nullptr;
 
-    // Use Intel Xe2 tuning parameters
-    const int mmq_x  =  MMQ_X_Q4_K_XE2;
-    const int mmq_y  =  MMQ_Y_Q4_K_XE2;
-    const int nwarps = NWARPS_Q4_K_XE2;
+//sycl_todo: change according to hardware
+    const int mmq_x  =  MMQ_X_Q4_K_AMPERE;
+    const int mmq_y  =  MMQ_Y_Q4_K_AMPERE;
+    const int nwarps = NWARPS_Q4_K_AMPERE;
     allocate_tiles_q4_K<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc,
                                tile_x_ql_q4_K, tile_x_dm_q4_K, tile_x_sc_q4_K);
     mul_mat_q<QK_K, QR4_K, QI4_K, true, block_q4_K, mmq_x, mmq_y, nwarps,
@@ -1675,20 +1683,21 @@ template <bool need_check> static void
         tile_x_dm, tile_x_qh, tile_x_sc, item_ct1, tile_y_qs, tile_y_ds);
 }
 
-// Intel Xe2 (Battlemage) - primary target for SYCL backend
-#define  MMQ_X_Q5_K_XE2    64
-#define  MMQ_Y_Q5_K_XE2    128
-#define NWARPS_Q5_K_XE2    4
-// Legacy architecture constants (kept for reference, not used in SYCL)
 #define  MMQ_X_Q5_K_RDNA2  64
 #define  MMQ_Y_Q5_K_RDNA2  128
 #define NWARPS_Q5_K_RDNA2  8
 #define  MMQ_X_Q5_K_RDNA1  32
 #define  MMQ_Y_Q5_K_RDNA1  64
 #define NWARPS_Q5_K_RDNA1  8
+#if defined(SYCL_USE_XMX)
+#define  MMQ_X_Q5_K_AMPERE 4
+#define  MMQ_Y_Q5_K_AMPERE 32
+#define NWARPS_Q5_K_AMPERE 4
+#else
 #define  MMQ_X_Q5_K_AMPERE 64
 #define  MMQ_Y_Q5_K_AMPERE 128
 #define NWARPS_Q5_K_AMPERE 4
+#endif
 #define  MMQ_X_Q5_K_PASCAL 64
 #define  MMQ_Y_Q5_K_PASCAL 64
 #define NWARPS_Q5_K_PASCAL 8
@@ -1705,10 +1714,10 @@ mul_mat_q5_K(
     int   * tile_x_qh = nullptr;
     int   * tile_x_sc = nullptr;
 
-    // Use Intel Xe2 tuning parameters
-    const int mmq_x  =  MMQ_X_Q5_K_XE2;
-    const int mmq_y  =  MMQ_Y_Q5_K_XE2;
-    const int nwarps = NWARPS_Q5_K_XE2;
+//sycl_todo: change according to hardware
+    const int mmq_x  =  MMQ_X_Q5_K_AMPERE;
+    const int mmq_y  =  MMQ_Y_Q5_K_AMPERE;
+    const int nwarps = NWARPS_Q5_K_AMPERE;
     allocate_tiles_q5_K<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc,
                                tile_x_ql_q5_K, tile_x_dm_q5_K, tile_x_sc_q5_K);
     mul_mat_q<QK_K, QR5_K, QI5_K, true, block_q5_K, mmq_x, mmq_y, nwarps,
@@ -1718,20 +1727,21 @@ mul_mat_q5_K(
         tile_x_dm, tile_x_qh, tile_x_sc, item_ct1, tile_y_qs, tile_y_ds);
 }
 
-// Intel Xe2 (Battlemage) - primary target for SYCL backend
-#define  MMQ_X_Q6_K_XE2    64
-#define  MMQ_Y_Q6_K_XE2    64
-#define NWARPS_Q6_K_XE2    4
-// Legacy architecture constants (kept for reference, not used in SYCL)
 #define  MMQ_X_Q6_K_RDNA2  64
 #define  MMQ_Y_Q6_K_RDNA2  128
 #define NWARPS_Q6_K_RDNA2  8
 #define  MMQ_X_Q6_K_RDNA1  32
 #define  MMQ_Y_Q6_K_RDNA1  64
 #define NWARPS_Q6_K_RDNA1  8
+#if defined(SYCL_USE_XMX)
+#define  MMQ_X_Q6_K_AMPERE 4
+#define  MMQ_Y_Q6_K_AMPERE 32
+#define NWARPS_Q6_K_AMPERE 4
+#else
 #define  MMQ_X_Q6_K_AMPERE 64
 #define  MMQ_Y_Q6_K_AMPERE 64
 #define NWARPS_Q6_K_AMPERE 4
+#endif
 #define  MMQ_X_Q6_K_PASCAL 64
 #define  MMQ_Y_Q6_K_PASCAL 64
 #define NWARPS_Q6_K_PASCAL 8
@@ -1747,10 +1757,10 @@ template <bool need_check> static void
     int   * tile_x_qh = nullptr;
     // int   * tile_x_sc = nullptr;
 
-    // Use Intel Xe2 tuning parameters
-    const int mmq_x  =  MMQ_X_Q6_K_XE2;
-    const int mmq_y  =  MMQ_Y_Q6_K_XE2;
-    const int nwarps = NWARPS_Q6_K_XE2;
+//sycl_todo: change according to hardware
+    const int mmq_x  =  MMQ_X_Q6_K_AMPERE;
+    const int mmq_y  =  MMQ_Y_Q6_K_AMPERE;
+    const int nwarps = NWARPS_Q6_K_AMPERE;
     allocate_tiles_q6_K<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc,
                                tile_x_ql, tile_x_dm, tile_x_sc);
     mul_mat_q<QK_K, QR6_K, QI6_K, false, block_q6_K, mmq_x, mmq_y, nwarps,
@@ -1771,11 +1781,26 @@ static void ggml_mul_mat_q4_0_q8_1_sycl(const void *vx, const void *vy,
         CHECK_TRY_ERROR(id = get_current_device_id()));
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
-    // Use Intel Xe2 tuning - must match the hardcoded values in mul_mat_q4_0 kernel template
-    const int mmq_x  = MMQ_X_Q4_0_XE2;
-    const int mmq_y  = MMQ_Y_Q4_0_XE2;
-    const int nwarps = NWARPS_Q4_0_XE2;
-    (void)compute_capability; // Currently using fixed Xe2 tuning for all Intel GPUs
+    int mmq_x, mmq_y, nwarps;
+    if (compute_capability >= VER_GEN13) {
+        mmq_x  =  MMQ_X_Q4_0_RDNA2;
+        mmq_y  =  MMQ_Y_Q4_0_RDNA2;
+        nwarps = NWARPS_Q4_0_RDNA2;
+    } else if (compute_capability >= VER_GEN12) {
+        mmq_x  =  MMQ_X_Q4_0_RDNA1;
+        mmq_y  =  MMQ_Y_Q4_0_RDNA1;
+        nwarps = NWARPS_Q4_0_RDNA1;
+    } else if (compute_capability >= VER_GEN9) {
+        mmq_x  =  MMQ_X_Q4_0_AMPERE;
+        mmq_y  =  MMQ_Y_Q4_0_AMPERE;
+        nwarps = NWARPS_Q4_0_AMPERE;
+    } else if (compute_capability >= VER_4VEC) {
+        mmq_x  =  MMQ_X_Q4_0_PASCAL;
+        mmq_y  =  MMQ_Y_Q4_0_PASCAL;
+        nwarps = NWARPS_Q4_0_PASCAL;
+    } else {
+        GGML_ABORT("fatal error");
+    }
 
     const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
     const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
@@ -1871,11 +1896,26 @@ static void ggml_mul_mat_q4_1_q8_1_sycl(const void *vx, const void *vy,
         CHECK_TRY_ERROR(id = get_current_device_id()));
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
-    // Use Intel Xe2 tuning - must match the hardcoded values in mul_mat_q4_1 kernel template
-    const int mmq_x  = MMQ_X_Q4_1_XE2;
-    const int mmq_y  = MMQ_Y_Q4_1_XE2;
-    const int nwarps = NWARPS_Q4_1_XE2;
-    (void)compute_capability; // Currently using fixed Xe2 tuning for all Intel GPUs
+    int mmq_x, mmq_y, nwarps;
+    if (compute_capability >= VER_GEN13) {
+        mmq_x  =  MMQ_X_Q4_1_RDNA2;
+        mmq_y  =  MMQ_Y_Q4_1_RDNA2;
+        nwarps = NWARPS_Q4_1_RDNA2;
+    } else if (compute_capability >= VER_GEN12) {
+        mmq_x  =  MMQ_X_Q4_1_RDNA1;
+        mmq_y  =  MMQ_Y_Q4_1_RDNA1;
+        nwarps = NWARPS_Q4_1_RDNA1;
+    } else if (compute_capability >= VER_GEN9) {
+        mmq_x  =  MMQ_X_Q4_1_AMPERE;
+        mmq_y  =  MMQ_Y_Q4_1_AMPERE;
+        nwarps = NWARPS_Q4_1_AMPERE;
+    } else if (compute_capability >= VER_4VEC) {
+        mmq_x  =  MMQ_X_Q4_1_PASCAL;
+        mmq_y  =  MMQ_Y_Q4_1_PASCAL;
+        nwarps = NWARPS_Q4_1_PASCAL;
+    } else {
+        GGML_ABORT("fatal error");
+    }
 
     const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
     const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
@@ -1971,11 +2011,26 @@ static void ggml_mul_mat_q5_0_q8_1_sycl(const void *vx, const void *vy,
         CHECK_TRY_ERROR(id = get_current_device_id()));
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
-    // Use Intel Xe2 tuning - must match the hardcoded values in mul_mat_q5_0 kernel template
-    const int mmq_x  = MMQ_X_Q5_0_XE2;
-    const int mmq_y  = MMQ_Y_Q5_0_XE2;
-    const int nwarps = NWARPS_Q5_0_XE2;
-    (void)compute_capability; // Currently using fixed Xe2 tuning for all Intel GPUs
+    int mmq_x, mmq_y, nwarps;
+    if (compute_capability >= VER_GEN13) {
+        mmq_x  =  MMQ_X_Q5_0_RDNA2;
+        mmq_y  =  MMQ_Y_Q5_0_RDNA2;
+        nwarps = NWARPS_Q5_0_RDNA2;
+    } else if (compute_capability >= VER_GEN12) {
+        mmq_x  =  MMQ_X_Q5_0_RDNA1;
+        mmq_y  =  MMQ_Y_Q5_0_RDNA1;
+        nwarps = NWARPS_Q5_0_RDNA1;
+    } else if (compute_capability >= VER_GEN9) {
+        mmq_x  =  MMQ_X_Q5_0_AMPERE;
+        mmq_y  =  MMQ_Y_Q5_0_AMPERE;
+        nwarps = NWARPS_Q5_0_AMPERE;
+    } else if (compute_capability >= VER_4VEC) {
+        mmq_x  =  MMQ_X_Q5_0_PASCAL;
+        mmq_y  =  MMQ_Y_Q5_0_PASCAL;
+        nwarps = NWARPS_Q5_0_PASCAL;
+    } else {
+        GGML_ABORT("fatal error");
+    }
 
     const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
     const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
@@ -2071,11 +2126,26 @@ static void ggml_mul_mat_q5_1_q8_1_sycl(const void *vx, const void *vy,
         CHECK_TRY_ERROR(id = get_current_device_id()));
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
-    // Use Intel Xe2 tuning - must match the hardcoded values in mul_mat_q5_1 kernel template
-    const int mmq_x  = MMQ_X_Q5_1_XE2;
-    const int mmq_y  = MMQ_Y_Q5_1_XE2;
-    const int nwarps = NWARPS_Q5_1_XE2;
-    (void)compute_capability; // Currently using fixed Xe2 tuning for all Intel GPUs
+    int mmq_x, mmq_y, nwarps;
+    if (compute_capability >= VER_GEN13) {
+        mmq_x  =  MMQ_X_Q5_1_RDNA2;
+        mmq_y  =  MMQ_Y_Q5_1_RDNA2;
+        nwarps = NWARPS_Q5_1_RDNA2;
+    } else if (compute_capability >= VER_GEN12) {
+        mmq_x  =  MMQ_X_Q5_1_RDNA1;
+        mmq_y  =  MMQ_Y_Q5_1_RDNA1;
+        nwarps = NWARPS_Q5_1_RDNA1;
+    } else if (compute_capability >= VER_GEN9) {
+        mmq_x  =  MMQ_X_Q5_1_AMPERE;
+        mmq_y  =  MMQ_Y_Q5_1_AMPERE;
+        nwarps = NWARPS_Q5_1_AMPERE;
+    } else if (compute_capability >= VER_4VEC) {
+        mmq_x  =  MMQ_X_Q5_1_PASCAL;
+        mmq_y  =  MMQ_Y_Q5_1_PASCAL;
+        nwarps = NWARPS_Q5_1_PASCAL;
+    } else {
+        GGML_ABORT("fatal error");
+    }
 
     const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
     const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
@@ -2171,11 +2241,26 @@ static void ggml_mul_mat_q8_0_q8_1_sycl(const void *vx, const void *vy,
         CHECK_TRY_ERROR(id = get_current_device_id()));
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
-    // Use Intel Xe2 tuning - must match the hardcoded values in mul_mat_q8_0 kernel template
-    const int mmq_x  = MMQ_X_Q8_0_XE2;
-    const int mmq_y  = MMQ_Y_Q8_0_XE2;
-    const int nwarps = NWARPS_Q8_0_XE2;
-    (void)compute_capability; // Currently using fixed Xe2 tuning for all Intel GPUs
+    int mmq_x, mmq_y, nwarps;
+    if (compute_capability >= VER_GEN13) {
+        mmq_x  =  MMQ_X_Q8_0_RDNA2;
+        mmq_y  =  MMQ_Y_Q8_0_RDNA2;
+        nwarps = NWARPS_Q8_0_RDNA2;
+    } else if (compute_capability >= VER_GEN12) {
+        mmq_x  =  MMQ_X_Q8_0_RDNA1;
+        mmq_y  =  MMQ_Y_Q8_0_RDNA1;
+        nwarps = NWARPS_Q8_0_RDNA1;
+    } else if (compute_capability >= VER_GEN9) {
+        mmq_x  =  MMQ_X_Q8_0_AMPERE;
+        mmq_y  =  MMQ_Y_Q8_0_AMPERE;
+        nwarps = NWARPS_Q8_0_AMPERE;
+    } else if (compute_capability >= VER_4VEC) {
+        mmq_x  =  MMQ_X_Q8_0_PASCAL;
+        mmq_y  =  MMQ_Y_Q8_0_PASCAL;
+        nwarps = NWARPS_Q8_0_PASCAL;
+    } else {
+        GGML_ABORT("fatal error");
+    }
 
     const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
     const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
@@ -2271,11 +2356,26 @@ static void ggml_mul_mat_q2_K_q8_1_sycl(const void *vx, const void *vy,
         CHECK_TRY_ERROR(id = get_current_device_id()));
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
-    // Use Intel Xe2 tuning - must match the hardcoded values in mul_mat_q2_K kernel template
-    const int mmq_x  = MMQ_X_Q2_K_XE2;
-    const int mmq_y  = MMQ_Y_Q2_K_XE2;
-    const int nwarps = NWARPS_Q2_K_XE2;
-    (void)compute_capability; // Currently using fixed Xe2 tuning for all Intel GPUs
+    int mmq_x, mmq_y, nwarps;
+    if (compute_capability >= VER_GEN13) {
+        mmq_x  =  MMQ_X_Q2_K_RDNA2;
+        mmq_y  =  MMQ_Y_Q2_K_RDNA2;
+        nwarps = NWARPS_Q2_K_RDNA2;
+    } else if (compute_capability >= VER_GEN12) {
+        mmq_x  =  MMQ_X_Q2_K_RDNA1;
+        mmq_y  =  MMQ_Y_Q2_K_RDNA1;
+        nwarps = NWARPS_Q2_K_RDNA1;
+    } else if (compute_capability >= VER_GEN9) {
+        mmq_x  =  MMQ_X_Q2_K_AMPERE;
+        mmq_y  =  MMQ_Y_Q2_K_AMPERE;
+        nwarps = NWARPS_Q2_K_AMPERE;
+    } else if (compute_capability >= VER_4VEC) {
+        mmq_x  =  MMQ_X_Q2_K_PASCAL;
+        mmq_y  =  MMQ_Y_Q2_K_PASCAL;
+        nwarps = NWARPS_Q2_K_PASCAL;
+    } else {
+        GGML_ABORT("fatal error");
+    }
 
     const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
     const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
@@ -2379,11 +2479,26 @@ static void ggml_mul_mat_q3_K_q8_1_sycl(const void *vx, const void *vy,
         CHECK_TRY_ERROR(id = get_current_device_id()));
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
-    // Use Intel Xe2 tuning - must match the hardcoded values in mul_mat_q3_K kernel template
-    const int mmq_x  = MMQ_X_Q3_K_XE2;
-    const int mmq_y  = MMQ_Y_Q3_K_XE2;
-    const int nwarps = NWARPS_Q3_K_XE2;
-    (void)compute_capability; // Currently using fixed Xe2 tuning for all Intel GPUs
+    int mmq_x, mmq_y, nwarps;
+    if (compute_capability >= VER_GEN13) {
+        mmq_x  =  MMQ_X_Q3_K_RDNA2;
+        mmq_y  =  MMQ_Y_Q3_K_RDNA2;
+        nwarps = NWARPS_Q3_K_RDNA2;
+    } else if (compute_capability >= VER_GEN12) {
+        mmq_x  =  MMQ_X_Q3_K_RDNA1;
+        mmq_y  =  MMQ_Y_Q3_K_RDNA1;
+        nwarps = NWARPS_Q3_K_RDNA1;
+    } else if (compute_capability >= VER_GEN9) {
+        mmq_x  =  MMQ_X_Q3_K_AMPERE;
+        mmq_y  =  MMQ_Y_Q3_K_AMPERE;
+        nwarps = NWARPS_Q3_K_AMPERE;
+    } else if (compute_capability >= VER_4VEC) {
+        mmq_x  =  MMQ_X_Q3_K_PASCAL;
+        mmq_y  =  MMQ_Y_Q3_K_PASCAL;
+        nwarps = NWARPS_Q3_K_PASCAL;
+    } else {
+        GGML_ABORT("fatal error");
+    }
 
     const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
     const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
@@ -2492,11 +2607,26 @@ static void ggml_mul_mat_q4_K_q8_1_sycl(const void *vx, const void *vy,
         CHECK_TRY_ERROR(id = get_current_device_id()));
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
-    // Use Intel Xe2 tuning - must match the hardcoded values in mul_mat_q4_K kernel template
-    const int mmq_x  = MMQ_X_Q4_K_XE2;
-    const int mmq_y  = MMQ_Y_Q4_K_XE2;
-    const int nwarps = NWARPS_Q4_K_XE2;
-    (void)compute_capability; // Currently using fixed Xe2 tuning for all Intel GPUs
+    int mmq_x, mmq_y, nwarps;
+    if (compute_capability >= VER_GEN13) {
+        mmq_x  =  MMQ_X_Q4_K_RDNA2;
+        mmq_y  =  MMQ_Y_Q4_K_RDNA2;
+        nwarps = NWARPS_Q4_K_RDNA2;
+    } else if (compute_capability >= VER_GEN12) {
+        mmq_x  =  MMQ_X_Q4_K_RDNA1;
+        mmq_y  =  MMQ_Y_Q4_K_RDNA1;
+        nwarps = NWARPS_Q4_K_RDNA1;
+    } else if (compute_capability >= VER_GEN9) {
+        mmq_x  =  MMQ_X_Q4_K_AMPERE;
+        mmq_y  =  MMQ_Y_Q4_K_AMPERE;
+        nwarps = NWARPS_Q4_K_AMPERE;
+    } else if (compute_capability >= VER_4VEC) {
+        mmq_x  =  MMQ_X_Q4_K_PASCAL;
+        mmq_y  =  MMQ_Y_Q4_K_PASCAL;
+        nwarps = NWARPS_Q4_K_PASCAL;
+    } else {
+        GGML_ABORT("fatal error");
+    }
 
     const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
     const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
@@ -2598,11 +2728,26 @@ static void ggml_mul_mat_q5_K_q8_1_sycl(const void *vx, const void *vy,
         CHECK_TRY_ERROR(id = get_current_device_id()));
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
-    // Use Intel Xe2 tuning - must match the hardcoded values in mul_mat_q5_K kernel template
-    const int mmq_x  = MMQ_X_Q5_K_XE2;
-    const int mmq_y  = MMQ_Y_Q5_K_XE2;
-    const int nwarps = NWARPS_Q5_K_XE2;
-    (void)compute_capability; // Currently using fixed Xe2 tuning for all Intel GPUs
+    int mmq_x, mmq_y, nwarps;
+    if (compute_capability >= VER_GEN13) {
+        mmq_x  =  MMQ_X_Q5_K_RDNA2;
+        mmq_y  =  MMQ_Y_Q5_K_RDNA2;
+        nwarps = NWARPS_Q5_K_RDNA2;
+    } else if (compute_capability >= VER_GEN12) {
+        mmq_x  =  MMQ_X_Q5_K_RDNA1;
+        mmq_y  =  MMQ_Y_Q5_K_RDNA1;
+        nwarps = NWARPS_Q5_K_RDNA1;
+    } else if (compute_capability >= VER_GEN9) {
+        mmq_x  =  MMQ_X_Q5_K_AMPERE;
+        mmq_y  =  MMQ_Y_Q5_K_AMPERE;
+        nwarps = NWARPS_Q5_K_AMPERE;
+    } else if (compute_capability >= VER_4VEC) {
+        mmq_x  =  MMQ_X_Q5_K_PASCAL;
+        mmq_y  =  MMQ_Y_Q5_K_PASCAL;
+        nwarps = NWARPS_Q5_K_PASCAL;
+    } else {
+        GGML_ABORT("fatal error");
+    }
 
     const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
     const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
@@ -2704,11 +2849,26 @@ static void ggml_mul_mat_q6_K_q8_1_sycl(const void *vx, const void *vy,
         CHECK_TRY_ERROR(id = get_current_device_id()));
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
-    // Use Intel Xe2 tuning - must match the hardcoded values in mul_mat_q6_K kernel template
-    const int mmq_x  = MMQ_X_Q6_K_XE2;
-    const int mmq_y  = MMQ_Y_Q6_K_XE2;
-    const int nwarps = NWARPS_Q6_K_XE2;
-    (void)compute_capability; // Currently using fixed Xe2 tuning for all Intel GPUs
+    int mmq_x, mmq_y, nwarps;
+    if (compute_capability >= VER_GEN13) {
+        mmq_x  =  MMQ_X_Q6_K_RDNA2;
+        mmq_y  =  MMQ_Y_Q6_K_RDNA2;
+        nwarps = NWARPS_Q6_K_RDNA2;
+    } else if (compute_capability >= VER_GEN12) {
+        mmq_x  =  MMQ_X_Q6_K_RDNA1;
+        mmq_y  =  MMQ_Y_Q6_K_RDNA1;
+        nwarps = NWARPS_Q6_K_RDNA1;
+    } else if (compute_capability >= VER_GEN9) {
+        mmq_x  =  MMQ_X_Q6_K_AMPERE;
+        mmq_y  =  MMQ_Y_Q6_K_AMPERE;
+        nwarps = NWARPS_Q6_K_AMPERE;
+    } else if (compute_capability >= VER_4VEC) {
+        mmq_x  =  MMQ_X_Q6_K_PASCAL;
+        mmq_y  =  MMQ_Y_Q6_K_PASCAL;
+        nwarps = NWARPS_Q6_K_PASCAL;
+    } else {
+        GGML_ABORT("fatal error");
+    }
 
     const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
     const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
@@ -2825,11 +2985,9 @@ void ggml_sycl_op_mul_mat_q(
     const int64_t nrows_dst = device_id == ctx.device ? ne0 : row_diff;
 
     switch (src0->type) {
-        case GGML_TYPE_Q8_0:
-            // Q8_0 XMX kernel produces NaN - use standard dp4a path until fixed
-            ggml_mul_mat_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
+        case GGML_TYPE_Q4_0:
+            ggml_mul_mat_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
-
         case GGML_TYPE_Q4_1:
             ggml_mul_mat_q4_1_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
@@ -2839,16 +2997,16 @@ void ggml_sycl_op_mul_mat_q(
         case GGML_TYPE_Q5_1:
             ggml_mul_mat_q5_1_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
+        case GGML_TYPE_Q8_0:
+            ggml_mul_mat_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
+            break;
         case GGML_TYPE_Q2_K:
-            // K-quants have complex scale/min handling that doesn't map well to XMX
-            // dp4a with per-block scaling is more efficient for these formats
             ggml_mul_mat_q2_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
         case GGML_TYPE_Q3_K:
             ggml_mul_mat_q3_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
         case GGML_TYPE_Q4_K:
-            // Q4_K XMX kernel not yet implemented - use standard dp4a path
             ggml_mul_mat_q4_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;
         case GGML_TYPE_Q5_K:
@@ -2870,17 +3028,3 @@ catch (sycl::exception const &exc) {
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
 }
-
-// Note: XMX (cooperative matrix) acceleration for quantized matmul was evaluated but
-// the dp4a (int8 dot product) path is generally more efficient because:
-// 1. XMX requires dequantizing to bf16/fp16 which adds overhead
-// 2. For decode (batch=1), XMX tiles can't be filled efficiently
-// 3. K-quants have complex per-block scale/min that doesn't map well to GEMM
-//
-// XMX is used successfully in flash attention where inputs are already fp16/fp32.
-// For quantized weights, the dp4a path with per-block scaling remains optimal.
-//
-// Future consideration: XMX could help for very large prompt batches (ncols_y >= 64)
-// with simple quants (Q4_0/Q4_1) if dequantization is done efficiently in shared memory.
-
-

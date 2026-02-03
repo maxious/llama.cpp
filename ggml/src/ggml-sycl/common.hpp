@@ -78,22 +78,19 @@ extern int g_ggml_sycl_prioritize_dmmv;
 #define __SYCL_ARCH__ DPCT_COMPATIBILITY_TEMP
 #define VER_4VEC 610 // todo for hardward optimize.
 #define VER_GEN9 700 // todo for hardward optimize.
-#define VER_GEN12 1200 // todo for hardward optimize.
-#define VER_GEN13 1300 // todo for hardward optimize.
-#define VER_GEN20 2000 // Intel Xe2 (Battlemage)
+#define VER_GEN12 1000000 // todo for hardward optimize.
+#define VER_GEN13 (VER_GEN12 + 1030) // todo for hardward optimize.
 
 #define GGML_SYCL_MAX_NODES 8192 // TODO: adapt to hardwares
 
-// XMX (cooperative matrix) support for Intel GPUs
-// When defined, enables XMX-accelerated flash attention and limits MMQ batch size.
-// Flash attention XMX provides 3-4x speedup on Intel Arc B60/Battlemage.
-// MMQ uses dp4a (int8 dot product) which is optimal for quantized matmul.
-#if !defined(GGML_SYCL_FORCE_MMQ) && !defined(SYCL_USE_XMX)
+// define for XMX in Intel GPU
+// TODO: currently, it's not used for XMX really.
+#if !defined(GGML_SYCL_FORCE_MMQ)
     #define SYCL_USE_XMX
 #endif
 
 // max batch size to use MMQ kernels when tensor cores are available
-#define MMQ_MAX_BATCH_SIZE 512
+#define MMQ_MAX_BATCH_SIZE 32
 
 // dmmv = dequantize_mul_mat_vec
 #ifndef GGML_SYCL_DMMV_X
@@ -150,148 +147,10 @@ typedef float dfloat; // dequantize float
 typedef sycl::float2 dfloat2;
 #endif // GGML_SYCL_F16
 
-// BF16 type definitions and conversion utilities
-#ifdef GGML_SYCL_BF16
-// Use SYCL's bfloat16 type if available (Intel GPU with supporting runtime)
-typedef sycl::ext::oneapi::bfloat16 bfloat16;
-#else
-// Fallback: represent BF16 as uint16_t for storage
-typedef uint16_t bfloat16;
-#endif // GGML_SYCL_BF16
-
-// BF16 to FP32 conversion
-static __dpct_inline__ float bf16_to_fp32(bfloat16 x) {
-#ifdef GGML_SYCL_BF16
-    // Use implicit conversion from bfloat16 to float
-    return static_cast<float>(x);
-#else
-    // Software conversion: extract mantissa and exponent
-    uint32_t bits = static_cast<uint32_t>(x);
-    // BF16: 1 sign bit, 8 exponent bits, 7 mantissa bits
-    // FP32: 1 sign bit, 8 exponent bits, 23 mantissa bits
-    uint32_t sign = (bits >> 15) & 0x1;
-    uint32_t exp = (bits >> 7) & 0xFF;
-    uint32_t mantissa = bits & 0x7F;
-    
-    uint32_t fp32_bits = (sign << 31) | (exp << 23) | (mantissa << 16);
-    return *reinterpret_cast<float*>(&fp32_bits);
-#endif
-}
-
-// FP32 to BF16 conversion (round to nearest even)
-static __dpct_inline__ bfloat16 fp32_to_bf16(float x) {
-#ifdef GGML_SYCL_BF16
-    // Use implicit conversion from float to bfloat16
-    return bfloat16(x);
-#else
-    uint32_t bits = *reinterpret_cast<uint32_t*>(&x);
-    uint32_t sign = (bits >> 31) & 0x1;
-    uint32_t exp = (bits >> 23) & 0xFF;
-    uint32_t mantissa = bits & 0x7FFFFF;
-    
-    // Round mantissa to 7 bits (keep upper 16 bits of mantissa, check lower bits)
-    uint32_t mantissa_upper = mantissa >> 16;
-    uint32_t mantissa_lower = mantissa & 0xFFFF;
-    
-    // Round to nearest even
-    uint32_t round_up = (mantissa_lower > 0x8000) || 
-                        (mantissa_lower == 0x8000 && (mantissa_upper & 1));
-    
-    uint32_t bf16_mantissa = mantissa_upper + round_up;
-    
-    // Handle overflow to exponent
-    if (bf16_mantissa >= 0x80) {
-        bf16_mantissa = 0;
-        if (exp < 0xFF) exp++;
-    }
-    
-    uint16_t bf16_bits = static_cast<uint16_t>((sign << 15) | (exp << 7) | bf16_mantissa);
-    return static_cast<bfloat16>(bf16_bits);
-#endif
-}
-
-// Helper to convert FP16 to FP32
-static __dpct_inline__ float fp16_to_fp32(sycl::half x) {
-    return static_cast<float>(x);
-}
-
-// Helper to convert FP32 to FP16
-static __dpct_inline__ sycl::half fp32_to_fp16(float x) {
-    return static_cast<sycl::half>(x);
-}
-
-// Type traits for supported SYCL floating point types
-template<typename T>
-struct sycl_float_type {
-    static constexpr bool is_supported = false;
-};
-
-template<>
-struct sycl_float_type<float> {
-    static constexpr bool is_supported = true;
-    static constexpr ggml_type type_id = GGML_TYPE_F32;
-};
-
-#ifdef GGML_SYCL_F16
-template<>
-struct sycl_float_type<sycl::half> {
-    static constexpr bool is_supported = true;
-    static constexpr ggml_type type_id = GGML_TYPE_F16;
-};
-#endif
-
-#ifdef GGML_SYCL_BF16
-template<>
-struct sycl_float_type<bfloat16> {
-    static constexpr bool is_supported = true;
-    static constexpr ggml_type type_id = GGML_TYPE_BF16;
-};
-#endif
-
 #define MMVQ_MAX_BATCH_SIZE  8
-
-// Cache-line aligned device memory allocation (64 bytes for Intel GPUs)
-// Improves memory access patterns and reduces cache line splits
-constexpr size_t SYCL_DEVICE_MEM_ALIGNMENT = 64;
-
-inline void * ggml_sycl_aligned_malloc_device(size_t size, sycl::queue & q) {
-    return sycl::aligned_alloc_device(SYCL_DEVICE_MEM_ALIGNMENT, size, q);
-}
-
-inline void * ggml_sycl_aligned_malloc_device(size_t size, sycl::queue * q) {
-    return sycl::aligned_alloc_device(SYCL_DEVICE_MEM_ALIGNMENT, size, *q);
-}
-
-// Shared USM allocation - accessible from host and all devices
-// Runtime handles page migration automatically, avoiding explicit cross-device copies
-// Use for multi-GPU split tensors and KV cache
-inline void * ggml_sycl_aligned_malloc_shared(size_t size, sycl::queue & q) {
-    return sycl::aligned_alloc_shared(SYCL_DEVICE_MEM_ALIGNMENT, size, q);
-}
-
-inline void * ggml_sycl_aligned_malloc_shared(size_t size, sycl::queue * q) {
-    return sycl::aligned_alloc_shared(SYCL_DEVICE_MEM_ALIGNMENT, size, *q);
-}
-
-// Shared USM for multi-GPU - enabled by default
-// Runtime handles cross-device page migration automatically
-// Set GGML_SYCL_SHARED_USM=0 to disable and use host-mediated copies instead
-inline bool ggml_sycl_use_shared_usm() {
-    static int use_shared = -1;
-    if (use_shared < 0) {
-        const char* env = getenv("GGML_SYCL_SHARED_USM");
-        // Default ON; only disable if explicitly set to "0"
-        use_shared = (env != nullptr && strcmp(env, "0") == 0) ? 0 : 1;
-    }
-    return use_shared == 1;
-}
 
 static int g_all_sycl_device_count = -1;
 static bool g_ggml_backend_sycl_buffer_type_initialized = false;
-
-#ifdef GGML_SYCL_GRAPH
-static bool g_ggml_sycl_graph_recording = false;
-#endif
 
 static ggml_sycl_backend_gpu_mode g_ggml_sycl_backend_gpu_mode =
     SYCL_UNSET_GPU_MODE;
@@ -541,12 +400,6 @@ struct ggml_backend_sycl_context {
 
 #ifdef GGML_SYCL_GRAPH
     std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
-    bool graph_recording = false;
-    
-    // Graph signature for invalidation detection
-    uint64_t graph_signature = 0;
-    uint64_t last_n_tokens = 0;
-    uint64_t last_n_past = 0;
 #endif
 
     ggml_sycl_pool & host_pool(int device) {
@@ -557,46 +410,7 @@ struct ggml_backend_sycl_context {
     }
 
     ggml_sycl_pool & host_pool() { return host_pool(device); }
-
-    struct staging_buffer_pool {
-        char* buffer;
-        size_t size;
-        size_t max_size;
-        sycl::event last_event;
-        bool in_use;
-        
-        staging_buffer_pool() : buffer(nullptr), size(0), max_size(0), in_use(false) {}
-        
-        ~staging_buffer_pool() {
-            if (buffer) {
-                sycl::free(buffer, dpct::get_default_queue());
-            }
-        }
-        
-        void ensure_size(size_t required_size, sycl::queue& q) {
-            if (buffer == nullptr || required_size > max_size) {
-                if (buffer) {
-                    sycl::free(buffer, q);
-                }
-                max_size = required_size * 2; // Allocate 2x to reduce reallocations
-                buffer = sycl::malloc_host<char>(max_size, q);
-                if (!buffer) {
-                    throw std::runtime_error("Failed to allocate staging buffer");
-                }
-            }
-            size = required_size;
-        }
-    };
-    
-    staging_buffer_pool staging_pools[GGML_SYCL_MAX_DEVICES];
 };
-
-// P3: XPTI correlation helper for command group naming
-// Usage: SYCL_NAMED_KERNEL(stream, "kernel_name") << [=](sycl::nd_item<3> item) { ... };
-#define SYCL_NAMED_KERNEL(queue, name) \
-    queue->submit([&](sycl::handler &h) { \
-        h.set_name(name); \
-        h.parallel_for
 
 // common device functions
 

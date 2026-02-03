@@ -2,70 +2,6 @@
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/presets.hpp"
 
-// SLM-cached LayerNorm kernel for rows that fit in shared local memory
-// This avoids re-reading input data from global memory for the normalization pass
-template <int NCOLS>
-static void norm_f32_slm(const float* x, float* dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
-        const int64_t stride_sample, const float eps, const sycl::nd_item<3>& item_ct1, 
-        sycl::float2* s_sum, float* s_row, int block_size) {
-
-    const int nrows = item_ct1.get_group_range(2);
-    const int nchannels = item_ct1.get_group_range(1);
-
-    const int sample  = item_ct1.get_group(0);
-    const int channel = item_ct1.get_group(1);
-    const int row     = item_ct1.get_group(2);
-
-    const int tid = item_ct1.get_local_id(2);
-    const int nwarps = block_size / WARP_SIZE;
-
-    const auto strided_offset = calculate_offset<3>({stride_sample, stride_channel, stride_row}, {sample, channel, row});
-    const auto packed_offset = calculate_offset<3>({nchannels * nrows * ncols, nrows * ncols, ncols}, {sample, channel, row});
-
-    x += strided_offset;
-    dst += packed_offset;
-
-    sycl::float2 mean_var = sycl::float2(0.f, 0.f);
-
-    // First pass: load into SLM and compute sum and sum of squares
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col];
-        s_row[col] = xi;  // Cache in SLM
-        mean_var.x() += xi;
-        mean_var.y() += xi * xi;
-    }
-
-    // Warp-level reduction
-    mean_var = warp_reduce_sum(mean_var, item_ct1);
-    if (block_size > WARP_SIZE) {
-        const auto sub_group = item_ct1.get_sub_group();
-        const auto sg_id = sub_group.get_group_linear_id();
-        const auto wi_in_sg = sub_group.get_local_linear_id();
-        if (wi_in_sg == 0) {
-            s_sum[sg_id] = mean_var;
-        }
-        item_ct1.barrier(sycl::access::fence_space::local_space);
-        mean_var = 0.f;
-        const size_t nreduce = ceil_div(nwarps, WARP_SIZE);
-        for (size_t i = 0; i < nreduce; i += 1) {
-            mean_var += s_sum[wi_in_sg + i * WARP_SIZE];
-        }
-        mean_var = warp_reduce_sum(mean_var, item_ct1);
-    }
-
-    // Ensure all threads have finished writing to s_row before reading
-    item_ct1.barrier(sycl::access::fence_space::local_space);
-
-    const float mean = mean_var.x() / ncols;
-    const float var = mean_var.y() / ncols - mean * mean;
-    const float inv_std = sycl::rsqrt(var + eps);
-
-    // Second pass: read from SLM instead of global memory
-    for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = (s_row[col] - mean) * inv_std;
-    }
-}
-
 static void norm_f32(const float* x, float* dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
         const int64_t stride_sample, const float eps, const sycl::nd_item<3>& item_ct1, sycl::float2* s_sum, int block_size) {
 
@@ -209,69 +145,6 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
     }
 }
 
-// SLM-cached RMSNorm kernel for rows that fit in shared local memory
-// This avoids re-reading input data from global memory for the normalization pass
-template <int NCOLS>
-static void rms_norm_f32_slm(const float* x, float* dst, const int ncols,
-        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
-        const float eps, const sycl::nd_item<3>& item_ct1, float* s_sum, float* s_row, int block_size) {
-
-    const int nrows = item_ct1.get_group_range(2);
-    const int nchannels = item_ct1.get_group_range(1);
-
-    const int sample  = item_ct1.get_group(0);
-    const int channel = item_ct1.get_group(1);
-    const int row     = item_ct1.get_group(2);
-
-    const int tid = item_ct1.get_local_id(2);
-    const int nwarps = block_size / WARP_SIZE;
-
-    const auto strided_offset = calculate_offset<3>({stride_sample, stride_channel, stride_row}, {sample, channel, row});
-    const auto packed_offset = calculate_offset<3>({nchannels * nrows * ncols, nrows * ncols, ncols}, {sample, channel, row});
-
-    x   += strided_offset;
-    dst += packed_offset;
-
-    float tmp = 0.0f;
-
-    // First pass: load into SLM and compute sum of squares
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col];
-        s_row[col] = xi;  // Cache in SLM
-        tmp += xi * xi;
-    }
-
-    // Warp-level reduction
-    tmp = warp_reduce_sum(tmp, item_ct1);
-    if (block_size > WARP_SIZE) {
-        const auto sub_group = item_ct1.get_sub_group();
-        const auto sg_id = sub_group.get_group_linear_id();
-        const auto wi_in_sg = sub_group.get_local_linear_id();
-        if (wi_in_sg == 0) {
-            s_sum[sg_id] = tmp;
-        }
-
-        item_ct1.barrier(sycl::access::fence_space::local_space);
-        const size_t nreduce = ceil_div(nwarps, WARP_SIZE);
-        tmp = 0.f;
-        for (size_t i = 0; i < nreduce; i += 1) {
-            tmp += s_sum[wi_in_sg + i * WARP_SIZE];
-        }
-        tmp = warp_reduce_sum(tmp, item_ct1);
-    }
-
-    // Ensure all threads have finished writing to s_row before reading
-    item_ct1.barrier(sycl::access::fence_space::local_space);
-
-    const float mean = tmp / ncols;
-    const float scale = sycl::rsqrt(mean + eps);
-
-    // Second pass: read from SLM instead of global memory
-    for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = scale * s_row[col];
-    }
-}
-
 static void rms_norm_f32(const float* x, float* dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
         const int64_t stride_sample, const float eps, const sycl::nd_item<3>& item_ct1, float* s_sum, int block_size) {
 
@@ -378,32 +251,7 @@ static void norm_f32_sycl(const float * x, float * dst, const int ncols, const i
         const float eps, queue_ptr stream, int device) {
 
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
-
-    // Use SLM-cached kernel for rows that fit in shared local memory (up to 4096 floats = 16KB)
-    // This avoids re-reading input data from global memory
-    constexpr int SLM_CACHE_THRESHOLD = 4096;
-    
-    if (ncols <= SLM_CACHE_THRESHOLD && ncols >= 256) {
-        // Use larger work-group with SLM caching
-        const int work_group_size = std::min(ncols, 256);
-        const sycl::range<3> block_dims(1, 1, work_group_size);
-        
-        stream->submit([&](sycl::handler& cgh) {
-            // SLM for partial sums (one float2 per warp)
-            sycl::local_accessor<sycl::float2, 1> s_sum_acc(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
-            // SLM for caching the input row
-            sycl::local_accessor<float, 1> s_row_acc(sycl::range<1>(ncols), cgh);
-            
-            cgh.parallel_for(
-                sycl::nd_range<3>(global_dims * block_dims, block_dims),
-                [=](sycl::nd_item<3> item_ct1)
-                [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    norm_f32_slm<SLM_CACHE_THRESHOLD>(x, dst, ncols, stride_row, stride_channel, stride_sample,
-                        eps, item_ct1, get_pointer(s_sum_acc), get_pointer(s_row_acc), work_group_size);
-                });
-        });
-    }
-    else if (ncols < 1024) {
+    if (ncols < 1024) {
         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
         stream->submit([&](sycl::handler& cgh) {
             cgh.parallel_for(
@@ -488,32 +336,7 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
     // printf("%s ncols=%d, nrows=%d, WARP_SIZE=%d\n", __func__, ncols, nrows, WARP_SIZE);
 
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
-
-    // Use SLM-cached kernel for small rows (up to 4096 floats = 16KB fits comfortably in 64KB SLM)
-    // This avoids re-reading input data from global memory
-    constexpr int SLM_CACHE_THRESHOLD = 4096;
-
-    if (ncols <= SLM_CACHE_THRESHOLD && ncols >= 256) {
-        // Use larger work-group with SLM caching
-        const int work_group_size = std::min(ncols, 256);  // Up to 256 threads
-        const sycl::range<3> block_dims(1, 1, work_group_size);
-
-        stream->submit([&](sycl::handler& cgh) {
-            // SLM for partial sums (one per warp)
-            sycl::local_accessor<float, 1> s_sum_acc(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
-            // SLM for caching the input row
-            sycl::local_accessor<float, 1> s_row_acc(sycl::range<1>(ncols), cgh);
-
-            cgh.parallel_for(
-                sycl::nd_range<3>(global_dims * block_dims, block_dims),
-                [=](sycl::nd_item<3> item_ct1)
-                [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    rms_norm_f32_slm<SLM_CACHE_THRESHOLD>(x, dst, ncols, stride_row, stride_channel, stride_sample,
-                        eps, item_ct1, get_pointer(s_sum_acc), get_pointer(s_row_acc), work_group_size);
-                });
-        });
-    }
-    else if (ncols < 1024) {
+    if (ncols < 1024) {
         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
         stream->submit([&](sycl::handler& cgh) {
             cgh.parallel_for(
@@ -590,22 +413,14 @@ static void l2_norm_f32_sycl(const float* x, float* dst, const int ncols,
 void ggml_sycl_op_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
 
-    // Support F16, BF16, and F32
-    const bool is_f16 = (src0->type == GGML_TYPE_F16);
-    const bool is_bf16 = (src0->type == GGML_TYPE_BF16);
-    const bool is_f32 = (src0->type == GGML_TYPE_F32);
-
-#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
-    GGML_ASSERT(is_f32 || is_f16 || is_bf16);
-    GGML_ASSERT(dst->type == src0->type);
-#else
-    GGML_ASSERT(is_f32);
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
-#endif
 
     GGML_TENSOR_UNARY_OP_LOCALS
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
+    float *       dst_dd  = static_cast<float *>(dst->data);
 
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
@@ -616,134 +431,39 @@ void ggml_sycl_op_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
-    const size_t nbytes = ggml_nbytes(src0);
-    float * src0_f32 = nullptr;
-    float * dst_f32 = nullptr;
-    bool need_temp_buffers = false;
-
-    if (is_f16 || is_bf16) {
-        src0_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
-        dst_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
-        need_temp_buffers = true;
-
-        const int64_t n_elements = ggml_nelements(src0);
-        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
-            const int idx = it.get_id(0);
-            if (is_f16) {
-                const sycl::half * src = (const sycl::half *)src0->data;
-                src0_f32[idx] = static_cast<float>(src[idx]);
-            } else {
-                const bfloat16 * src = (const bfloat16 *)src0->data;
-                src0_f32[idx] = bf16_to_fp32(src[idx]);
-            }
-        });
-    }
-
-    const float * src_ptr = is_f32 ? (const float *)src0->data : src0_f32;
-    float * dst_ptr = is_f32 ? (float *)dst->data : dst_f32;
-
-    norm_f32_sycl(src_ptr, dst_ptr, ne00, ne01, ne02, ne03, s01, s02, s03, eps, main_stream, ctx.device);
-
-    if (need_temp_buffers) {
-        const int64_t n_elements = ggml_nelements(dst);
-        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
-            const int idx = it.get_id(0);
-            float val = dst_f32[idx];
-            if (is_f16) {
-                ((sycl::half *)dst->data)[idx] = static_cast<sycl::half>(val);
-            } else {
-                ((bfloat16 *)dst->data)[idx] = fp32_to_bf16(val);
-            }
-        });
-        sycl::free(src0_f32, *main_stream);
-        sycl::free(dst_f32, *main_stream);
-    }
+    norm_f32_sycl(src0_dd, dst_dd, ne00, ne01, ne02, ne03, s01, s02, s03, eps, main_stream, ctx.device);
 }
 
 void ggml_sycl_op_group_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
 
-    const ggml_tensor * src0 = dst->src[0];
-    const bool is_f16 = (src0->type == GGML_TYPE_F16);
-    const bool is_bf16 = (src0->type == GGML_TYPE_BF16);
-    const bool is_f32 = (src0->type == GGML_TYPE_F32);
-
-#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
-    GGML_ASSERT(is_f32 || is_f16 || is_bf16);
-    GGML_ASSERT(dst->type == src0->type);
-#else
-    GGML_ASSERT(is_f32);
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
-#endif
 
     int num_groups = dst->op_params[0];
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
 
+    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
+    float *       dst_dd  = static_cast<float *>(dst->data);
+
     float eps;
     memcpy(&eps, dst->op_params + 1, sizeof(float));
 
-    const size_t nbytes = ggml_nbytes(src0);
-    float * src0_f32 = nullptr;
-    float * dst_f32 = nullptr;
-    bool need_temp_buffers = false;
-
-    if (is_f16 || is_bf16) {
-        src0_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
-        dst_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
-        need_temp_buffers = true;
-
-        const int64_t n_elements = ggml_nelements(src0);
-        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
-            const int idx = it.get_id(0);
-            if (is_f16) {
-                const sycl::half * src = (const sycl::half *)src0->data;
-                src0_f32[idx] = static_cast<float>(src[idx]);
-            } else {
-                const bfloat16 * src = (const bfloat16 *)src0->data;
-                src0_f32[idx] = bf16_to_fp32(src[idx]);
-            }
-        });
-    }
-
-    const float * src_ptr = is_f32 ? (const float *)src0->data : src0_f32;
-    float * dst_ptr = is_f32 ? (float *)dst->data : dst_f32;
-
-    int group_size = src0->ne[0] * src0->ne[1] * ((src0->ne[2] + num_groups - 1) / num_groups);
-    group_norm_f32_sycl(src_ptr, dst_ptr, num_groups, eps, group_size, src0->ne[0] * src0->ne[1] * src0->ne[2], main_stream, ctx.device);
-
-    if (need_temp_buffers) {
-        const int64_t n_elements = ggml_nelements(dst);
-        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
-            const int idx = it.get_id(0);
-            float val = dst_f32[idx];
-            if (is_f16) {
-                ((sycl::half *)dst->data)[idx] = static_cast<sycl::half>(val);
-            } else {
-                ((bfloat16 *)dst->data)[idx] = fp32_to_bf16(val);
-            }
-        });
-        sycl::free(src0_f32, *main_stream);
-        sycl::free(dst_f32, *main_stream);
-    }
+    int group_size = dst->src[0]->ne[0] * dst->src[0]->ne[1] * ((dst->src[0]->ne[2] + num_groups - 1) / num_groups);
+    group_norm_f32_sycl(src0_dd, dst_dd, num_groups, eps, group_size, dst->src[0]->ne[0] * dst->src[0]->ne[1] * dst->src[0]->ne[2], main_stream, ctx.device);
 }
 
 void ggml_sycl_op_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
-    const bool is_f16 = (src0->type == GGML_TYPE_F16);
-    const bool is_bf16 = (src0->type == GGML_TYPE_BF16);
-    const bool is_f32 = (src0->type == GGML_TYPE_F32);
-
-#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
-    GGML_ASSERT(is_f32 || is_f16 || is_bf16);
-    GGML_ASSERT(dst->type == src0->type);
-#else
-    GGML_ASSERT(is_f32);
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
-#endif
 
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
+    float *       dst_dd  = static_cast<float *>(dst->data);
 
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
@@ -754,49 +474,7 @@ void ggml_sycl_op_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const int64_t s01 = nb01 / ts0;
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
-
-    const size_t nbytes = ggml_nbytes(src0);
-    float * src0_f32 = nullptr;
-    float * dst_f32 = nullptr;
-    bool need_temp_buffers = false;
-
-    if (is_f16 || is_bf16) {
-        src0_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
-        dst_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
-        need_temp_buffers = true;
-
-        const int64_t n_elements = ggml_nelements(src0);
-        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
-            const int idx = it.get_id(0);
-            if (is_f16) {
-                const sycl::half * src = (const sycl::half *)src0->data;
-                src0_f32[idx] = static_cast<float>(src[idx]);
-            } else {
-                const bfloat16 * src = (const bfloat16 *)src0->data;
-                src0_f32[idx] = bf16_to_fp32(src[idx]);
-            }
-        });
-    }
-
-    const float * src_ptr = is_f32 ? (const float *)src0->data : src0_f32;
-    float * dst_ptr = is_f32 ? (float *)dst->data : dst_f32;
-
-    rms_norm_f32_sycl(src_ptr, dst_ptr, ne00, ne01, ne02, ne03, s01, s02, s03, eps, main_stream, ctx.device);
-
-    if (need_temp_buffers) {
-        const int64_t n_elements = ggml_nelements(dst);
-        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
-            const int idx = it.get_id(0);
-            float val = dst_f32[idx];
-            if (is_f16) {
-                ((sycl::half *)dst->data)[idx] = static_cast<sycl::half>(val);
-            } else {
-                ((bfloat16 *)dst->data)[idx] = fp32_to_bf16(val);
-            }
-        });
-        sycl::free(src0_f32, *main_stream);
-        sycl::free(dst_f32, *main_stream);
-    }
+    rms_norm_f32_sycl(src0_dd, dst_dd, ne00, ne01, ne02, ne03, s01, s02, s03, eps, main_stream, ctx.device);
 }
 
 void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -957,69 +635,20 @@ void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * d
 
 void ggml_sycl_op_l2_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
 
-    const ggml_tensor * src0 = dst->src[0];
-    const bool is_f16 = (src0->type == GGML_TYPE_F16);
-    const bool is_bf16 = (src0->type == GGML_TYPE_BF16);
-    const bool is_f32 = (src0->type == GGML_TYPE_F32);
-
-#if defined(GGML_SYCL_F16) || defined(GGML_SYCL_BF16)
-    GGML_ASSERT(is_f32 || is_f16 || is_bf16);
-    GGML_ASSERT(dst->type == src0->type);
-#else
-    GGML_ASSERT(is_f32);
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
-#endif
 
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
 
-    const int64_t ne00 = src0->ne[0];
-    const int64_t nrows = ggml_nrows(src0);
+    const int64_t ne00 = dst->src[0]->ne[0];
+    const int64_t nrows = ggml_nrows(dst->src[0]);
+    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
+    float * dst_dd = static_cast<float *>(dst->data);
 
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
 
-    const size_t nbytes = ggml_nbytes(src0);
-    float * src0_f32 = nullptr;
-    float * dst_f32 = nullptr;
-    bool need_temp_buffers = false;
-
-    if (is_f16 || is_bf16) {
-        src0_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
-        dst_f32 = (float *)sycl::malloc_device(nbytes, *main_stream);
-        need_temp_buffers = true;
-
-        const int64_t n_elements = ggml_nelements(src0);
-        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
-            const int idx = it.get_id(0);
-            if (is_f16) {
-                const sycl::half * src = (const sycl::half *)src0->data;
-                src0_f32[idx] = static_cast<float>(src[idx]);
-            } else {
-                const bfloat16 * src = (const bfloat16 *)src0->data;
-                src0_f32[idx] = bf16_to_fp32(src[idx]);
-            }
-        });
-    }
-
-    const float * src_ptr = is_f32 ? (const float *)src0->data : src0_f32;
-    float * dst_ptr = is_f32 ? (float *)dst->data : dst_f32;
-
-    l2_norm_f32_sycl(src_ptr, dst_ptr, ne00, nrows, eps, main_stream, ctx.device);
-
-    if (need_temp_buffers) {
-        const int64_t n_elements = ggml_nelements(dst);
-        main_stream->parallel_for(sycl::range<1>(n_elements), [=](sycl::item<1> it) {
-            const int idx = it.get_id(0);
-            float val = dst_f32[idx];
-            if (is_f16) {
-                ((sycl::half *)dst->data)[idx] = static_cast<sycl::half>(val);
-            } else {
-                ((bfloat16 *)dst->data)[idx] = fp32_to_bf16(val);
-            }
-        });
-        sycl::free(src0_f32, *main_stream);
-        sycl::free(dst_f32, *main_stream);
-    }
+    l2_norm_f32_sycl(src0_dd, dst_dd, ne00, nrows, eps, main_stream, ctx.device);
 
 }

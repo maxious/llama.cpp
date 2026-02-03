@@ -1,3 +1,22 @@
+/***************************************************************************
+ *
+ *  Copyright (C) 2025 Codeplay Software Ltd.
+ *  Copyright (C) 2025 Intel Corporation
+ *
+ *  MIT License
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ *  quantize.hpp
+ *
+ *  Description:
+ *     Sycl backend specific quantization functions
+ **************************************************************************/
+
 #pragma once
 
 #include <sycl/nd_item.hpp>
@@ -34,52 +53,47 @@ __dpct_inline__ static void quantize_q8_1_impl(const float * __restrict__ x,
     }
 
     d = amax == 0 ? 0 : d;
-    // Clamp sum to avoid infinity in half
-    sum = sycl::fmax(-65504.0f, sycl::fmin(65504.0f, sum));
 }
 
+// No op to control codepath in ggml_sycl_op_mul_mat
 template <int ElementsPerWI> struct no_quantize_q8_1 {
-    void operator()(const float *, void *, int, int, int, const sycl::nd_item<1> &) const {}
+    void operator()(const float *, void *, int, int, const sycl::nd_item<1> &) const {}
 };
 
-template <int ElementsPerWI> struct quantize_q8_1_soa {
-    __dpct_inline__ void operator()(const float * __restrict__ x, void * q8_tensor, const int kx, const int ky,
+template <int ElementsPerWI> struct quantize_and_reorder_q8_1_soa {
+    __dpct_inline__ void operator()(const float * __restrict__ x, void * reordered_q8_tensor, const int kx,
                                     const int kx_padded, const sycl::nd_item<1> & it) const {
-        (void)kx_padded;  // Currently unused, kept for interface compatibility
+        /*
+        Quantizes and reorders the resultant q8 tensor in a per row fashion
+        Each sub-group calculates one quant block. i.e. QK8_1 quant values and the d and sum values
+    */
         auto subgroup_id = it.get_group(0);
         auto wi_id       = it.get_local_id(0);
-
-        const int num_blocks_per_row = kx / QK8_1;
-        auto      row                = subgroup_id / num_blocks_per_row;
-        auto      col                = subgroup_id % num_blocks_per_row;
 
         sycl::vec<int8_t, ElementsPerWI> quantized_values;
         float                            d   = 0.0f;
         float                            sum = 0.0f;
         quantize_q8_1_impl<ElementsPerWI>(x, quantized_values, d, sum, it);
 
-        const int total_blocks = ky * num_blocks_per_row;
-        sycl::half2 * ds_ptr = (sycl::half2 *) q8_tensor;
-        int8_t * qs_ptr = (int8_t *) (ds_ptr + total_blocks);
+        const int num_blocks_per_row = kx / QK8_1;
+        auto      row                = subgroup_id / num_blocks_per_row;
+        auto      col                = subgroup_id % num_blocks_per_row;
+        auto      row_offset         = row * (kx_padded / QK8_1) * sizeof(block_q8_1);
+        auto      col_offset         = QK8_1 * col + wi_id * ElementsPerWI;
 
+        auto quant_ptr = (int8_t *) ((char *) reordered_q8_tensor + row_offset + col_offset);
+        *reinterpret_cast<sycl::vec<int8_t, ElementsPerWI> *>(quant_ptr) = quantized_values;
+
+        auto ds_ptr = (sycl::half2 *) ((char *) reordered_q8_tensor + row_offset + kx + col * sizeof(sycl::half2));
         if (wi_id == 0) {
-            ds_ptr[subgroup_id] = sycl::half2(sycl::half(d), sycl::half(sum));
-        }
-
-        for (int i = 0; i < ElementsPerWI; i++) {
-            int k = col * QK8_1 + wi_id * ElementsPerWI + i;
-            int n = row;
-            int N = ky;
-            int vnni_idx = (k / 4) * N * 4 + n * 4 + (k % 4);
-            qs_ptr[vnni_idx] = quantized_values[i];
+            *ds_ptr = sycl::half2(sycl::half(d), sycl::half(sum));
         }
     }
 };
 
 template <int ElementsPerWI> struct quantize_q8_1 {
-    __dpct_inline__ void operator()(const float * __restrict__ x, void * q8_tensor, const int kx, const int ky,
-                                    const int kx_padded, const sycl::nd_item<1> & it) const {
-        (void)ky;  // Currently unused, kept for interface compatibility
+    __dpct_inline__ void operator()(const float * __restrict__ x, void * q8_tensor, const int kx, const int kx_padded,
+                                    const sycl::nd_item<1> & it) const {
         auto subgroup_id = it.get_group(0);
         auto wi_id       = it.get_local_id(0);
 
@@ -114,6 +128,6 @@ void quantize_row_q8_1_sycl(const float * x, void * vy, const int kx, const int 
 
     stream->parallel_for(sycl::nd_range<1>({ global_range }, { local_range }),
                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             quantize_f<QK8_1 / WARP_SIZE>()(x, vy, kx, ky, kx_padded, it);
+                             quantize_f<QK8_1 / WARP_SIZE>()(x, vy, kx, kx_padded, it);
                          });
 }

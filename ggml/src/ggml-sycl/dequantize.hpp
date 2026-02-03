@@ -200,7 +200,7 @@ static void dequantize_block_q4_0_reorder(const void * __restrict__ vx, dst_t * 
     auto k=nb32;
     // assume 32 threads
     const int64_t tid = item_ct1.get_local_id(2);
-    const int lane_ib = i * QK_WARP_SIZE + tid;
+    const int lane_ib = i * WARP_SIZE + tid;
 
     if (lane_ib >= k / QK4_0) {
         return;
@@ -208,9 +208,8 @@ static void dequantize_block_q4_0_reorder(const void * __restrict__ vx, dst_t * 
 
     dst_t * y_ptr = yy + lane_ib * QK4_0;
 
-    const int64_t nblocks = k / QK4_0;
     auto qs = (const uint8_t*)vx + lane_ib * QK4_0 / 2;
-    auto s_ptr = (const sycl::half*)((const uint8_t*)vx + nblocks * (QK4_0 / 2)) + lane_ib;
+    auto s_ptr = (const sycl::half*)((const uint8_t*)vx + k / 2) + lane_ib;
 
     const float d = float(*s_ptr);
 
