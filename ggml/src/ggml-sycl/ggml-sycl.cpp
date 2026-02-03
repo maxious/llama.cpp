@@ -4873,18 +4873,20 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
                 GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
                               ggml_op_name(node_op));
                 return false;
+            case GGML_OP_FLASH_ATTN_EXT:
+                // Flash attention creates dependencies that cannot be captured in SYCL graphs.
+                // Even with async_malloc, the operation has issues during graph recording.
+                // TODO: Investigate and fix graph compatibility for flash attention
+                GGML_LOG_INFO("%s: disabling SYCL graphs due to %s (not yet graph-compatible)\n",
+                              __func__, ggml_op_name(node_op));
+                return false;
             case GGML_OP_MUL_MAT:
-                // We cannot use graphs with ggml_sycl_mul_mat() when SYCL async memory allocation extensions are not available,
-                // as SYCL malloc / free and host wait calls are not supported when recording to a graph which are all present
-                // in reordering.
-                if (!g_ggml_sycl_use_async_mem_op) {
-                    GGML_LOG_INFO(
-                        "%s: disabling SYCL graphs due to unsupported node type when using a compiler without the "
-                        "oneAPI async memory allocation extension "
-                        "%s\n",
-                        __func__, ggml_op_name(node_op));
-                    return false;
-                }
+                // oneMKL GEMM operations create internal events that cannot be captured by SYCL graphs.
+                // This causes "Exception caught" errors during graph recording.
+                // TODO: Use a graph-compatible GEMM implementation for MUL_MAT when graphs are enabled.
+                GGML_LOG_INFO("%s: disabling SYCL graphs due to %s (oneMKL GEMM not graph-compatible)\n",
+                              __func__, ggml_op_name(node_op));
+                return false;
         }
     }
     return true;
