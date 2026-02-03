@@ -4368,15 +4368,23 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                 // ggml_sycl_mul_mat_id() does a blocking host wait on the sycl queue after
                 // submitting a memcpy operation (to read ids on host), which breaks graph recording.
                 // This host-side dependency on device data makes it incompatible with static graphs.
-                GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
-                              ggml_op_name(node_op));
+                //
+                // To fix: the expert ID tensor read needs to be done asynchronously or cached,
+                // so the kernel selection doesn't require a host-side wait during graph recording.
+                // See ggml_sycl_mul_mat_id() in this file.
+                GGML_LOG_INFO("%s: disabling SYCL graphs - MUL_MAT_ID (MoE) requires host-side expert ID read which blocks graph recording. "
+                              "Fix: implement async expert ID handling or pre-cache IDs before graph record.\n", __func__);
                 return graph_compat_t::DISABLED;
         case GGML_OP_SET_ROWS:
             // SET_ROWS uses USM memory and has implicit data dependencies that are not
             // automatically tracked by SYCL graphs, which can lead to out-of-order execution
             // and race conditions when combined with other kernels (e.g., ROPE + SET_ROWS).
-            // Disable graphs for any graph containing SET_ROWS to ensure correctness.
-            GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__, ggml_op_name(node_op));
+            //
+            // To fix: SET_ROWS kernel needs explicit SYCL event dependencies added, or the
+            // kernel needs to be rewritten to use SYCL accessors instead of USM pointers.
+            // See ggml-sycl/set_rows.cpp for the current implementation.
+            GGML_LOG_INFO("%s: disabling SYCL graphs - SET_ROWS has implicit USM dependencies incompatible with graph recording. "
+                          "Fix: add explicit event dependencies to set_rows kernel.\n", __func__);
             return graph_compat_t::DISABLED;
         case GGML_OP_MUL_MAT:
                 {
@@ -4423,10 +4431,21 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                     }
 
                     // oneMKL GEMM operations internally create events and call wait() which cannot
-                    // be used during SYCL graph recording. This is fundamental to oneMKL, not just
-                    // about async memory allocation.
-                    GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s (oneMKL fallback)\n", __func__,
-                                  ggml_op_name(node_op));
+                    // be used during SYCL graph recording. This is a fundamental limitation of oneMKL.
+                    //
+                    // To enable graphs for this MUL_MAT, one of these conditions must be met:
+                    // 1. Use quantized weights (Q4_K, Q8_0, etc.) with batch size 1 -> uses mul_mat_vec_q kernels
+                    // 2. Use F16 weights with specific tensor layouts (see conditions above)
+                    // 3. Implement a graph-compatible custom GEMM kernel (see ggml-sycl/gemm_tiled.hpp)
+                    //
+                    // Current tensor: src0=%s [%ldx%ld], src1=F32 [%ldx%ld], batch=%ld
+                    GGML_LOG_INFO("%s: disabling SYCL graphs - MUL_MAT requires oneMKL GEMM which is graph-incompatible. "
+                                  "src0 type=%s ne=[%ld,%ld], src1 ne=[%ld,%ld], nrows=%ld. "
+                                  "Fix: use quantized model (Q4_K/Q8_0) or implement graph-compatible GEMM.\n",
+                                  __func__, ggml_type_name(src0->type),
+                                  (long)src0->ne[0], (long)src0->ne[1],
+                                  (long)src1->ne[0], (long)src1->ne[1],
+                                  (long)src1->ne[1]);
                     return graph_compat_t::DISABLED;
                 }
         }
