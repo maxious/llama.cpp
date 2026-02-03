@@ -153,3 +153,4 @@ if (GGML_SYCL_DEVICE_ARCH)
     target_link_options(ggml-sycl PRIVATE -Xsycl-target-backend --offload-arch=${GGML_SYCL_DEVICE_ARCH})
 endif()
 
+target_include_directories(ggml-sycl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
