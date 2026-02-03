@@ -13,6 +13,46 @@
   - Fixed by adding MMQ_MIN_NROWS=128 guard in ggml-sycl.cpp to fall back to oneMKL when nrows is too small.
   - Test with: `./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q4_K"`
 
+## Multi-Device SYCL Graphs (Experimental)
+
+A proof-of-concept implementation for per-device SYCL graphs in multi-GPU setups.
+
+### How It Works
+
+1. **Detection**: When `device_count > 1` and split buffers are detected, the system uses `graph_compat_t::MULTI_DEVICE` mode
+2. **Node Partitioning**: cgraph nodes are partitioned by device:
+   - Nodes using split buffers → assigned to ALL devices (each handles its row range)
+   - Other nodes → assigned to the context's primary device
+3. **Per-Device Recording**: Each device gets its own `command_graph` recorded on its queue
+4. **Sequential Execution**: Graphs execute sequentially with `ext_oneapi_submit_barrier()` for inter-device sync
+
+### Testing Multi-Device Graphs
+
+```bash
+# Build with graph support (enabled by default)
+./build-sycl.sh
+
+# Run with multiple devices visible
+GGML_SYCL_DEBUG=1 ./build-sycl/bin/llama-completion \
+  --model model.gguf \
+  --split-mode layer --tensor-split 0.5,0.5 \
+  --prompt "Hello" -n 10
+
+# Look for "[SYCL-MULTI-GRAPH]" log messages
+```
+
+### Current Limitations
+
+- **Sequential execution**: Graphs run one device at a time (no overlap yet)
+- **No dependency analysis**: All split-buffer nodes are assigned to all devices
+- **Experimental**: May have edge cases with certain model architectures
+
+### Future Optimizations
+
+1. Analyze node dependencies to overlap independent graphs
+2. Smarter partitioning based on tensor→device mapping
+3. Persistent graph caching across iterations
+
 ## SYCL Performance Profiling
 
 ### Available Tools (in ~/pti-gpu/tools/)

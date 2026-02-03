@@ -4329,23 +4329,36 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 }
 
 #ifdef GGML_SYCL_GRAPH
-static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
-    if (ggml_sycl_info().device_count > 1) {
-        // A sycl_ex::command_graph object can only be created for a single device
-        GGML_LOG_INFO("%s: disabling SYCL graphs due to multiple devices\n", __func__);
-        return false;
-    }
 
+// Graph compatibility result
+enum class graph_compat_t {
+    DISABLED,        // Graphs cannot be used
+    SINGLE_DEVICE,   // Use single-device graph (original path)
+    MULTI_DEVICE     // Use per-device graphs (new path)
+};
+
+static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
     // Heuristic: Disable graphs for very large compute graphs to avoid driver hang/compile explosion.
     // The exact threshold may need tuning per device/driver.
     if (cgraph->n_nodes > 500) {
         GGML_LOG_INFO("%s: disabling SYCL graphs due to large graph size (%d nodes)\n", __func__, cgraph->n_nodes);
-        return false;
+        return graph_compat_t::DISABLED;
     }
+
+    bool has_split_buffers = false;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         const ggml_op node_op = node->op;
+
+        // Check for split buffers (multi-device)
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (node->src[s] && node->src[s]->buffer &&
+                ggml_backend_buffer_is_sycl_split(node->src[s]->buffer)) {
+                has_split_buffers = true;
+            }
+        }
+
         switch (node_op) {
             default:
                 break;
@@ -4357,14 +4370,14 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
                 // This host-side dependency on device data makes it incompatible with static graphs.
                 GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
                               ggml_op_name(node_op));
-                return false;
+                return graph_compat_t::DISABLED;
         case GGML_OP_SET_ROWS:
             // SET_ROWS uses USM memory and has implicit data dependencies that are not
             // automatically tracked by SYCL graphs, which can lead to out-of-order execution
             // and race conditions when combined with other kernels (e.g., ROPE + SET_ROWS).
             // Disable graphs for any graph containing SET_ROWS to ensure correctness.
             GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__, ggml_op_name(node_op));
-            return false;
+            return graph_compat_t::DISABLED;
         case GGML_OP_MUL_MAT:
                 {
                     ggml_tensor * src0 = node->src[0];
@@ -4375,7 +4388,7 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
                     static int max_ne = get_sycl_env("GGML_SYCL_GRAPH_MUL_MAT_MAX_NE", -1);
                     if (max_ne != -1 && ggml_nelements(dst) > max_ne) {
                         GGML_LOG_INFO("%s: disabling SYCL graphs due to MUL_MAT size %ld > %d\n", __func__, (long)ggml_nelements(dst), max_ne);
-                        return false;
+                        return graph_compat_t::DISABLED;
                     }
 
                     bool use_dequantize_mul_mat_vec = can_use_dequantize_mul_mat_vec(src0, src1, dst);
@@ -4390,7 +4403,7 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
                     if (!g_ggml_sycl_prioritize_dmmv && ((should_reorder_tensor(ctx, dst) && ggml_sycl_supports_reorder_mmvq(src0->type)))) {
                         GGML_LOG_INFO("%s: disabling SYCL graphs to perform tensor reordering (src0 type=%s)\n",
                                 __func__, ggml_type_name(src0->type));
-                        return false;
+                        return graph_compat_t::DISABLED;
                     }
 
                     const bool split = src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer);
@@ -4414,20 +4427,217 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
                     // about async memory allocation.
                     GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s (oneMKL fallback)\n", __func__,
                                   ggml_op_name(node_op));
-                    return false;
+                    return graph_compat_t::DISABLED;
                 }
         }
     }
-    return true;
+
+    // Determine single vs multi-device mode
+    if (ggml_sycl_info().device_count > 1 && has_split_buffers) {
+        // Multi-device with split buffers: use per-device graphs
+        GGML_LOG_INFO("%s: using multi-device SYCL graphs (%d devices)\n",
+                      __func__, ggml_sycl_info().device_count);
+        return graph_compat_t::MULTI_DEVICE;
+    } else if (ggml_sycl_info().device_count > 1) {
+        // Multi-device without split buffers: can still use single graph on primary device
+        // But be conservative for now
+        GGML_LOG_INFO("%s: multi-device detected but no split buffers, using single-device graph\n", __func__);
+        return graph_compat_t::SINGLE_DEVICE;
+    }
+
+    return graph_compat_t::SINGLE_DEVICE;
 }
-#endif
+
+// Check if a node involves split buffers (multi-device operation)
+static bool node_uses_split_buffer_mdg(const ggml_tensor * node) {
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (node->src[i] && node->src[i]->buffer) {
+            if (ggml_backend_buffer_is_sycl_split(node->src[i]->buffer)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Partition cgraph nodes by device
+// Returns map of device_id -> vector of node indices
+static std::map<int, std::vector<int>> partition_nodes_by_device(
+    ggml_backend_sycl_context & ctx,
+    ggml_cgraph * cgraph
+) {
+    std::map<int, std::vector<int>> partitions;
+    int device_count = ggml_sycl_info().device_count;
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+
+        if (node_uses_split_buffer_mdg(node)) {
+            // Split buffer nodes execute on ALL devices that have a portion
+            // The actual mul_mat split logic handles per-device row ranges
+            for (int d = 0; d < device_count; d++) {
+                partitions[d].push_back(i);
+            }
+        } else {
+            // Single-device node - assign to context's device
+            partitions[ctx.device].push_back(i);
+        }
+    }
+
+    return partitions;
+}
+
+// Record and execute per-device graphs for multi-GPU setups
+static ggml_status ggml_backend_sycl_multi_device_graph_compute(
+    ggml_backend_sycl_context & ctx,
+    ggml_cgraph * cgraph
+) {
+    int device_count = ggml_sycl_info().device_count;
+
+    GGML_LOG_INFO("[SYCL-MULTI-GRAPH] Starting multi-device graph compute (%d devices, %d nodes)\n",
+                  device_count, cgraph->n_nodes);
+
+    // Partition nodes by device
+    auto partitions = partition_nodes_by_device(ctx, cgraph);
+
+    // Log partition info
+    for (auto & [device_id, node_indices] : partitions) {
+        GGML_LOG_DEBUG("[SYCL-MULTI-GRAPH] Device %d: %zu nodes\n", device_id, node_indices.size());
+    }
+
+    // Phase 1: Wait for all queues to be idle before recording
+    for (int d = 0; d < device_count; d++) {
+        if (partitions.find(d) != partitions.end() && !partitions[d].empty()) {
+            ctx.stream(d, 0)->wait();
+        }
+    }
+
+    // Phase 2: Record and finalize graph for each device
+    std::map<int, sycl_ex::command_graph<sycl_ex::graph_state::modifiable>> modifiable_graphs;
+
+    for (auto & [device_id, node_indices] : partitions) {
+        if (node_indices.empty()) continue;
+
+        ggml_sycl_set_device(device_id);
+        queue_ptr stream = ctx.stream(device_id, 0);
+
+        // Check graph support on this device
+        if (!dpct::get_device(device_id).has(sycl::aspect::ext_oneapi_limited_graph)) {
+            GGML_LOG_WARN("[SYCL-MULTI-GRAPH] Device %d does not support graphs, falling back\n", device_id);
+            // Fall back to non-graph execution for this device's nodes
+            for (int node_idx : node_indices) {
+                ggml_tensor * node = cgraph->nodes[node_idx];
+                bool ok = ggml_sycl_compute_forward(ctx, node);
+                GGML_ASSERT(ok);
+            }
+            continue;
+        }
+
+        GGML_LOG_DEBUG("[SYCL-MULTI-GRAPH] Recording graph for device %d (%zu nodes)\n",
+                       device_id, node_indices.size());
+
+        // Create modifiable graph for this device
+        sycl_ex::command_graph device_graph(*stream,
+            {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
+
+        device_graph.begin_recording(*stream);
+
+        // Record nodes for this device
+        for (int node_idx : node_indices) {
+            ggml_tensor * node = cgraph->nodes[node_idx];
+            bool ok = ggml_sycl_compute_forward(ctx, node);
+            if (!ok) {
+                GGML_LOG_ERROR("[SYCL-MULTI-GRAPH] Failed to compute node %s\n", node->name);
+            }
+            GGML_ASSERT(ok);
+        }
+
+        device_graph.end_recording();
+        modifiable_graphs.emplace(device_id, std::move(device_graph));
+    }
+
+    // Phase 3: Finalize and cache executable graphs
+    for (auto & [device_id, mod_graph] : modifiable_graphs) {
+        ggml_sycl_set_device(device_id);
+
+        bool supports_update = dpct::get_device(device_id).has(sycl::aspect::ext_oneapi_graph);
+
+        auto & cached_graph = ctx.per_device_exec_graphs[device_id];
+
+        if (!cached_graph || !supports_update) {
+            auto exec = supports_update ?
+                mod_graph.finalize(sycl_ex::property::graph::updatable{}) :
+                mod_graph.finalize();
+            cached_graph = std::make_unique<
+                sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec));
+            GGML_LOG_DEBUG("[SYCL-MULTI-GRAPH] Finalized new graph for device %d\n", device_id);
+        } else {
+            try {
+                cached_graph->update(mod_graph);
+                GGML_LOG_DEBUG("[SYCL-MULTI-GRAPH] Updated existing graph for device %d\n", device_id);
+            } catch (sycl::exception const & e) {
+                GGML_LOG_DEBUG("[SYCL-MULTI-GRAPH] Graph update failed on device %d: %s, re-finalizing\n",
+                               device_id, e.what());
+                auto exec = mod_graph.finalize({sycl_ex::property::graph::updatable{}});
+                cached_graph = std::make_unique<
+                    sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec));
+            }
+        }
+    }
+
+    // Phase 4: Execute graphs with inter-device synchronization
+    // Execute sequentially with barriers to ensure correct ordering.
+    // Future optimization: analyze dependencies and overlap where possible.
+
+    std::vector<sycl::event> prev_events;
+
+    for (auto & [device_id, cached_graph] : ctx.per_device_exec_graphs) {
+        if (!cached_graph) continue;
+
+        ggml_sycl_set_device(device_id);
+        queue_ptr stream = ctx.stream(device_id, 0);
+
+        // Wait for previous device(s) to complete
+        if (!prev_events.empty()) {
+            stream->ext_oneapi_submit_barrier(prev_events);
+        }
+
+        // Execute this device's graph
+        stream->ext_oneapi_graph(*cached_graph);
+
+        // Record completion event for next device
+        sycl::event completion = stream->ext_oneapi_submit_barrier();
+        prev_events.clear();
+        prev_events.push_back(completion);
+
+        GGML_LOG_DEBUG("[SYCL-MULTI-GRAPH] Executed graph on device %d\n", device_id);
+    }
+
+    ctx.multi_device_graphs_initialized = true;
+
+    GGML_LOG_INFO("[SYCL-MULTI-GRAPH] Multi-device graph execution complete\n");
+
+    return GGML_STATUS_SUCCESS;
+}
+
+#endif // GGML_SYCL_GRAPH
 
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
 
  #ifdef GGML_SYCL_GRAPH
-    bool use_sycl_graph = !g_ggml_sycl_disable_graph && check_graph_compatibility(*sycl_ctx, cgraph);
-    if (use_sycl_graph) {
+    graph_compat_t graph_mode = g_ggml_sycl_disable_graph ?
+        graph_compat_t::DISABLED : check_graph_compatibility(*sycl_ctx, cgraph);
+
+    if (graph_mode == graph_compat_t::MULTI_DEVICE) {
+        // ===== MULTI-DEVICE GRAPH PATH =====
+        // Use per-device graphs for multi-GPU with split buffers
+        GGML_SYCL_DEBUG("[SYCL-MULTI-GRAPH] Starting multi-device graph compute (n_nodes=%d)\n", cgraph->n_nodes);
+
+        return ggml_backend_sycl_multi_device_graph_compute(*sycl_ctx, cgraph);
+
+    } else if (graph_mode == graph_compat_t::SINGLE_DEVICE) {
+        // ===== SINGLE-DEVICE GRAPH PATH (original) =====
         GGML_SYCL_DEBUG("[SYCL-GRAPH] Starting graph compute (n_nodes=%d)\n", cgraph->n_nodes);
         struct timeval tv_start, tv_end;
         gettimeofday(&tv_start, NULL);
@@ -4499,7 +4709,9 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         GGML_SYCL_DEBUG("[SYCL-GRAPH] ext_oneapi_graph took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
         gettimeofday(&tv_start, NULL);
 
-    } else
+        return GGML_STATUS_SUCCESS;
+    }
+    // graph_mode == DISABLED falls through to non-graph path
 #endif
     {
         ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);

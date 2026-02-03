@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <string>
 
 #include "dpct/helper.hpp"
@@ -400,6 +401,10 @@ struct ggml_backend_sycl_context {
 
 #ifdef GGML_SYCL_GRAPH
     std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
+
+    // Multi-device graph support: one executable graph per device
+    std::map<int, std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>> per_device_exec_graphs;
+    bool multi_device_graphs_initialized = false;
 #endif
 
     ggml_sycl_pool & host_pool(int device) {
