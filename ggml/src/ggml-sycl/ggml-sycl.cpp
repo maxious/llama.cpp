@@ -4354,17 +4354,12 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
                               ggml_op_name(node_op));
                 return false;
             case GGML_OP_MUL_MAT:
-                // We cannot use graphs with ggml_sycl_mul_mat() when SYCL async memory allocation extensions are not available,
-                // as SYCL malloc / free and host wait calls are not supported when recording to a graph which are all present
-                // in reordering.
-                if (!g_ggml_sycl_use_async_mem_op) {
-                    GGML_LOG_INFO(
-                        "%s: disabling SYCL graphs due to unsupported node type when using a compiler without the "
-                        "oneAPI async memory allocation extension "
-                        "%s\n",
-                        __func__, ggml_op_name(node_op));
-                    return false;
-                }
+                // oneMKL GEMM operations internally create events and call wait() which cannot
+                // be used during SYCL graph recording. This is fundamental to oneMKL, not just
+                // about async memory allocation.
+                GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
+                              ggml_op_name(node_op));
+                return false;
         }
     }
     return true;
