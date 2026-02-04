@@ -50,7 +50,7 @@ constexpr int XMX_WG_SIZE = XMX_NUM_SG * XMX_SG_SIZE;  // 256
 constexpr int XMX_A_STRIDE = XMX_BK + 4;  // Padding for bank conflicts
 constexpr int XMX_B_STRIDE = XMX_BN + 4;  // Padding for B (stored row-major after transpose)
 
-template <bool transpose_B = true>
+template <bool transpose_A = false, bool transpose_B = true>
 inline void gemm_xmx_kernel(
     sycl::nd_item<1> it,
     const float * __restrict__ A,
@@ -103,8 +103,15 @@ inline void gemm_xmx_kernel(
             const int global_k = k_base + tile_k;
             
             float val = 0.0f;
-            if (global_m < M && global_k < K) {
-                val = A[global_m * lda + global_k];
+            if constexpr (transpose_A) {
+                // A is [K, M] row-major. We want A[m, k].
+                if (global_m < M && global_k < K) {
+                    val = A[global_k * lda + global_m];
+                }
+            } else {
+                if (global_m < M && global_k < K) {
+                    val = A[global_m * lda + global_k];
+                }
             }
             shA[tile_m * XMX_A_STRIDE + tile_k] = xmx_bfloat16(val);
         }
@@ -193,7 +200,7 @@ inline void gemm_xmx_kernel(
     }
 }
 
-template <bool transpose_B = true>
+template <bool transpose_A = false, bool transpose_B = true>
 inline void launch_gemm_xmx(
     sycl::queue * stream,
     const float * A, const float * B, float * C,
@@ -220,7 +227,7 @@ inline void launch_gemm_xmx(
         
         cgh.parallel_for(sycl::nd_range<1>(global, local), [=](sycl::nd_item<1> it) 
             [[sycl::reqd_sub_group_size(XMX_SG_SIZE)]] {
-            gemm_xmx_kernel<transpose_B>(
+            gemm_xmx_kernel<transpose_A, transpose_B>(
                 it, A, B, C,
                 M, N, K,
                 alpha, beta,
@@ -247,7 +254,7 @@ inline bool xmx_gemm_available([[maybe_unused]] sycl::queue * stream) {
 // A[M,K] and B[N,K] are sycl::half, C[M,N] is float
 // ============================================================================
 
-template <bool transpose_B = true>
+template <bool transpose_A = false, bool transpose_B = true>
 inline void gemm_xmx_f16_kernel(
     sycl::nd_item<1> it,
     const sycl::half * __restrict__ A,
@@ -298,8 +305,14 @@ inline void gemm_xmx_f16_kernel(
             const int global_k = k_base + tile_k;
             
             sycl::half val = sycl::half(0.0f);
-            if (global_m < M && global_k < K) {
-                val = A[global_m * lda + global_k];
+            if constexpr (transpose_A) {
+                if (global_m < M && global_k < K) {
+                    val = A[global_k * lda + global_m];
+                }
+            } else {
+                if (global_m < M && global_k < K) {
+                    val = A[global_m * lda + global_k];
+                }
             }
             shA[tile_m * XMX_A_STRIDE + tile_k] = val;
         }
@@ -380,7 +393,7 @@ inline void gemm_xmx_f16_kernel(
 }
 
 // Launch F16 XMX GEMM: A and B are sycl::half, C is float
-template <bool transpose_B = true>
+template <bool transpose_A = false, bool transpose_B = true>
 inline void launch_gemm_xmx_f16(
     sycl::queue * stream,
     const sycl::half * A, const sycl::half * B, float * C,
@@ -406,7 +419,7 @@ inline void launch_gemm_xmx_f16(
         
         cgh.parallel_for(sycl::nd_range<1>(global, local), [=](sycl::nd_item<1> it) 
             [[sycl::reqd_sub_group_size(XMX_SG_SIZE)]] {
-            gemm_xmx_f16_kernel<transpose_B>(
+            gemm_xmx_f16_kernel<transpose_A, transpose_B>(
                 it, A, B, C,
                 M, N, K,
                 alpha, beta,
@@ -424,7 +437,7 @@ inline void launch_gemm_xmx_f16(
 // All tensors are sycl::half. Useful when output doesn't need F32 precision.
 // ============================================================================
 
-template <bool transpose_B = true>
+template <bool transpose_A = false, bool transpose_B = true>
 inline void gemm_xmx_f16_f16_kernel(
     sycl::nd_item<1> it,
     const sycl::half * __restrict__ A,
@@ -471,8 +484,14 @@ inline void gemm_xmx_f16_f16_kernel(
             const int global_k = k_base + tile_k;
             
             sycl::half val = sycl::half(0.0f);
-            if (global_m < M && global_k < K) {
-                val = A[global_m * lda + global_k];
+            if constexpr (transpose_A) {
+                if (global_m < M && global_k < K) {
+                    val = A[global_k * lda + global_m];
+                }
+            } else {
+                if (global_m < M && global_k < K) {
+                    val = A[global_m * lda + global_k];
+                }
             }
             shA[tile_m * XMX_A_STRIDE + tile_k] = val;
         }
@@ -551,7 +570,7 @@ inline void gemm_xmx_f16_f16_kernel(
 }
 
 // Launch F16->F16 XMX GEMM
-template <bool transpose_B = true>
+template <bool transpose_A = false, bool transpose_B = true>
 inline void launch_gemm_xmx_f16_f16(
     sycl::queue * stream,
     const sycl::half * A, const sycl::half * B, sycl::half * C,
@@ -577,7 +596,7 @@ inline void launch_gemm_xmx_f16_f16(
         
         cgh.parallel_for(sycl::nd_range<1>(global, local), [=](sycl::nd_item<1> it) 
             [[sycl::reqd_sub_group_size(XMX_SG_SIZE)]] {
-            gemm_xmx_f16_f16_kernel<transpose_B>(
+            gemm_xmx_f16_f16_kernel<transpose_A, transpose_B>(
                 it, A, B, C,
                 M, N, K,
                 alpha, beta,
@@ -593,7 +612,7 @@ inline void launch_gemm_xmx_f16_f16(
 #else // !SYCL_EXT_ONEAPI_MATRIX
 
 // Stub when XMX not available
-template <bool transpose_B = true>
+template <bool transpose_A = false, bool transpose_B = true>
 inline void launch_gemm_xmx(
     sycl::queue * stream,
     const float * A, const float * B, float * C,
@@ -612,7 +631,7 @@ inline bool xmx_gemm_available(sycl::queue *) {
     return false;
 }
 
-template <bool transpose_B = true>
+template <bool transpose_A = false, bool transpose_B = true>
 inline void launch_gemm_xmx_f16(
     sycl::queue * stream,
     const sycl::half * A, const sycl::half * B, float * C,
@@ -626,7 +645,7 @@ inline void launch_gemm_xmx_f16(
     (void)lda; (void)ldb; (void)ldc;
 }
 
-template <bool transpose_B = true>
+template <bool transpose_A = false, bool transpose_B = true>
 inline void launch_gemm_xmx_f16_f16(
     sycl::queue * stream,
     const sycl::half * A, const sycl::half * B, sycl::half * C,

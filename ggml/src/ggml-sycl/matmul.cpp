@@ -49,6 +49,7 @@
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/gemm_tiled.hpp"
 #include "ggml-sycl/gemm_f16_f32_tiled.hpp"
+#include "ggml-sycl/gemm_xmx.hpp"
 #include "ggml-sycl/set_rows.hpp"
 #include "ggml-sycl/set.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
@@ -1037,6 +1038,44 @@ bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, g
 
 
 
+// Wrapper for XMX GEMM to match ggml_sycl_op_mul_mat_t signature
+static void ggml_sycl_op_mul_mat_xmx(
+    ggml_backend_sycl_context & ctx,
+    const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
+    const char *src0_dd_i, const float *src1_ddf_i, const char *src1_ddq_i,
+    float *dst_dd_i, const int64_t row_low, const int64_t row_high,
+    const int64_t src1_ncols, const int64_t src1_padded_row_size,
+    const queue_ptr &stream) {
+
+    const int64_t M = row_high - row_low;
+    const int64_t N = src1_ncols;
+    const int64_t K = src0->ne[0];
+
+    int id = get_current_device_id();
+    // dst is N x M (row-major), ne0=M (inner dim), ne1=N (outer dim)
+    const int64_t ldc = dst->ne[0]; 
+
+    // Compute C^T = src1 * src0^T (N x M)
+    // src1 is N x K (row-major). A param. lda = K.
+    // src0 is M x K (row-major). B param. ldb = K.
+    // gemm_xmx computes A * B^T.
+    // So A=src1, B=src0. 
+    
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        launch_gemm_xmx(stream, (const float*)src1_ddf_i, (const float*)src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc);
+    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
+        launch_gemm_xmx_f16(stream, (const sycl::half*)src1_ddf_i, (const sycl::half*)src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc);
+    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
+        launch_gemm_xmx_f16_f16(stream, (const sycl::half*)src1_ddf_i, (const sycl::half*)src0_dd_i, (sycl::half*)dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc);
+    } else {
+        // Fallback to oneMKL for unsupported types (mixed, etc.)
+        // Note: This fallback is NOT graph-compatible. 
+        // If graph recording is active, this will crash or produce invalid graph.
+        // We rely on backend.cpp to disable graphs for unsupported types if we don't handle them here.
+        ggml_sycl_op_mul_mat_sycl(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low, row_high, src1_ncols, src1_padded_row_size, stream);
+    }
+}
+
 void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
     const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
@@ -1118,7 +1157,11 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0
     } else if (use_mul_mat_q) {
         ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
     } else {
-        ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);
+        if (xmx_gemm_available(ctx.stream())) {
+            ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_xmx);
+        } else {
+            ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);
+        }
     }
 }
 

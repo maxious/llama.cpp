@@ -48,6 +48,7 @@
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/gemm_tiled.hpp"
+#include "ggml-sycl/gemm_xmx.hpp"
 #include "ggml-sycl/gemm_f16_f32_tiled.hpp"
 #include "ggml-sycl/set_rows.hpp"
 #include "ggml-sycl/set.hpp"
@@ -632,6 +633,22 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                     if (use_dequantize_mul_mat_vec || use_mul_mat_vec_q || use_mul_mat_q) {
                         break;
                     }
+
+#ifdef SYCL_EXT_ONEAPI_MATRIX
+                    // Check if XMX is available and types are supported
+                    if (xmx_gemm_available(ctx.stream())) {
+                        bool xmx_supported = false;
+                        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+                            xmx_supported = true;
+                        } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16)) {
+                            xmx_supported = true;
+                        }
+                        
+                        if (xmx_supported) {
+                            break; // Compatible
+                        }
+                    }
+#endif
 
                     // Note: oneDNN Graph API (DnnlGraphWrapper) is NOT compatible with SYCL command graphs
                     // because oneDNN Graph's cp.execute() creates internal SYCL events that break graph recording.
