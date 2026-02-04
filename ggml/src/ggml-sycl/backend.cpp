@@ -593,6 +593,16 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
             GGML_LOG_INFO("%s: disabling SYCL graphs - SET_ROWS has implicit USM dependencies incompatible with graph recording. "
                           "Fix: add explicit event dependencies to set_rows kernel.\n", __func__);
             return graph_compat_t::DISABLED;
+        case GGML_OP_OUT_PROD:
+            // OUT_PROD uses oneMKL GEMM which creates internal SYCL events that are incompatible
+            // with graph recording. The oneMKL gemm() call internally creates events and may call
+            // wait(), which causes "wait method cannot be used for an event associated with a
+            // command graph" errors.
+            //
+            // To fix: implement a graph-compatible custom outer product kernel that doesn't use oneMKL.
+            GGML_LOG_INFO("%s: disabling SYCL graphs - OUT_PROD uses oneMKL GEMM which is graph-incompatible. "
+                          "Fix: implement custom graph-compatible outer product kernel.\n", __func__);
+            return graph_compat_t::DISABLED;
         case GGML_OP_MUL_MAT:
                 {
                     ggml_tensor * src0 = node->src[0];
