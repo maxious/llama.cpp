@@ -1128,7 +1128,7 @@ static void ggml_sycl_op_mul_mat_tiled(
 
         launch_gemm_f16_f32_tiled(stream, src1_f16, src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, true);
     } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
-        launch_gemm_bf16_f32_tiled(stream, src1_ddf_i, src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, true);
+        launch_gemm_bf16_f32_tiled(stream, src1_ddf_i, src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, false);
     } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         // Convert src1 (F32) to BF16 temporary
         ggml_sycl_pool_alloc<sycl::ext::oneapi::bfloat16> src1_bf16_alloc(ctx.pool(), N * K);
@@ -1140,7 +1140,7 @@ static void ggml_sycl_op_mul_mat_tiled(
             });
         });
 
-        launch_gemm_bf16_f32_tiled(stream, src1_bf16, src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, true);
+        launch_gemm_bf16_f32_tiled(stream, src1_bf16, src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, false);
     } else if (src0->type == GGML_TYPE_MXFP4 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         // MXFP4 graph support: use fused dequantization kernel
         
@@ -1155,7 +1155,7 @@ static void ggml_sycl_op_mul_mat_tiled(
         });
 
         // Use fused kernel
-        launch_gemm_mxfp4_f32_tiled(stream, src0_dd_i, src1_f16, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, true);
+        launch_gemm_mxfp4_f32_tiled(stream, src0_dd_i, src1_f16, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, false);
     } else {
         // Fallback for unsupported types
         ggml_sycl_op_mul_mat_sycl(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low, row_high, src1_ncols, src1_padded_row_size, stream);

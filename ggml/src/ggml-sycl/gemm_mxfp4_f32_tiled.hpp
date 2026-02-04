@@ -98,10 +98,14 @@ inline void gemm_mxfp4_f32_tiled_kernel(
                     const float d = ggml_sycl_e8m0_to_fp32(b.e);
                     
                     // Get quantized value (4-bit)
-                    // qs is uint8 array of size 16. Each holds 2 values.
+                    // MXFP4 layout: qs[j] contains elements j (low nibble) and j+16 (high nibble)
                     // elem_k is 0..31
-                    const uint8_t q_byte = b.qs[elem_k / 2];
-                    const uint8_t q4 = (elem_k % 2 == 0) ? (q_byte & 0x0F) : (q_byte >> 4);
+                    uint8_t q4;
+                    if (elem_k < 16) {
+                        q4 = b.qs[elem_k] & 0x0F;
+                    } else {
+                        q4 = b.qs[elem_k - 16] >> 4;
+                    }
                     
                     // Lookup value
                     val = d * kvalues_mxfp4[q4] * 0.5f;
