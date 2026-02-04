@@ -360,7 +360,7 @@ void ggml_mul_mat_p021_f16_f32_sycl(const void *vx, const float *y,
                                            const int nrows_x,
                                            const int nchannels_x,
                                            const int nchannels_y,
-                                           queue_ptr stream) {
+                                           const dpct::queue_ptr &stream) {
 
     const sycl::range<3> block_nums(nchannels_y, nrows_x, 1);
     const sycl::range<3> block_dims(1, 1, WARP_SIZE);
@@ -380,7 +380,7 @@ void ggml_mul_mat_p021_f16_f32_sycl(const void *vx, const float *y,
 void ggml_mul_mat_vec_nc_f16_f32_sycl(
     const void *vx, const float *y, float *dst, const int ncols_x,
     const int nrows_x, const int row_stride_x, const int nchannels_x,
-    const int nchannels_y, const int channel_stride_x, const int channel_stride_y, queue_ptr stream) {
+    const int nchannels_y, const int channel_stride_x, const int channel_stride_y, const dpct::queue_ptr &stream) {
 
     const sycl::range<3> block_nums(nchannels_y, nrows_x, 1);
     const sycl::range<3> block_dims(1, 1, WARP_SIZE);
@@ -1159,7 +1159,6 @@ void ggml_sycl_set_peer_access(const int n_tokens, int main_device) {
     peer_access_enabled = enable_peer_access;
 }
 
-template <template <int> typename quantize_f>
 void ggml_sycl_scale(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
     ggml_sycl_op_scale(ctx, dst);

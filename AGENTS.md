@@ -41,6 +41,21 @@ GGML_SYCL_DEBUG=1 ./build-sycl/bin/llama-completion \
 # Look for "[SYCL-MULTI-GRAPH]" log messages
 ```
 
+### Testing XMX GEMM with SYCL Graphs
+
+```bash
+# Build standalone XMX flash attention + graph test
+icpx -fsycl -O3 -DSYCL_EXT_ONEAPI_MATRIX -DSYCL_EXT_ONEAPI_GRAPH -I. \
+  tests/test-fattn-xmx-graph.cpp -o test-fattn-xmx-graph
+
+# Run the test
+./test-fattn-xmx-graph
+
+# Expected output shows:
+# - All tests PASSED with NMSE < 1e-7
+# - Graph speedup of ~5-11% for small workloads
+```
+
 ### Current Limitations
 
 - **Sequential execution**: Graphs run one device at a time (no overlap yet)
