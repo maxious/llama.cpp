@@ -196,7 +196,8 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
                                                      /*num_src=*/2, " : converting src1 to Q8_1");
                 try {
-                    quantize_row_q8_1_sycl<quantize_f>(dev[i].src1_ddf, dev[i].src1_ddq, ne10, nrows1, src1_padded_col_size, stream);
+                    // Correct argument order: kx = row length (ne11 = nrows1), ky = number of rows (ne10)
+                    quantize_row_q8_1_sycl<quantize_f>(dev[i].src1_ddf, dev[i].src1_ddq, nrows1, ne10, src1_padded_col_size, stream);
                 } catch (sycl::exception const &exc) {
                     std::cerr << "Quantize_row_q8_1_sycl error" << exc.what() << "Exception caught at file:" << __FILE__
                               << ", line:" << __LINE__ << std::endl;
@@ -213,10 +214,17 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         }
     }
 
+    GGML_SYCL_DEBUG("[SYCL][MUL_MAT] split=%d, device_count=%d, used_devices=%d, ne11=%ld, is_max=%d, MUL_MAT_SRC1_COL_STRIDE=%d\n",
+        split, ggml_sycl_info().device_count, used_devices, ne11,
+        (int)((ne11 + MUL_MAT_SRC1_COL_STRIDE - 1) / MUL_MAT_SRC1_COL_STRIDE), (int)MUL_MAT_SRC1_COL_STRIDE);
+
     // if multiple devices are used they need to wait for the main device
     // here an event is recorded that signals that the main device has finished calculating the input data
     if (split && used_devices > 1) {
         ggml_sycl_set_device(ctx.device);
+        GGML_SYCL_DEBUG("[SYCL][MUL_MAT] Recording MAIN device event: dev=%d, events[%d][0]=%p, ne11=%ld, is_max=%d\n",
+            ctx.device, ctx.device, (void*)(src0_extra->events[ctx.device][0]), ne11,
+            (int)((ne11 + MUL_MAT_SRC1_COL_STRIDE - 1) / MUL_MAT_SRC1_COL_STRIDE));
         SYCL_CHECK(CHECK_TRY_ERROR(
             *src0_extra->events[ctx.device][0] =
                 ctx.stream()->ext_oneapi_submit_barrier()));
@@ -240,6 +248,8 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
 
             // wait for main GPU data if necessary
             if (split && (i != ctx.device || is != 0)) {
+                GGML_SYCL_DEBUG("[SYCL][MUL_MAT]DEVICE %d (stream %d) WAITING on main event dev=%d events[%d][0]=%p\n",
+                    i, (int)is, ctx.device, ctx.device, (void*)(src0_extra->events[ctx.device][0]));
                 SYCL_CHECK(CHECK_TRY_ERROR(stream->ext_oneapi_submit_barrier(
                     {*src0_extra->events[ctx.device][0]})));
             }
@@ -352,6 +362,8 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
 
                 // add event for the main device to wait on until other device is done
                 if (split && (i != ctx.device || is != 0)) {
+                    GGML_SYCL_DEBUG("[SYCL][MUL_MAT]DEVICE %d (stream %d) RECORDING completion event at events[%d][%d]=%p\n",
+                        i, (int)is, i, is, (void*)(src0_extra->events[i][is]));
                     SYCL_CHECK(CHECK_TRY_ERROR(
                         *src0_extra->events[i][is] =
                             stream->ext_oneapi_submit_barrier()));
@@ -365,17 +377,24 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         int64_t is_max = (ne11 + MUL_MAT_SRC1_COL_STRIDE - 1) / MUL_MAT_SRC1_COL_STRIDE;
         is_max = is_max <= GGML_SYCL_MAX_STREAMS ? is_max : GGML_SYCL_MAX_STREAMS;
 
+        GGML_SYCL_DEBUG("[SYCL][MUL_MAT] Main device %d waiting on %d devices, is_max=%d\n",
+            ctx.device, ggml_sycl_info().device_count, (int)is_max);
+
         ggml_sycl_set_device(ctx.device);
         for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
             if (dev[i].row_low == dev[i].row_high) {
+                GGML_SYCL_DEBUG("[SYCL][MUL_MAT] Skipping device %d (row_low==row_high)\n", i);
                 continue;
             }
             for (int64_t is = 0; is < is_max; ++is) {
+                GGML_SYCL_DEBUG("[SYCL][MUL_MAT] Main waiting on event from dev %d stream %d at ptr=%p\n",
+                    i, (int)is, (void*)(src0_extra->events[i][is]));
                 SYCL_CHECK(CHECK_TRY_ERROR(
                     ctx.stream()->ext_oneapi_submit_barrier(
                         {*src0_extra->events[i][is]})));
             }
         }
+        GGML_SYCL_DEBUG("[SYCL][MUL_MAT] Main device %d finished waiting all devices\n", ctx.device);
     }
 }
 catch (sycl::exception const &exc) {

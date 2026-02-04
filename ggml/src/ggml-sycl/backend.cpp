@@ -502,7 +502,9 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    GGML_SYCL_DEBUG("[SYCL] %s: about to wait on stream %p for device %d\n", __func__, (void*)stream, sycl_ctx->device);
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
+    GGML_SYCL_DEBUG("[SYCL] %s: wait completed successfully\n", __func__);
 
     GGML_UNUSED(backend);
 }
@@ -648,6 +650,16 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
             // OUT_PROD uses custom kernel which is graph-compatible.
             break;
         case GGML_OP_MUL_MAT:
+            // Disable SYCL graphs for MUL_MAT operations due to driver instability/GPU faults (Level Zero error 20)
+            // Observed with various quantized types (Q8_0, MXFP4) and mixed precision (F16/BF16)
+            // The crash occurs during stream synchronization after graph execution.
+            // Until the root cause (buffer lifetime or kernel issue) is fixed, we disable graphs for MUL_MAT.
+            {
+                ggml_tensor * src0 = node->src[0];
+                GGML_LOG_DEBUG("%s: disabling SYCL graphs for MUL_MAT (type=%s) to prevent GPU faults\n", 
+                    __func__, ggml_type_name(src0->type));
+                return graph_compat_t::DISABLED;
+            }
                 {
                     ggml_tensor * src0 = node->src[0];
                     ggml_tensor * src1 = node->src[1];
@@ -668,6 +680,19 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
 #ifdef SYCL_USE_XMX
                     use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
 #endif
+
+                    // Exclude known problematic MMQ types that cause GPU faults under SYCL graphs
+                    // q5_0 and q8_0 with certain shapes have been observed to cause device loss
+                    // MXFP4 also causes device loss in graphs
+                    if (src0->type == GGML_TYPE_Q5_0 || 
+                        src0->type == GGML_TYPE_Q8_0 || 
+                        src0->type == GGML_TYPE_MXFP4 ||
+                        src0->type == GGML_TYPE_F16 ||
+                        src0->type == GGML_TYPE_BF16) {
+                        GGML_LOG_INFO("%s: disabling SYCL graphs for problematic MMQ type %s\n",
+                            __func__, ggml_type_name(src0->type));
+                        return graph_compat_t::DISABLED;
+                    }
 
                     // Reordering logic:
                     // During graph recording, we disable reordering in matmul.cpp by checking force_graph_compatible.
