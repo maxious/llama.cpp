@@ -49,6 +49,7 @@
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/gemm_tiled.hpp"
 #include "ggml-sycl/gemm_f16_f32_tiled.hpp"
+#include "ggml-sycl/gemm_bf16_f32_tiled.hpp"
 #include "ggml-sycl/gemm_xmx.hpp"
 #include "ggml-sycl/set_rows.hpp"
 #include "ggml-sycl/set.hpp"
@@ -1125,6 +1126,20 @@ static void ggml_sycl_op_mul_mat_tiled(
         });
 
         launch_gemm_f16_f32_tiled(stream, src1_f16, src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, true);
+    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
+        launch_gemm_bf16_f32_tiled(stream, src1_ddf_i, src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, true);
+    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        // Convert src1 (F32) to BF16 temporary
+        ggml_sycl_pool_alloc<sycl::ext::oneapi::bfloat16> src1_bf16_alloc(ctx.pool(), N * K);
+        sycl::ext::oneapi::bfloat16 * src1_bf16 = src1_bf16_alloc.get();
+
+        stream->submit([&](sycl::handler &cgh) {
+            cgh.parallel_for(sycl::range<1>(N*K), [=](sycl::id<1> idx) {
+                src1_bf16[idx] = (sycl::ext::oneapi::bfloat16)src1_ddf_i[idx];
+            });
+        });
+
+        launch_gemm_bf16_f32_tiled(stream, src1_bf16, src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, true);
     } else {
         // Fallback for unsupported types
         ggml_sycl_op_mul_mat_sycl(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low, row_high, src1_ncols, src1_padded_row_size, stream);
@@ -1487,6 +1502,19 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
         if (src0->type == GGML_TYPE_F16) {
              const sycl::half * weights = (const sycl::half *)((const char *)src0_base + i * w_nb2);
              launch_gemm_tiled_indirect_f32_f16(stream,
+                src1_packed,
+                weights,
+                dst_packed,
+                dev_expert_counts.get() + i,
+                dev_expert_offsets.get() + i,
+                total_rows, // max_M
+                N, K,
+                1.0f, 0.0f,
+                K, K, N
+            );
+        } else if (src0->type == GGML_TYPE_BF16) {
+             const sycl::ext::oneapi::bfloat16 * weights = (const sycl::ext::oneapi::bfloat16 *)((const char *)src0_base + i * w_nb2);
+             launch_gemm_tiled_indirect_f32_bf16(stream,
                 src1_packed,
                 weights,
                 dst_packed,
