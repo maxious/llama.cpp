@@ -226,6 +226,10 @@ void ggml_sycl_op_set_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->src[1]->type == GGML_TYPE_I64 || dst->src[1]->type == GGML_TYPE_I32);
 
+    // Add barrier to ensure previous operations are complete before set_rows starts.
+    // This is required for SYCL graph compatibility as set_rows uses USM with implicit dependencies.
+    ctx.stream()->ext_oneapi_submit_barrier();
+
     if (src1->type == GGML_TYPE_I64) {
         set_rows_sycl<float, int64_t>(ctx, src0, src1, dst);
     } else {

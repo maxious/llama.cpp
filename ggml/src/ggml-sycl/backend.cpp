@@ -583,16 +583,9 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                               "Fix: implement async expert ID handling or pre-cache IDs before graph record.\n", __func__);
                 return graph_compat_t::DISABLED;
         case GGML_OP_SET_ROWS:
-            // SET_ROWS uses USM memory and has implicit data dependencies that are not
-            // automatically tracked by SYCL graphs, which can lead to out-of-order execution
-            // and race conditions when combined with other kernels (e.g., ROPE + SET_ROWS).
-            //
-            // To fix: SET_ROWS kernel needs explicit SYCL event dependencies added, or the
-            // kernel needs to be rewritten to use SYCL accessors instead of USM pointers.
-            // See ggml-sycl/set_rows.cpp for the current implementation.
-            GGML_LOG_INFO("%s: disabling SYCL graphs - SET_ROWS has implicit USM dependencies incompatible with graph recording. "
-                          "Fix: add explicit event dependencies to set_rows kernel.\n", __func__);
-            return graph_compat_t::DISABLED;
+            // SET_ROWS uses USM memory and has implicit data dependencies.
+            // We now insert an explicit barrier in ggml_sycl_op_set_rows to ensure ordering.
+            break;
         case GGML_OP_OUT_PROD:
             // OUT_PROD uses oneMKL GEMM which creates internal SYCL events that are incompatible
             // with graph recording. The oneMKL gemm() call internally creates events and may call
