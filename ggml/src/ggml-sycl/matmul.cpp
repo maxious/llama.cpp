@@ -85,7 +85,6 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
 
     GGML_ASSERT(!ggml_backend_buffer_is_sycl_split(dst->buffer));
     GGML_ASSERT(!ggml_backend_buffer_is_sycl_split(src1->buffer));
-    GGML_ASSERT(src1->type == GGML_TYPE_F32 || (src1->ne[2] == 1 && src1->ne[3] == 1));
 
     GGML_ASSERT(ne12 >= ne02 && ne12 % ne02 == 0);
 
@@ -253,7 +252,12 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
 
                 // for split tensors the data begins at i0 == i0_offset_low
                 char  *  src0_dd_i =  dev[i].src0_dd + (i0/i02_divisor) * (ne01*ne00*src0_ts)/src0_bs;
-                float * src1_ddf_i = dev[i].src1_ddf + (i0*ne11 + src1_col_0) * ne10;
+                float * src1_ddf_i;
+    if (src1->type == GGML_TYPE_F16) {
+         src1_ddf_i = (float *)((char *)dev[i].src1_ddf + (i0*ne11 + src1_col_0) * ne10 * sizeof(sycl::half));
+    } else {
+         src1_ddf_i = dev[i].src1_ddf + (i0*ne11 + src1_col_0) * ne10;
+    }
                 char  * src1_ddq_i = dev[i].src1_ddq +  src1_ddq_i_offset;
                 float *   dst_dd_i =   dev[i].dst_dd + (i0*ne1  + src1_col_0) * (dst_on_device ? ne0 : row_diff);
 
@@ -274,12 +278,17 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                                                              src1_ncols * src1_padded_col_size * q8_1_ts / q8_1_bs)
                                                     .wait()));
                         } else {
-                            float * src1_ddf_i_source = (float *) src1_extra->data_device[ctx.device];
-                            src1_ddf_i_source += (i0 * ne11 + src1_col_0) * ne10;
+                            float * src1_ddf_i_source;
+                            if (src1->type == GGML_TYPE_F16) {
+                                src1_ddf_i_source = (float *)((char *)src1_extra->data_device[ctx.device] + (i0 * ne11 + src1_col_0) * ne10 * sizeof(sycl::half));
+                            } else {
+                                src1_ddf_i_source = (float *) src1_extra->data_device[ctx.device];
+                                src1_ddf_i_source += (i0 * ne11 + src1_col_0) * ne10;
+                            }
 
                             SYCL_CHECK(
                                 CHECK_TRY_ERROR(dev2dev_memcpy(*stream, *main_stream, src1_ddf_i, src1_ddf_i_source,
-                                                               src1_ncols * ne10 * sizeof(float))));
+                                                               src1_ncols * ne10 * ggml_type_size(src1->type))));
                         }
                     }
                 } else {

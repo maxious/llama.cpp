@@ -797,7 +797,7 @@ void ggml_sycl_op_mul_mat_sycl(
             to_fp16_sycl(src1_ddf_i, src1_as_f16.get(), ne, stream);
         }
         const sycl::half *src1_ptr = src1->type == GGML_TYPE_F16
-                ? (const sycl::half *)src1->data + src1_padded_row_size
+                ? (const sycl::half *)src1_ddf_i
                                          : src1_as_f16.get();
 
 #if GGML_SYCL_DNNL
