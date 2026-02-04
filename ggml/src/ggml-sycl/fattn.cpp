@@ -1,6 +1,7 @@
 #include "./fattn.hpp"
 #include "./fattn_kernel.hpp"
 #include "./fattn_common.hpp"
+#include "./fattn_fused.hpp"
 #include "./common.hpp"
 
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
@@ -592,6 +593,22 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     GGML_SYCL_DEBUG("[SYCL][OP] call ggml_sycl_op_flash_attn: Q=[%ld,%ld,%ld] V=[%ld,%ld,%ld]\n",
             Q->ne[0], Q->ne[1], Q->ne[2], V->ne[0], V->ne[1], V->ne[2]);
 
+    // Common tensor dimensions (used by all paths)
+    const int64_t DQK = Q->ne[0];
+    const int64_t DV = V->ne[0];
+    const int64_t N = Q->ne[1];
+    const int64_t N_kv = K->ne[1];
+    const int64_t n_heads = Q->ne[2];
+    const int64_t n_kv_heads = K->ne[2];
+    const int64_t gqa_ratio = n_heads / n_kv_heads;
+    const int64_t n_splits = get_kv_split_count(N_kv, n_heads);
+    bool is_f16 = (Q->type == GGML_TYPE_F16);
+
+    // Extract mask and scale
+    const ggml_tensor * mask = dst->src[3];
+    float scale = 1.0f;
+    std::memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
 #ifdef GGML_SYCL_USE_INTEL_ONEMKL
     // Check if oneMKL is forced first (before XMX check)
     static bool sycl_use_mkl = false;
@@ -607,14 +624,23 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         }
     }
 
-            const int64_t DQK = Q->ne[0];
-            const int64_t DV = V->ne[0];
-            const int64_t N = Q->ne[1];
-            const int64_t N_kv = K->ne[1];
-            const int64_t n_heads = Q->ne[2];
-            // Determine number of KV splits for XMX path
-            int64_t n_splits = get_kv_split_count(N_kv, n_heads);
-            bool is_f16 = (Q->type == GGML_TYPE_F16);
+    // Sinks (attention sinks / StreamingLLM) only supported in MKL path
+    // XMX cooperative matrix kernels don't support sinks yet
+    const bool use_mkl_for_sinks = (sinks != nullptr);
+
+    // Use MKL for small batch sizes (N < 32) as it's often faster for small batches
+    // Set GGML_SYCL_FLASH_ATTN_FORCE_XMX=1 to bypass this and use XMX for all batch sizes
+    static bool force_xmx = false;
+    static bool force_xmx_checked = false;
+    if (!force_xmx_checked) {
+        const char* env = getenv("GGML_SYCL_FLASH_ATTN_FORCE_XMX");
+        force_xmx = (env != nullptr && strcmp(env, "1") == 0);
+        force_xmx_checked = true;
+        if (force_xmx) {
+            GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention FORCED for all batch sizes by environment variable\n");
+        }
+    }
+    const bool small_batch = !force_xmx && (N < 32);
 
     // Sinks (attention sinks / StreamingLLM) only supported in MKL path
     // XMX cooperative matrix kernels don't support sinks yet
@@ -705,7 +731,79 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
             GGML_ABORT("ggml_sycl: oneMKL flash attention path failed (unsupported head size); XMX is required but fallback failed\n");
         }
     }
-#endif
+    #endif // GGML_SYCL_USE_INTEL_ONEMKL
+
+    // ============================================================================
+    // Fused Single-Kernel Flash Attention (Graph-Compatible)
+    // ============================================================================
+    // This is a new implementation that fuses QK, softmax, and PV into a single
+    // kernel without host-side split loops. It uses online softmax and direct
+    // stride loading from ggml tensor layout.
+    // Supported: head sizes up to 128 (shared memory constraints), F16/BF16/F32.
+    // This replaces the host-side sequential KV split loop in the MKL path.
+    if (DQK <= 128 && DV <= 128 && DQK == DV) {
+        // Prepare mask pointer (only F32 mask supported for now)
+        const float* mask_d = nullptr;
+        int64_t mask_stride = 0;
+        if (mask != nullptr && mask->data != nullptr) {
+            if (mask->type == GGML_TYPE_F32) {
+                mask_d = (const float*)mask->data;
+                mask_stride = mask->nb[1] / sizeof(float);
+            } else {
+                // Fused path only supports F32 mask; other types will fall back
+                mask_d = nullptr;
+            }
+        }
+
+        // Compute tensor strides for direct loading
+        fattn_tensor_strides strides = compute_tensor_strides(Q, K, V, dst);
+
+        // Dispatch based on Q data type
+        if (Q->type == GGML_TYPE_F16) {
+            GGML_SYCL_DEBUG("ggml_sycl: Using fused flash attention (F16) DQK=%d DV=%d\n", DQK, DV);
+            ggml_sycl_op_flash_attn_fused<sycl::half>(
+                ctx.stream(),
+                (const sycl::half*)Q, (const sycl::half*)K, (const sycl::half*)V,
+                (float*)dst->data,
+                N, N_kv, n_heads, n_kv_heads, gqa_ratio, scale,
+                mask_d, mask_stride,
+                sinks ? (const float*)sinks->data : nullptr,
+                strides,
+                DQK, DV);
+            return;
+        } else if (Q->type == GGML_TYPE_BF16) {
+            #ifdef SYCL_EXT_ONEAPI_BFLOAT16_MATH_FUNCTIONS
+            GGML_SYCL_DEBUG("ggml_sycl: Using fused flash attention (BF16) DQK=%d DV=%d\n", DQK, DV);
+            ggml_sycl_op_flash_attn_fused<sycl::ext::oneapi::bfloat16>(
+                ctx.stream(),
+                (const sycl::ext::oneapi::bfloat16*)Q,
+                (const sycl::ext::oneapi::bfloat16*)K,
+                (const sycl::ext::oneapi::bfloat16*)V,
+                (float*)dst->data,
+                N, N_kv, n_heads, n_kv_heads, gqa_ratio, scale,
+                mask_d, mask_stride,
+                sinks ? (const float*)sinks->data : nullptr,
+                strides,
+                DQK, DV);
+            return;
+            #endif
+        } else if (Q->type == GGML_TYPE_F32) {
+            GGML_SYCL_DEBUG("ggml_sycl: Using fused flash attention (F32) DQK=%d DV=%d\n", DQK, DV);
+            ggml_sycl_op_flash_attn_fused<float>(
+                ctx.stream(),
+                (const float*)Q, (const float*)K, (const float*)V,
+                (float*)dst->data,
+                N, N_kv, n_heads, n_kv_heads, gqa_ratio, scale,
+                mask_d, mask_stride,
+                sinks ? (const float*)sinks->data : nullptr,
+                strides,
+                DQK, DV);
+            return;
+        }
+    }
+
+    GGML_SYCL_DEBUG("ggml_sycl: Fused flash attention not applicable (DQK=%ld DV=%ld type=%s), falling back\n",
+            DQK, DV, ggml_type_name(Q->type));
 
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
     // Try XMX path if device supports it
