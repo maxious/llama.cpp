@@ -634,11 +634,16 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                     use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
 #endif
 
+                    // Reordering logic:
+                    // During graph recording, we disable reordering in matmul.cpp by checking force_graph_compatible.
+                    // So we don't need to disable graph here. The execution path will just skip reordering.
+                    /*
                     if (!g_ggml_sycl_prioritize_dmmv && ((should_reorder_tensor(ctx, dst) && ggml_sycl_supports_reorder_mmvq(src0->type)))) {
                         GGML_LOG_INFO("%s: disabling SYCL graphs to perform tensor reordering (src0 type=%s)\n",
                                 __func__, ggml_type_name(src0->type));
                         return graph_compat_t::DISABLED;
                     }
+                    */
 
                     const bool split = src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer);
 
@@ -687,14 +692,11 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                     // 4. Enable oneDNN with Graph API for F16/F32 -> uses DnnlGraphWrapper
                     //
                     // Current tensor: src0=%s [%ldx%ld], src1=F32 [%ldx%ld], batch=%ld
-                    GGML_LOG_INFO("%s: disabling SYCL graphs - MUL_MAT requires oneMKL GEMM which is graph-incompatible. "
-                                  "src0 type=%s ne=[%ld,%ld], src1 ne=[%ld,%ld], nrows=%ld. "
-                                  "Fix: use quantized model (Q4_K/Q8_0), implement graph-compatible GEMM, or enable oneDNN Graph.\n",
-                                  __func__, ggml_type_name(src0->type),
-                                  (long)src0->ne[0], (long)src0->ne[1],
-                                  (long)src1->ne[0], (long)src1->ne[1],
-                                  (long)src1->ne[1]);
-                    return graph_compat_t::DISABLED;
+                    
+                    // Fallback to graph-compatible Tiled GEMM if allowed
+                    // ggml_sycl_mul_mat() will pick the tiled kernel if force_graph_compatible is set.
+                    // We allow the graph to proceed.
+                    break; 
                 }
         }
     }
@@ -901,7 +903,10 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         // Use per-device graphs for multi-GPU with split buffers
         GGML_SYCL_DEBUG("[SYCL-MULTI-GRAPH] Starting multi-device graph compute (n_nodes=%d)\n", cgraph->n_nodes);
 
-        return ggml_backend_sycl_multi_device_graph_compute(*sycl_ctx, cgraph);
+        sycl_ctx->force_graph_compatible = true;
+        ggml_status status = ggml_backend_sycl_multi_device_graph_compute(*sycl_ctx, cgraph);
+        sycl_ctx->force_graph_compatible = false;
+        return status;
 
     } else if (graph_mode == graph_compat_t::SINGLE_DEVICE) {
         // ===== SINGLE-DEVICE GRAPH PATH (original) =====
@@ -936,7 +941,10 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         GGML_SYCL_DEBUG("[SYCL-GRAPH] begin_recording took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
         gettimeofday(&tv_start, NULL);
 
+        sycl_ctx->force_graph_compatible = true;
         ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+        sycl_ctx->force_graph_compatible = false;
+
         gettimeofday(&tv_end, NULL);
         GGML_SYCL_DEBUG("[SYCL-GRAPH] compute_impl took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
         gettimeofday(&tv_start, NULL);

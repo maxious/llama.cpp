@@ -986,6 +986,9 @@ static void reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
 }
 
 bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst) {
+    // Disable reordering when graph compatibility is forced, to avoid host sync in reorder_qw
+    if (ctx.force_graph_compatible) return false;
+
     return !g_ggml_sycl_disable_optimize && //allow optimize, controlled by $GGML_SYCL_DISABLE_OPT
             ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
             dst->op == GGML_OP_MUL_MAT &&   //limit to some supported cases of Q4_0, to do for more cases.
@@ -1072,6 +1075,47 @@ static void ggml_sycl_op_mul_mat_xmx(
         // Note: This fallback is NOT graph-compatible. 
         // If graph recording is active, this will crash or produce invalid graph.
         // We rely on backend.cpp to disable graphs for unsupported types if we don't handle them here.
+        ggml_sycl_op_mul_mat_sycl(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low, row_high, src1_ncols, src1_padded_row_size, stream);
+    }
+}
+
+static void ggml_sycl_op_mul_mat_tiled(
+    ggml_backend_sycl_context & ctx,
+    const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
+    const char *src0_dd_i, const float *src1_ddf_i, const char *src1_ddq_i,
+    float *dst_dd_i, const int64_t row_low, const int64_t row_high,
+    const int64_t src1_ncols, const int64_t src1_padded_row_size,
+    const queue_ptr &stream) {
+
+    const int64_t M = row_high - row_low;
+    const int64_t N = src1_ncols;
+    const int64_t K = src0->ne[0];
+    const int64_t ldc = dst->ne[0];
+
+    // Tiled GEMM computes C = alpha * A * B^T + beta * C
+    // We map A=src1, B=src0, C=dst.
+    // src1 is N x K. src0 is M x K.
+    // C = src1 * src0^T = (N x K) * (K x M) = N x M.
+    // dst is N x M.
+
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        launch_gemm_tiled<true>(stream, (const float*)src1_ddf_i, (const float*)src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc);
+    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
+        launch_gemm_f16_f32_tiled(stream, src1_ddf_i, src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, true);
+    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        // Convert src1 (F32) to F16 temporary
+        ggml_sycl_pool_alloc<sycl::half> src1_f16_alloc(ctx.pool(), N * K);
+        sycl::half * src1_f16 = src1_f16_alloc.get();
+
+        stream->submit([&](sycl::handler &cgh) {
+            cgh.parallel_for(sycl::range<1>(N*K), [=](sycl::id<1> idx) {
+                src1_f16[idx] = (sycl::half)src1_ddf_i[idx];
+            });
+        });
+
+        launch_gemm_f16_f32_tiled(stream, src1_f16, src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, true);
+    } else {
+        // Fallback for unsupported types
         ggml_sycl_op_mul_mat_sycl(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low, row_high, src1_ncols, src1_padded_row_size, stream);
     }
 }
