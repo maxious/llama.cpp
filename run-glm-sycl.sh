@@ -47,7 +47,7 @@ source /opt/intel/oneapi/setvars.sh intel64
 export UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
 # Enable SYSMAN for better memory management
 export ZES_ENABLE_SYSMAN=1
-
+export ONEAPI_DEVICE_SELECTOR=level_zero:0
 # Check for required GPU group permissions
 if ! groups | grep -qwE "(render|video)"; then
     echo "WARNING: User is not in 'render' or 'video' groups."

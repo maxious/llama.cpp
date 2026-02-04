@@ -7,7 +7,7 @@ source /opt/intel/oneapi/setvars.sh intel64
 export UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
 export ZES_ENABLE_SYSMAN=1
 
-MODEL=~/koboldcpp/GLM-4.7-Flash-REAP-23B-A3B-Q8_0.gguf
+MODEL=models/koboldcpp/GLM-4.7-Flash-REAP-23B-A3B-Q8_0.gguf
 PROMPT="[gMASK]<sop><|user|>\nWhat is the capital of France?<|assistant|>\n"
 
 echo "=== Testing XMX Flash Attention (default) ==="

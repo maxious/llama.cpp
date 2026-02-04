@@ -585,7 +585,26 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                 return graph_compat_t::DISABLED;
         case GGML_OP_SET_ROWS:
             // SET_ROWS uses USM memory and has implicit data dependencies.
-            // We now insert an explicit barrier in ggml_sycl_op_set_rows to ensure ordering.
+            // We insert an explicit barrier in ggml_sycl_op_set_rows to ensure ordering.
+            //
+            // However, when SET_ROWS operates on a VIEW of ROPE output (ROPE → VIEW → SET_ROWS pattern),
+            // with large tensors, the Level Zero driver crashes with GPU page faults on the BCS engine.
+            // This appears to be a driver bug with memory aliasing in SYCL graphs.
+            // See kernel log: "Faulted Address... EngineClass: 3 bcs... Engine memory CAT error"
+            //
+            // Workaround: disable graphs when SET_ROWS source is a VIEW with large tensors.
+            {
+                ggml_tensor * src = node->src[0];
+                if (src && src->op == GGML_OP_VIEW) {
+                    int64_t view_size = ggml_nbytes(src);
+                    // Threshold: 1MB - large VIEW operations trigger driver bug
+                    if (view_size > 1024 * 1024) {
+                        GGML_LOG_INFO("%s: disabling SYCL graphs - SET_ROWS with large VIEW source (%ld bytes) "
+                                      "triggers Level Zero driver page fault bug\n", __func__, (long)view_size);
+                        return graph_compat_t::DISABLED;
+                    }
+                }
+            }
             break;
         case GGML_OP_OUT_PROD:
             // OUT_PROD uses custom kernel which is graph-compatible.

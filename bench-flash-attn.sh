@@ -19,8 +19,8 @@ RESULTS_FILE="flash-attn-bench-results-$(date +%Y%m%d-%H%M%S).md"
 REPEATITIONS=3
 
 # Model paths
-LLAMA_MODEL="$HOME/koboldcpp/Llama-3.2-1B.Q8_0.gguf"
-GLM_MODEL="$HOME/koboldcpp/GLM-4.7-Flash-SynthLabs-REAP-25-Q4_K_M.gguf"
+LLAMA_MODEL="models/koboldcpp/Llama-3.2-1B.Q8_0.gguf"
+GLM_MODEL="models/koboldcpp/GLM-4.7-Flash-SynthLabs-REAP-25-Q4_K_M.gguf"
 
 # Test configurations
 # Format: "prompt_len:gen_len:batch_sizes"
