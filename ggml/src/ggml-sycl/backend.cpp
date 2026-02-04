@@ -1203,11 +1203,13 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                 }
                 ggml_type src0_type = op->src[0]->type;
+                /*
                 if (src0_type == GGML_TYPE_BF16 ) {
                     // TODO: support GGML_TYPE_BF16
                     // FIXME: keep a list of supported types to avoid breaking the backend when a new type is added
                     return false;
                 }
+                */
 
                 // TODO: The configuration below needs more work to be supported with oneDNN
                 if (ggml_is_permuted(a) && !ggml_is_contiguous(a) &&
