@@ -576,16 +576,9 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
             case GGML_OP_CONCAT:
                 break;
             case GGML_OP_MUL_MAT_ID:
-                // ggml_sycl_mul_mat_id() does a blocking host wait on the sycl queue after
-                // submitting a memcpy operation (to read ids on host), which breaks graph recording.
-                // This host-side dependency on device data makes it incompatible with static graphs.
-                //
-                // To fix: the expert ID tensor read needs to be done asynchronously or cached,
-                // so the kernel selection doesn't require a host-side wait during graph recording.
-                // See ggml_sycl_mul_mat_id() in this file.
-                GGML_LOG_INFO("%s: disabling SYCL graphs - MUL_MAT_ID (MoE) requires host-side expert ID read which blocks graph recording. "
-                              "Fix: implement async expert ID handling or pre-cache IDs before graph record.\n", __func__);
-                return graph_compat_t::DISABLED;
+                // Graph-compatible tiled implementation is now available.
+                // It runs entirely on device without host synchronization.
+                break;
         case GGML_OP_SET_ROWS:
             // SET_ROWS uses USM memory and has implicit data dependencies.
             // We insert an explicit barrier in ggml_sycl_op_set_rows to ensure ordering.

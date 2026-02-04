@@ -429,6 +429,402 @@ inline void launch_gemm_tiled_batched(
     });
 }
 
+template <int BM, int BN, int BK, int TM, int TN, bool transpose_A = false, bool transpose_B = true>
+inline void gemm_tiled_kernel_indirect(
+    sycl::nd_item<2> it,
+    sycl::local_accessor<float, 1> tile_A,
+    sycl::local_accessor<float, 1> tile_B,
+    const float * __restrict__ A,
+    const float * __restrict__ B,
+    float * __restrict__ C,
+    const int * __restrict__ M_ptr,
+    const int * __restrict__ offset_ptr,
+    const int N, const int K,
+    const float alpha, const float beta,
+    const int lda, const int ldb, const int ldc
+) {
+    const int M = *M_ptr;
+    if (M <= 0) return;
+
+    const int offset = (offset_ptr) ? *offset_ptr : 0;
+    const float * A_ptr = A;
+    float * C_ptr = C;
+    
+    if (offset > 0) {
+        if constexpr (transpose_A) {
+             A_ptr += offset;
+        } else {
+             A_ptr += offset * lda;
+        }
+        C_ptr += offset * ldc;
+    }
+
+    constexpr int WG_M = BM / TM;
+    constexpr int WG_N = BN / TN;
+    
+    const int block_row = it.get_group(0);
+    const int block_col = it.get_group(1);
+    
+    if (block_row * BM >= M) return;
+
+    const int thread_row = it.get_local_id(0);
+    const int thread_col = it.get_local_id(1);
+    const int thread_id = thread_row * WG_N + thread_col;
+    
+    const int row_start = block_row * BM + thread_row * TM;
+    const int col_start = block_col * BN + thread_col * TN;
+    
+    float acc[TM][TN];
+    #pragma unroll
+    for (int tm = 0; tm < TM; ++tm) {
+        #pragma unroll
+        for (int tn = 0; tn < TN; ++tn) {
+            acc[tm][tn] = 0.0f;
+        }
+    }
+    
+    constexpr int WG_SIZE = WG_M * WG_N;
+    
+    constexpr int A_TILE_SIZE = BM * BK;
+    constexpr int B_TILE_SIZE = BN * BK;
+    constexpr int A_LOADS_PER_THREAD = (A_TILE_SIZE + WG_SIZE - 1) / WG_SIZE;
+    constexpr int B_LOADS_PER_THREAD = (B_TILE_SIZE + WG_SIZE - 1) / WG_SIZE;
+    
+    const int num_k_tiles = (K + BK - 1) / BK;
+    
+    for (int k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
+        const int k_start = k_tile * BK;
+        
+        #pragma unroll
+        for (int load = 0; load < A_LOADS_PER_THREAD; ++load) {
+            const int flat_idx = thread_id + load * WG_SIZE;
+            if (flat_idx < A_TILE_SIZE) {
+                const int tile_m = flat_idx / BK;
+                const int tile_k = flat_idx % BK;
+                const int global_row = block_row * BM + tile_m;
+                const int global_k = k_start + tile_k;
+                
+                float val = 0.0f;
+                if (global_row < M && global_k < K) {
+                    if constexpr (transpose_A) {
+                        val = A_ptr[global_k * lda + global_row];
+                    } else {
+                        val = A_ptr[global_row * lda + global_k];
+                    }
+                }
+                tile_A[tile_m * BK + tile_k] = val;
+            }
+        }
+        
+        #pragma unroll
+        for (int load = 0; load < B_LOADS_PER_THREAD; ++load) {
+            const int flat_idx = thread_id + load * WG_SIZE;
+            if (flat_idx < B_TILE_SIZE) {
+                const int tile_n = flat_idx / BK;
+                const int tile_k = flat_idx % BK;
+                const int global_col = block_col * BN + tile_n;
+                const int global_k = k_start + tile_k;
+                
+                float val = 0.0f;
+                if constexpr (transpose_B) {
+                    if (global_col < N && global_k < K) {
+                        val = B[global_col * ldb + global_k];
+                    }
+                } else {
+                    if (global_k < K && global_col < N) {
+                        val = B[global_k * ldb + global_col];
+                    }
+                }
+                tile_B[tile_n * BK + tile_k] = val;
+            }
+        }
+        
+        sycl::group_barrier(it.get_group());
+        
+        #pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            float a_reg[TM];
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm) {
+                a_reg[tm] = tile_A[(thread_row * TM + tm) * BK + k];
+            }
+            
+            float b_reg[TN];
+            #pragma unroll
+            for (int tn = 0; tn < TN; ++tn) {
+                b_reg[tn] = tile_B[(thread_col * TN + tn) * BK + k];
+            }
+            
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm) {
+                #pragma unroll
+                for (int tn = 0; tn < TN; ++tn) {
+                    acc[tm][tn] = sycl::fma(a_reg[tm], b_reg[tn], acc[tm][tn]);
+                }
+            }
+        }
+        
+        sycl::group_barrier(it.get_group());
+    }
+    
+    #pragma unroll
+    for (int tm = 0; tm < TM; ++tm) {
+        const int global_row = row_start + tm;
+        if (global_row >= M) continue;
+        
+        #pragma unroll
+        for (int tn = 0; tn < TN; ++tn) {
+            const int global_col = col_start + tn;
+            if (global_col >= N) continue;
+            
+            const int c_idx = global_row * ldc + global_col;
+            if (beta == 0.0f) {
+                C_ptr[c_idx] = alpha * acc[tm][tn];
+            } else {
+                C_ptr[c_idx] = alpha * acc[tm][tn] + beta * C_ptr[c_idx];
+            }
+        }
+    }
+}
+
+template <bool transpose_B = true>
+inline void launch_gemm_tiled_indirect(
+    sycl::queue * stream,
+    const float * A, const float * B, float * C,
+    const int * M_ptr, const int * offset_ptr, const int max_M, const int N, const int K,
+    const float alpha, const float beta,
+    const int lda, const int ldb, const int ldc
+) {
+    constexpr int BM = GEMM_BM;
+    constexpr int BN = GEMM_BN;
+    constexpr int BK = GEMM_BK;
+    constexpr int TM = GEMM_TM;
+    constexpr int TN = GEMM_TN;
+    constexpr int WG_M = BM / TM;
+    constexpr int WG_N = BN / TN;
+    
+    const int grid_m = (max_M + BM - 1) / BM;
+    const int grid_n = (N + BN - 1) / BN;
+    
+    sycl::range<2> global(grid_m * WG_M, grid_n * WG_N);
+    sycl::range<2> local(WG_M, WG_N);
+    
+    stream->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> tile_A(sycl::range<1>(BM * BK), cgh);
+        sycl::local_accessor<float, 1> tile_B(sycl::range<1>(BN * BK), cgh);
+        
+        cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) {
+            gemm_tiled_kernel_indirect<BM, BN, BK, TM, TN, false, transpose_B>(
+                it, tile_A, tile_B,
+                A, B, C,
+                M_ptr, offset_ptr, N, K,
+                alpha, beta,
+                lda, ldb, ldc
+            );
+        });
+    });
+}
+
+template <int BM, int BN, int BK, int TM, int TN, bool transpose_A = false, bool transpose_B = true>
+inline void gemm_tiled_kernel_indirect_f32_f16(
+    sycl::nd_item<2> it,
+    sycl::local_accessor<float, 1> tile_A,
+    sycl::local_accessor<float, 1> tile_B,
+    const float * __restrict__ A,
+    const sycl::half * __restrict__ B,
+    float * __restrict__ C,
+    const int * __restrict__ M_ptr,
+    const int * __restrict__ offset_ptr,
+    const int N, const int K,
+    const float alpha, const float beta,
+    const int lda, const int ldb, const int ldc
+) {
+    const int M = *M_ptr;
+    if (M <= 0) return;
+
+    const int offset = (offset_ptr) ? *offset_ptr : 0;
+    const float * A_ptr = A;
+    const sycl::half * B_ptr = B; // Weights usually don't use offset? 
+    // Wait, B is passed as base + i*stride in launch.
+    // So B_ptr is already correct for this expert.
+    // Offset applies to A (src1 packed) and C (dst packed).
+    
+    float * C_ptr = C;
+    
+    if (offset > 0) {
+        if constexpr (transpose_A) {
+             A_ptr += offset;
+        } else {
+             A_ptr += offset * lda;
+        }
+        C_ptr += offset * ldc;
+    }
+
+    constexpr int WG_M = BM / TM;
+    constexpr int WG_N = BN / TN;
+    
+    const int block_row = it.get_group(0);
+    const int block_col = it.get_group(1);
+    
+    if (block_row * BM >= M) return;
+
+    const int thread_row = it.get_local_id(0);
+    const int thread_col = it.get_local_id(1);
+    const int thread_id = thread_row * WG_N + thread_col;
+    
+    const int row_start = block_row * BM + thread_row * TM;
+    const int col_start = block_col * BN + thread_col * TN;
+    
+    float acc[TM][TN];
+    #pragma unroll
+    for (int tm = 0; tm < TM; ++tm) {
+        #pragma unroll
+        for (int tn = 0; tn < TN; ++tn) {
+            acc[tm][tn] = 0.0f;
+        }
+    }
+    
+    constexpr int WG_SIZE = WG_M * WG_N;
+    constexpr int A_TILE_SIZE = BM * BK;
+    constexpr int B_TILE_SIZE = BN * BK;
+    constexpr int A_LOADS_PER_THREAD = (A_TILE_SIZE + WG_SIZE - 1) / WG_SIZE;
+    constexpr int B_LOADS_PER_THREAD = (B_TILE_SIZE + WG_SIZE - 1) / WG_SIZE;
+    
+    const int num_k_tiles = (K + BK - 1) / BK;
+    
+    for (int k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
+        const int k_start = k_tile * BK;
+        
+        #pragma unroll
+        for (int load = 0; load < A_LOADS_PER_THREAD; ++load) {
+            const int flat_idx = thread_id + load * WG_SIZE;
+            if (flat_idx < A_TILE_SIZE) {
+                const int tile_m = flat_idx / BK;
+                const int tile_k = flat_idx % BK;
+                const int global_row = block_row * BM + tile_m;
+                const int global_k = k_start + tile_k;
+                
+                float val = 0.0f;
+                if (global_row < M && global_k < K) {
+                    if constexpr (transpose_A) {
+                        val = A_ptr[global_k * lda + global_row];
+                    } else {
+                        val = A_ptr[global_row * lda + global_k];
+                    }
+                }
+                tile_A[tile_m * BK + tile_k] = val;
+            }
+        }
+        
+        #pragma unroll
+        for (int load = 0; load < B_LOADS_PER_THREAD; ++load) {
+            const int flat_idx = thread_id + load * WG_SIZE;
+            if (flat_idx < B_TILE_SIZE) {
+                const int tile_n = flat_idx / BK;
+                const int tile_k = flat_idx % BK;
+                const int global_col = block_col * BN + tile_n;
+                const int global_k = k_start + tile_k;
+                
+                float val = 0.0f;
+                if constexpr (transpose_B) {
+                    if (global_col < N && global_k < K) {
+                        val = (float)B_ptr[global_col * ldb + global_k];
+                    }
+                } else {
+                    if (global_k < K && global_col < N) {
+                        val = (float)B_ptr[global_k * ldb + global_col];
+                    }
+                }
+                tile_B[tile_n * BK + tile_k] = val;
+            }
+        }
+        
+        sycl::group_barrier(it.get_group());
+        
+        #pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            float a_reg[TM];
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm) {
+                a_reg[tm] = tile_A[(thread_row * TM + tm) * BK + k];
+            }
+            
+            float b_reg[TN];
+            #pragma unroll
+            for (int tn = 0; tn < TN; ++tn) {
+                b_reg[tn] = tile_B[(thread_col * TN + tn) * BK + k];
+            }
+            
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm) {
+                #pragma unroll
+                for (int tn = 0; tn < TN; ++tn) {
+                    acc[tm][tn] = sycl::fma(a_reg[tm], b_reg[tn], acc[tm][tn]);
+                }
+            }
+        }
+        
+        sycl::group_barrier(it.get_group());
+    }
+    
+    #pragma unroll
+    for (int tm = 0; tm < TM; ++tm) {
+        const int global_row = row_start + tm;
+        if (global_row >= M) continue;
+        
+        #pragma unroll
+        for (int tn = 0; tn < TN; ++tn) {
+            const int global_col = col_start + tn;
+            if (global_col >= N) continue;
+            
+            const int c_idx = global_row * ldc + global_col;
+            if (beta == 0.0f) {
+                C_ptr[c_idx] = alpha * acc[tm][tn];
+            } else {
+                C_ptr[c_idx] = alpha * acc[tm][tn] + beta * C_ptr[c_idx];
+            }
+        }
+    }
+}
+
+template <bool transpose_B = true>
+inline void launch_gemm_tiled_indirect_f32_f16(
+    sycl::queue * stream,
+    const float * A, const sycl::half * B, float * C,
+    const int * M_ptr, const int * offset_ptr, const int max_M, const int N, const int K,
+    const float alpha, const float beta,
+    const int lda, const int ldb, const int ldc
+) {
+    constexpr int BM = GEMM_BM;
+    constexpr int BN = GEMM_BN;
+    constexpr int BK = GEMM_BK;
+    constexpr int TM = GEMM_TM;
+    constexpr int TN = GEMM_TN;
+    constexpr int WG_M = BM / TM;
+    constexpr int WG_N = BN / TN;
+    
+    const int grid_m = (max_M + BM - 1) / BM;
+    const int grid_n = (N + BN - 1) / BN;
+    
+    sycl::range<2> global(grid_m * WG_M, grid_n * WG_N);
+    sycl::range<2> local(WG_M, WG_N);
+    
+    stream->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> tile_A(sycl::range<1>(BM * BK), cgh);
+        sycl::local_accessor<float, 1> tile_B(sycl::range<1>(BN * BK), cgh);
+        
+        cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) {
+            gemm_tiled_kernel_indirect_f32_f16<BM, BN, BK, TM, TN, false, transpose_B>(
+                it, tile_A, tile_B,
+                A, B, C,
+                M_ptr, offset_ptr, N, K,
+                alpha, beta,
+                lda, ldb, ldc
+            );
+        });
+    });
+}
+
 // Batched version with indirect pointers (float**)
 template <bool transpose_B = true>
 inline void launch_gemm_tiled_batched_indirect(
@@ -439,6 +835,7 @@ inline void launch_gemm_tiled_batched_indirect(
     const int batch,
     const int lda, const int ldb, const int ldc
 ) {
+
     constexpr int BM = GEMM_BM;
     constexpr int BN = GEMM_BN;
     constexpr int BK = GEMM_BK;
