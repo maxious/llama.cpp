@@ -1,5 +1,24 @@
 #include "outprod.hpp"
 
+static void k_out_prod(const float * src0, const char * src1, float * dst,
+                       int64_t ne00, int64_t ne01, int64_t ne10,
+                       int64_t nb10, int64_t nb11,
+                       const sycl::nd_item<1> & item) {
+    int64_t idx = item.get_global_linear_id();
+    if (idx >= ne00 * ne10) return;
+
+    int64_t i = idx % ne00;
+    int64_t j = idx / ne00;
+
+    float sum = 0.0f;
+    for (int64_t k = 0; k < ne01; ++k) {
+        float v0 = src0[i + k * ne00];
+        float v1 = *(const float *)(src1 + j * nb10 + k * nb11);
+        sum += v0 * v1;
+    }
+    dst[idx] = sum;
+}
+
 void ggml_sycl_op_out_prod(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
     const ggml_tensor *src0 = dst->src[0];
@@ -23,25 +42,14 @@ void ggml_sycl_op_out_prod(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
 
     // Get data pointers
     const float* src0_d = (const float*)src0->data;
-    const float* src1_d = (const float*)src1->data;
+    const char* src1_d = (const char*)src1->data;
     float* dst_d = (float*)dst->data;
 
-    // GEMM parameters
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
+    int64_t total = ne00 * ne10;
+    int64_t block_size = 256;
+    int64_t num_blocks = (total + block_size - 1) / block_size;
 
-    // Handle transposition of src1
-    const bool src1_T = ggml_is_transposed(src1);
-    const oneapi::mkl::transpose src1_op = src1_T ? oneapi::mkl::transpose::nontrans : oneapi::mkl::transpose::trans;
-    const int64_t ldb = (src1_T ? nb10 : nb11) / sizeof(float);
-
-    try {
-        // Perform matrix multiplication using oneMKL GEMM
-        oneapi::mkl::blas::column_major::gemm(*stream, oneapi::mkl::transpose::nontrans, src1_op,
-                                               ne0, ne1, ne01, alpha, src0_d, ne00, src1_d, ldb, beta, dst_d, ne0);
-    }
-    catch (sycl::exception const& exc) {
-        std::cerr << exc.what() << std::endl;
-        GGML_ASSERT(false);
-    }
+    stream->parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> item) {
+        k_out_prod(src0_d, src1_d, dst_d, ne00, ne01, ne10, nb10, nb11, item);
+    });
 }

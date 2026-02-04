@@ -587,15 +587,8 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
             // We now insert an explicit barrier in ggml_sycl_op_set_rows to ensure ordering.
             break;
         case GGML_OP_OUT_PROD:
-            // OUT_PROD uses oneMKL GEMM which creates internal SYCL events that are incompatible
-            // with graph recording. The oneMKL gemm() call internally creates events and may call
-            // wait(), which causes "wait method cannot be used for an event associated with a
-            // command graph" errors.
-            //
-            // To fix: implement a graph-compatible custom outer product kernel that doesn't use oneMKL.
-            GGML_LOG_INFO("%s: disabling SYCL graphs - OUT_PROD uses oneMKL GEMM which is graph-incompatible. "
-                          "Fix: implement custom graph-compatible outer product kernel.\n", __func__);
-            return graph_compat_t::DISABLED;
+            // OUT_PROD uses custom kernel which is graph-compatible.
+            break;
         case GGML_OP_MUL_MAT:
                 {
                     ggml_tensor * src0 = node->src[0];
