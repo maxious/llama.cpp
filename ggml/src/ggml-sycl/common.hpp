@@ -401,11 +401,18 @@ struct ggml_backend_sycl_context {
     }
 
 #ifdef GGML_SYCL_GRAPH
+    // Single cached graph (legacy, for backward compatibility)
     std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
+    uint64_t exec_graph_hash = 0;  // Hash of graph topology for cache invalidation
 
     // Multi-device graph support: one executable graph per device
     std::map<int, std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>> per_device_exec_graphs;
     bool multi_device_graphs_initialized = false;
+
+    // Graph cache: maps topology hash -> executable graph
+    // This allows reusing graphs when the same topology is encountered again
+    std::map<uint64_t, std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>> graph_cache;
+    static constexpr size_t MAX_GRAPH_CACHE_SIZE = 8;  // Limit cache to prevent memory bloat
 #endif
 
     ggml_sycl_pool & host_pool(int device) {

@@ -1113,24 +1113,13 @@ static void ggml_sycl_op_mul_mat_tiled(
 
     if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         launch_gemm_tiled<true>(stream, (const float*)src1_ddf_i, (const float*)src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc);
-    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
-        launch_gemm_f16_f32_tiled(stream, src1_ddf_i, src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, true);
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-        // Convert src1 (F32) to F16 temporary
-        ggml_sycl_pool_alloc<sycl::half> src1_f16_alloc(ctx.pool(), N * K);
-        sycl::half * src1_f16 = src1_f16_alloc.get();
-
-        stream->submit([&](sycl::handler &cgh) {
-            cgh.parallel_for(sycl::range<1>(N*K), [=](sycl::id<1> idx) {
-                src1_f16[idx] = (sycl::half)src1_ddf_i[idx];
-            });
-        });
-
-        launch_gemm_f16_f32_tiled(stream, src1_f16, src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, true);
-    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
-        launch_gemm_bf16_f32_tiled(stream, src1_ddf_i, src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, false);
+        // F16 weights with F32 activations: convert src1 (F32) to F16 temporary
+        // For F16 tiled GEMM, fall back to oneMKL (not graph compatible) for now
+        // because the dimension mapping is complex with F16 data layouts
+        ggml_sycl_op_mul_mat_sycl(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low, row_high, src1_ncols, src1_padded_row_size, stream);
     } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-        // Convert src1 (F32) to BF16 temporary
+        // BF16 weights with F32 activations: convert src1 (F32) to BF16 temporary
         ggml_sycl_pool_alloc<sycl::ext::oneapi::bfloat16> src1_bf16_alloc(ctx.pool(), N * K);
         sycl::ext::oneapi::bfloat16 * src1_bf16 = src1_bf16_alloc.get();
 

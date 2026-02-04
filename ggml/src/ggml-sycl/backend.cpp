@@ -548,6 +548,48 @@ enum class graph_compat_t {
     MULTI_DEVICE     // Use per-device graphs (new path)
 };
 
+// Compute a hash of the cgraph topology for graph caching
+// This allows reusing compiled graphs when the same structure is encountered
+static uint64_t compute_cgraph_hash(const ggml_cgraph * cgraph) {
+    uint64_t hash = 0xcbf29ce484222325ULL;  // FNV-1a offset basis
+    constexpr uint64_t FNV_PRIME = 0x100000001b3ULL;
+
+    // Hash number of nodes
+    hash ^= static_cast<uint64_t>(cgraph->n_nodes);
+    hash *= FNV_PRIME;
+
+    // Hash each node's key properties (op, type, shape)
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+
+        // Hash operation type
+        hash ^= static_cast<uint64_t>(node->op);
+        hash *= FNV_PRIME;
+
+        // Hash tensor type
+        hash ^= static_cast<uint64_t>(node->type);
+        hash *= FNV_PRIME;
+
+        // Hash dimensions
+        for (int j = 0; j < GGML_MAX_DIMS; j++) {
+            hash ^= static_cast<uint64_t>(node->ne[j]);
+            hash *= FNV_PRIME;
+        }
+
+        // Hash source tensor types and shapes (important for MUL_MAT variants)
+        for (int s = 0; s < GGML_MAX_SRC && node->src[s]; s++) {
+            hash ^= static_cast<uint64_t>(node->src[s]->type);
+            hash *= FNV_PRIME;
+            for (int j = 0; j < GGML_MAX_DIMS; j++) {
+                hash ^= static_cast<uint64_t>(node->src[s]->ne[j]);
+                hash *= FNV_PRIME;
+            }
+        }
+    }
+
+    return hash;
+}
+
 static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
     // Heuristic: Disable graphs for very large compute graphs to avoid driver hang/compile explosion.
     // The exact threshold may need tuning per device/driver.
@@ -688,8 +730,28 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                     
                     // Fallback to graph-compatible Tiled GEMM if allowed
                     // ggml_sycl_mul_mat() will pick the tiled kernel if force_graph_compatible is set.
-                    // We allow the graph to proceed.
-                    break; 
+                    // Check if the tiled GEMM supports this type combination:
+                    // - F32 x F32 -> F32: supported
+                    // - F16 x F32 -> F32: supported (converts F32 to F16 temp)
+                    // - BF16 x F32 -> F32: supported (converts F32 to BF16 temp)
+                    // - MXFP4 x F32 -> F32: supported (dequantizes MXFP4)
+                    // - F16 x F16 -> F32: NOT supported (src1_ddf_i is float, not f16)
+                    // - BF16 x BF16 -> F32: NOT supported (same reason)
+                    // Check if the tiled GEMM supports this type combination
+                    // Currently only F32xF32 is fully tested for graph compatibility
+                    bool tiled_gemm_supported = false;
+                    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
+                        tiled_gemm_supported = true;
+                    }
+                    // F16xF32, BF16xF32, MXFP4xF32 fall back to oneMKL (not graph compatible)
+
+                    if (tiled_gemm_supported) {
+                        break; // Proceed with graph
+                    } else {
+                        GGML_LOG_DEBUG("%s: disabling SYCL graphs for unsupported tiled GEMM type combo (src0=%s, src1=%s)\n",
+                            __func__, ggml_type_name(src0->type), ggml_type_name(src1->type));
+                        return graph_compat_t::DISABLED;
+                    } 
                 }
         }
     }
@@ -902,7 +964,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         return status;
 
     } else if (graph_mode == graph_compat_t::SINGLE_DEVICE) {
-        // ===== SINGLE-DEVICE GRAPH PATH (original) =====
+        // ===== SINGLE-DEVICE GRAPH PATH (with hash-based caching) =====
         GGML_SYCL_DEBUG("[SYCL-GRAPH] Starting graph compute (n_nodes=%d)\n", cgraph->n_nodes);
         struct timeval tv_start, tv_end;
         gettimeofday(&tv_start, NULL);
@@ -924,55 +986,98 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         GGML_SYCL_DEBUG("[SYCL-GRAPH] Graph support check took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
         gettimeofday(&tv_start, NULL);
 
-        sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()), {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
-        gettimeofday(&tv_end, NULL);
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] Graph construction took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
-        gettimeofday(&tv_start, NULL);
+        // Compute hash of graph topology for cache lookup
+        const uint64_t graph_hash = compute_cgraph_hash(cgraph);
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] Graph hash: 0x%016llx\n", (unsigned long long)graph_hash);
 
-        model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
-        gettimeofday(&tv_end, NULL);
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] begin_recording took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
-        gettimeofday(&tv_start, NULL);
+        // Check if we have a cached graph with matching topology
+        auto cache_it = sycl_ctx->graph_cache.find(graph_hash);
+        bool use_cached = (cache_it != sycl_ctx->graph_cache.end());
 
-        sycl_ctx->force_graph_compatible = true;
-        ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
-        sycl_ctx->force_graph_compatible = false;
+        if (use_cached) {
+            // Use cached graph - just execute it directly
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache hit, reusing existing graph\n");
+            gettimeofday(&tv_end, NULL);
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache lookup took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+            gettimeofday(&tv_start, NULL);
 
-        gettimeofday(&tv_end, NULL);
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] compute_impl took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
-        gettimeofday(&tv_start, NULL);
+            // Still need to execute the compute to update tensor data pointers
+            // For now, we re-record and update the cached graph
+            sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()), {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
+            model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
 
-        model_sycl_graph.end_recording();
-        gettimeofday(&tv_end, NULL);
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] end_recording took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
-        gettimeofday(&tv_start, NULL);
+            sycl_ctx->force_graph_compatible = true;
+            ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+            sycl_ctx->force_graph_compatible = false;
 
-        const bool graph_update_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_graph);
-        gettimeofday(&tv_end, NULL);
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] graph_update_support check took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
-        gettimeofday(&tv_start, NULL);
+            model_sycl_graph.end_recording();
 
-        if (!sycl_ctx->exec_graph || !graph_update_support) {
-            auto exec_graph = graph_update_support ? model_sycl_graph.finalize(sycl_ex::property::graph::updatable{}) :
-                                                     model_sycl_graph.finalize();
-            sycl_ctx->exec_graph = std::make_unique<
-                sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec_graph);
-        } else {
             try {
-                sycl_ctx->exec_graph->update(model_sycl_graph);
-                GGML_SYCL_DEBUG("[SYCL-GRAPH] update success\n");
+                cache_it->second->update(model_sycl_graph);
+                GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache update success\n");
             } catch (sycl::exception const & e) {
-                GGML_SYCL_DEBUG("[SYCL-GRAPH] Exception when updating graph, %s\n", e.what());
+                GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache update failed: %s, re-finalizing\n", e.what());
                 auto exec_graph = model_sycl_graph.finalize({sycl_ex::property::graph::updatable{}});
-                sycl_ctx->exec_graph = std::make_unique<
-                    sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec_graph);
+                cache_it->second = std::make_unique<
+                    sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec_graph));
             }
-        }
-        gettimeofday(&tv_end, NULL);
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] finalize/update took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
-        gettimeofday(&tv_start, NULL);
 
-        sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
+            gettimeofday(&tv_end, NULL);
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] finalize/update took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+            gettimeofday(&tv_start, NULL);
+
+            sycl_ctx->stream()->ext_oneapi_graph(*(cache_it->second));
+        } else {
+            // Cache miss - record, finalize, and cache the new graph
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache miss, creating new graph\n");
+
+            // Evict oldest entry if cache is full
+            if (sycl_ctx->graph_cache.size() >= sycl_ctx->MAX_GRAPH_CACHE_SIZE) {
+                GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache full, evicting oldest entry\n");
+                sycl_ctx->graph_cache.erase(sycl_ctx->graph_cache.begin());
+            }
+
+            sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()), {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
+            gettimeofday(&tv_end, NULL);
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] Graph construction took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+            gettimeofday(&tv_start, NULL);
+
+            model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
+            gettimeofday(&tv_end, NULL);
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] begin_recording took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+            gettimeofday(&tv_start, NULL);
+
+            sycl_ctx->force_graph_compatible = true;
+            ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+            sycl_ctx->force_graph_compatible = false;
+
+            gettimeofday(&tv_end, NULL);
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] compute_impl took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+            gettimeofday(&tv_start, NULL);
+
+            model_sycl_graph.end_recording();
+            gettimeofday(&tv_end, NULL);
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] end_recording took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+            gettimeofday(&tv_start, NULL);
+
+            const bool graph_update_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_graph);
+
+            auto exec_graph = graph_update_support ?
+                model_sycl_graph.finalize(sycl_ex::property::graph::updatable{}) :
+                model_sycl_graph.finalize();
+
+            // Store in cache
+            sycl_ctx->graph_cache[graph_hash] = std::make_unique<
+                sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec_graph));
+
+            gettimeofday(&tv_end, NULL);
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] finalize took %ld us (cache size: %zu)\n",
+                (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec),
+                sycl_ctx->graph_cache.size());
+            gettimeofday(&tv_start, NULL);
+
+            sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->graph_cache[graph_hash]));
+        }
         gettimeofday(&tv_end, NULL);
         GGML_SYCL_DEBUG("[SYCL-GRAPH] ext_oneapi_graph took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
         gettimeofday(&tv_start, NULL);
