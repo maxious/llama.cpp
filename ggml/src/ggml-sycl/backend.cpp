@@ -671,16 +671,9 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
             // OUT_PROD uses custom kernel which is graph-compatible.
             break;
         case GGML_OP_MUL_MAT:
-            // Disable SYCL graphs for MUL_MAT operations due to driver instability/GPU faults (Level Zero error 20)
-            // Observed with various quantized types (Q8_0, MXFP4) and mixed precision (F16/BF16)
-            // The crash occurs during stream synchronization after graph execution.
-            // Until the root cause (buffer lifetime or kernel issue) is fixed, we disable graphs for MUL_MAT.
-            {
-                ggml_tensor * src0 = node->src[0];
-                GGML_LOG_DEBUG("%s: disabling SYCL graphs for MUL_MAT (type=%s) to prevent GPU faults\n", 
-                    __func__, ggml_type_name(src0->type));
-                return graph_compat_t::DISABLED;
-            }
+            // MUL_MAT can use SYCL graphs for supported type combinations (F32 x F32).
+            // Other types (quantized, F16, BF16) are disabled due to driver/kernel limitations.
+            // The detailed logic below determines compatibility.
                 {
                     ggml_tensor * src0 = node->src[0];
                     ggml_tensor * src1 = node->src[1];
