@@ -71,7 +71,7 @@ inline void ggml_sycl_op_flash_attn_fused(
 
     stream->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> shmem_acc(sycl::range<1>(shmem_elems), cgh);
-        float* shmem = shmem_acc.get_pointer();
+        float* shmem = shmem_acc.get_multi_ptr<sycl::access::decorated::no>().get();
 
         cgh.parallel_for(sycl::nd_range<2>(global, local),
             [=](sycl::nd_item<2> it) [[intel::kernel_args_restrict]] {
