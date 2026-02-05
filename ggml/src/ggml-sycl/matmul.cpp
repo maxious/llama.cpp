@@ -1226,9 +1226,11 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0
     // MMQ kernels with need_check=true (when nrows < mmq_y tile size) can have shared memory 
     // write collisions that cause GPU hangs on Intel GPUs. Fall back to oneMKL when nrows
     // is too small. The MMQ_Y tile sizes range from 32-128, so we use 128 as the minimum.
+    // Also guard against small ne11 (output rows) which causes need_check=true path issues.
     // See AGENTS.md for more details.
     constexpr int64_t MMQ_MIN_NROWS = 128;
     use_mul_mat_q = use_mul_mat_q && (src0->ne[1] >= MMQ_MIN_NROWS);
+    use_mul_mat_q = use_mul_mat_q && (src1->ne[1] >= MMQ_MIN_NROWS);
 
     // Dispatch becomes obscure with the reorder, MMVQ when the reorder optimization
     // is enabled takes precedence over DMMV, the current if-else implementation
@@ -1699,7 +1701,6 @@ void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                 continue;
             }
 
-
             ggml_sycl_pool_alloc<int> dev_cur_src1_row(ctx.pool(), 1);
             ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), num_src1_rows);
             SYCL_CHECK(CHECK_TRY_ERROR(
@@ -1772,6 +1773,12 @@ void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                         });
                 });
             }
+
+            // IMPORTANT: Synchronize before dev_cur_src1_row and dev_row_mapping go out of scope.
+            // These pool allocations are used by the kernels above. Without this wait, the memory
+            // may be reused/freed on the next iteration while kernels are still accessing it,
+            // causing GPU page faults (use-after-free).
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
         }
     }
 }

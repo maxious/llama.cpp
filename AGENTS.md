@@ -10,8 +10,16 @@
   - P2P copies are opt-in via `GGML_SYCL_ENABLE_P2P=1` (may cause device-lost on some systems).
 - SYCL MMQ kernel known issues:
   - MMQ kernels with `need_check=true` (when nrows < mmq_y tile size) can have shared memory write collisions.
-  - Fixed by adding MMQ_MIN_NROWS=128 guard in matmul.cpp to fall back to oneMKL when nrows is too small.
+  - Fixed by adding MMQ_MIN_NROWS=128 guard in matmul.cpp to fall back to oneMKL when:
+    - `src0->ne[1] < 128` (weight matrix rows)
+    - `src1->ne[1] < 128` (output rows / batch size)
+  - This is especially important for MUL_MAT_ID where per-expert batches can be small.
   - Test with: `./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q4_K"`
+  - Test MUL_MAT_ID_FUSION: `./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID_FUSION -p "type_a=q4_K"`
+- SYCL MMQ XE2 tile size fix (Feb 2026):
+  - When SYCL_USE_XMX is defined (--xe2 build), MMQ kernel tile sizes were incorrectly set to tiny values (4x32).
+  - Fixed by adding XE2-specific defines in mmq_internal.hpp that use 64x128 tiles like RDNA2.
+  - Without this fix, caller allocated 128x64 shared memory but kernel expected 32x4, causing GPU page faults.
 - SYCL MMVQ quantization fix (Feb 2026):
   - Fixed swapped arguments in `quantize_row_q8_1_sycl` call at line ~200 of matmul.cpp.
   - Bug: `kx=nrows1, ky=ne10` was wrong; correct is `kx=ne10, ky=nrows1`.
