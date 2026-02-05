@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <float.h>
 #include <limits>
 #include <stdint.h>
@@ -101,6 +102,91 @@ static ggml_sycl_device_info ggml_sycl_init() {
         info.devices[i].nsm = prop.get_max_compute_units();
         info.devices[i].opt_feature.reorder = device.ext_oneapi_architecture_is(syclex::arch_category::intel_gpu);
         info.devices[i].smpbo = prop.get_local_mem_size();
+
+        // Determine MMQ tile configuration based on device architecture
+        // Using version numbers and vendor ID for maximum compatibility
+        mmq_config cfg = {64, 128, 4};
+        sycl_arch_type arch_type = SYCL_ARCH_UNKNOWN;
+
+        const int major = prop.get_major_version();
+        const int minor = prop.get_minor_version();
+        const uint32_t vendor_id = device.get_info<sycl::info::device::vendor_id>();
+
+        if (vendor_id == 0x8086) {
+            if (major >= 13) {
+                arch_type = SYCL_ARCH_INTEL_XE2;
+                cfg = {64, 128, 8};
+            } else if (major == 12) {
+                arch_type = SYCL_ARCH_INTEL_XE;
+                cfg = {64, 128, 4};
+            } else if (major >= 9) {
+                arch_type = SYCL_ARCH_INTEL_GEN9;
+            }
+         } else if (vendor_id == 0x1002) {
+             if (major >= 11) {
+                 arch_type = SYCL_ARCH_AMD_RDNA3;
+                 cfg = {64, 128, 8};
+            } else if (major == 10) {
+                if (minor >= 30) {
+                    arch_type = SYCL_ARCH_AMD_RDNA2;
+                    cfg = {64, 128, 8};
+                } else {
+                    arch_type = SYCL_ARCH_AMD_RDNA1;
+                    cfg = {64, 64, 8};
+                }
+            } else {
+                arch_type = SYCL_ARCH_UNKNOWN;
+                cfg = {64, 128, 4};
+            }
+          } else if (vendor_id == 0x10de) {
+              if (major == 7 && minor >= 5) {
+                  arch_type = SYCL_ARCH_NVIDIA_TURING;
+                  cfg = {64, 128, 4};  // Same tile config as Ampere for now
+              } else if (major >= 8) {
+                  arch_type = SYCL_ARCH_NVIDIA_AMPERE;
+                  cfg = {64, 128, 4};
+              } else {
+                  arch_type = SYCL_ARCH_NVIDIA_AMPERE;  // fallback
+                  cfg = {64, 128, 4};
+              }
+           }
+
+        const char* force_arch = std::getenv("GGML_SYCL_FORCE_ARCH");
+        if (force_arch && std::strlen(force_arch) > 0) {
+            if (std::strcmp(force_arch, "INTEL_XE2") == 0) {
+                arch_type = SYCL_ARCH_INTEL_XE2;
+                cfg = {64, 128, 8};
+            } else if (std::strcmp(force_arch, "INTEL_XE") == 0) {
+                arch_type = SYCL_ARCH_INTEL_XE;
+                cfg = {64, 128, 4};
+            } else if (std::strcmp(force_arch, "INTEL_GEN9") == 0) {
+                arch_type = SYCL_ARCH_INTEL_GEN9;
+                cfg = {64, 128, 4};
+            } else if (std::strcmp(force_arch, "AMD_RDNA3") == 0) {
+                arch_type = SYCL_ARCH_AMD_RDNA3;
+                cfg = {64, 128, 8};
+            } else if (std::strcmp(force_arch, "AMD_RDNA2") == 0) {
+                arch_type = SYCL_ARCH_AMD_RDNA2;
+                cfg = {64, 128, 8};
+            } else if (std::strcmp(force_arch, "AMD_RDNA1") == 0) {
+                arch_type = SYCL_ARCH_AMD_RDNA1;
+                cfg = {64, 64, 8};
+            } else if (std::strcmp(force_arch, "NVIDIA_AMPERE") == 0) {
+                arch_type = SYCL_ARCH_NVIDIA_AMPERE;
+                cfg = {64, 128, 4};
+            } else if (std::strcmp(force_arch, "NVIDIA_TURING") == 0) {
+                arch_type = SYCL_ARCH_NVIDIA_TURING;
+                cfg = {64, 128, 4};
+            } else {
+                std::cerr << "Warning: Unknown GGML_SYCL_FORCE_ARCH value: " << force_arch << ". Using detected configuration.\n";
+            }
+        }
+
+        info.devices[i].arch = arch_type;
+        info.devices[i].mmq = cfg;
+
+        GGML_LOG_INFO("Device %d: vendor=0x%04x, arch=%d, mmq={%d,%d,%d}\n",
+                      i, vendor_id, arch_type, cfg.mmq_x, cfg.mmq_y, cfg.nwarps);
 
         info.max_work_group_sizes[i] = prop.get_max_work_group_size();
     }

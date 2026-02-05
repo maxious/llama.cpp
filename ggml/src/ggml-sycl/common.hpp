@@ -189,7 +189,30 @@ inline dpct::err0 ggml_sycl_set_device(const int device) try {
   std::exit(1);
 }
 
-//////////////////////
+// SYCL device architecture types for runtime optimization
+enum sycl_arch_type {
+    SYCL_ARCH_UNKNOWN = 0,
+    SYCL_ARCH_INTEL_GEN9,       // Intel Gen9-Gen11 (integrated)
+    SYCL_ARCH_INTEL_XE,         // Intel Xe (Alchemist) - Gen12.7 discrete
+    SYCL_ARCH_INTEL_XE2,        // Intel Xe2 (Battlemage) - Gen13
+    SYCL_ARCH_INTEL_XE_LPG,     // Intel Xe-LPG (Meteor Lake) - integrated Gen12
+    SYCL_ARCH_INTEL_PVC,        // Intel Ponte Vecchio (Xe-HPC)
+    SYCL_ARCH_AMD_RDNA1,
+    SYCL_ARCH_AMD_RDNA2,
+    SYCL_ARCH_AMD_RDNA3,
+    SYCL_ARCH_NVIDIA_AMPERE,
+    SYCL_ARCH_NVIDIA_TURING,
+    // Add more as needed
+};
+
+// MMQ kernel tile configuration
+struct mmq_config {
+    int mmq_x;
+    int mmq_y;
+    int nwarps;
+};
+
+////////////////////
 struct optimize_feature {
     bool reorder=false;
 };
@@ -204,6 +227,8 @@ struct sycl_device_info {
     size_t  total_vram;
     //sycl_hw_info hw_info;     \\ device id and aarch, currently not used
     optimize_feature opt_feature;
+    mmq_config mmq;             // MMQ tile configuration (runtime determined)
+    sycl_arch_type arch;        // Device architecture type for feature dispatch
 };
 
 

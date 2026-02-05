@@ -25,7 +25,38 @@
   - Bug: `kx=nrows1, ky=ne10` was wrong; correct is `kx=ne10, ky=nrows1`.
   - Symptom: MUL_MAT with quantized types (q4_K, q8_0, etc.) produced `ERR = inf` for n=2-8, m=16.
   - Root cause: With kx=2 < QK8_1=32, `num_quant_blocks = ky * (kx/32) = 0`, so quantization kernel didn't run.
-  - Test: `GGML_SYCL_DISABLE_OPT=1 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q4_K"`
+   - Test: `GGML_SYCL_DISABLE_OPT=1 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q4_K"`
+
+## SYCL Runtime Architecture Detection
+
+The SYCL backend now automatically detects the GPU vendor and architecture at runtime to select optimal MMQ (matrix multiplication with quantization) tile sizes, eliminating the need for compile-time flags like `--xe2`.
+
+### Supported Architectures
+
+| Architecture | Vendor | Vendor ID | MMQ Tile Config (x, y, warps) | Detection Criteria |
+|--------------|--------|-----------|------------------------------|--------------------|
+| Intel Xe2 (Battlemage) | Intel | 0x8086 | (64, 128, 8) | `major >= 13` |
+| Intel Xe (Alchemist) / Xe-LPG (Meteor Lake) | Intel | 0x8086 | (64, 128, 4) | `major == 12` |
+| Intel Gen9-Gen11 (integrated) | Intel | 0x8086 | (64, 128, 4) | `major >= 9 && major < 12` |
+| AMD RDNA3 | AMD | 0x1002 | (64, 128, 8) | `major >= 11` |
+| AMD RDNA2 | AMD | 0x1002 | (64, 128, 8) | `major == 10 && minor >= 30` |
+| AMD RDNA1 | AMD | 0x1002 | (64, 64, 8) | `major == 10 && minor < 30` |
+| NVIDIA Ampere | NVIDIA | 0x10de | (64, 128, 4) | `major >= 8` |
+| NVIDIA Turing | NVIDIA | 0x10de | (64, 128, 4) | `major == 7 && minor >= 5` |
+
+### Implementation Details
+
+- **Detection Code**: `ggml/src/ggml-sycl/ggml-sycl.cpp` → `ggml_sycl_init()`
+- **Arch Enum**: `ggml/src/ggml-sycl/common.hpp` → `enum sycl_arch_type`
+- **Dispatch**: All MMQ kernel files (`mmq_q*.cpp`) use `switch(dev_info.arch)` to instantiate template specializations with compile-time tile constants.
+- **Logging**: Set `GGML_SYCL_DEBUG=1` to see detection output: `Device X: vendor=0xXXXX, arch=Y, mmq={a,b,c}`
+
+### Notes
+
+- Unknown or older GPUs fall back to AMPERE-like config `(64, 128, 4)`.
+- The tile size constants are defined in `mmq_internal.hpp` (e.g., `MMQ_X_Q4_0_XE2`, `MMQ_X_Q4_0_AMPERE`, `MMQ_X_Q4_0_RDNA2`, etc.).
+- The design removes the compile-time `SYCL_USE_XMX` flag in favor of runtime detection.
+- **User Override**: Set `GGML_SYCL_FORCE_ARCH` environment variable to force a specific architecture (e.g., `INTEL_XE2`, `AMD_RDNA3`, `NVIDIA_TURING`) to override automatic detection. Useful for testing or unsupported hardware.
 
 ## Multi-Device SYCL Graphs (Experimental)
 

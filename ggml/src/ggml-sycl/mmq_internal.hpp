@@ -1344,15 +1344,9 @@ mul_mat_q(const void *__restrict__ vx, const void *__restrict__ vy,
 #define  MMQ_X_Q4_0_XE2    64
 #define  MMQ_Y_Q4_0_XE2    128
 #define NWARPS_Q4_0_XE2    8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q4_0_AMPERE MMQ_X_Q4_0_XE2
-#define  MMQ_Y_Q4_0_AMPERE MMQ_Y_Q4_0_XE2
-#define NWARPS_Q4_0_AMPERE NWARPS_Q4_0_XE2
-#else
 #define  MMQ_X_Q4_0_AMPERE 64
 #define  MMQ_Y_Q4_0_AMPERE 128
 #define NWARPS_Q4_0_AMPERE 4
-#endif
 #define  MMQ_X_Q4_0_PASCAL 64
 #define  MMQ_Y_Q4_0_PASCAL 64
 #define NWARPS_Q4_0_PASCAL 8
@@ -1392,15 +1386,9 @@ template <bool need_check> static void
 #define  MMQ_X_Q4_1_XE2    64
 #define  MMQ_Y_Q4_1_XE2    128
 #define NWARPS_Q4_1_XE2    8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q4_1_AMPERE MMQ_X_Q4_1_XE2
-#define  MMQ_Y_Q4_1_AMPERE MMQ_Y_Q4_1_XE2
-#define NWARPS_Q4_1_AMPERE NWARPS_Q4_1_XE2
-#else
 #define  MMQ_X_Q4_1_AMPERE 64
 #define  MMQ_Y_Q4_1_AMPERE 128
 #define NWARPS_Q4_1_AMPERE 4
-#endif
 #define  MMQ_X_Q4_1_PASCAL 64
 #define  MMQ_Y_Q4_1_PASCAL 64
 #define NWARPS_Q4_1_PASCAL 8
@@ -1439,15 +1427,9 @@ template <bool need_check> static void
 #define  MMQ_X_Q5_0_XE2    64
 #define  MMQ_Y_Q5_0_XE2    128
 #define NWARPS_Q5_0_XE2    8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q5_0_AMPERE MMQ_X_Q5_0_XE2
-#define  MMQ_Y_Q5_0_AMPERE MMQ_Y_Q5_0_XE2
-#define NWARPS_Q5_0_AMPERE NWARPS_Q5_0_XE2
-#else
 #define  MMQ_X_Q5_0_AMPERE 128
 #define  MMQ_Y_Q5_0_AMPERE 64
 #define NWARPS_Q5_0_AMPERE 4
-#endif
 #define  MMQ_X_Q5_0_PASCAL 64
 #define  MMQ_Y_Q5_0_PASCAL 64
 #define NWARPS_Q5_0_PASCAL 8
@@ -1486,15 +1468,9 @@ template <bool need_check> static void
 #define  MMQ_X_Q5_1_XE2    64
 #define  MMQ_Y_Q5_1_XE2    128
 #define NWARPS_Q5_1_XE2    8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q5_1_AMPERE MMQ_X_Q5_1_XE2
-#define  MMQ_Y_Q5_1_AMPERE MMQ_Y_Q5_1_XE2
-#define NWARPS_Q5_1_AMPERE NWARPS_Q5_1_XE2
-#else
 #define  MMQ_X_Q5_1_AMPERE 128
 #define  MMQ_Y_Q5_1_AMPERE 64
 #define NWARPS_Q5_1_AMPERE 4
-#endif
 #define  MMQ_X_Q5_1_PASCAL 64
 #define  MMQ_Y_Q5_1_PASCAL 64
 #define NWARPS_Q5_1_PASCAL 8
@@ -1533,15 +1509,9 @@ mul_mat_q5_1(
 #define  MMQ_X_Q8_0_XE2    64
 #define  MMQ_Y_Q8_0_XE2    128
 #define NWARPS_Q8_0_XE2    8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q8_0_AMPERE MMQ_X_Q8_0_XE2
-#define  MMQ_Y_Q8_0_AMPERE MMQ_Y_Q8_0_XE2
-#define NWARPS_Q8_0_AMPERE NWARPS_Q8_0_XE2
-#else
 #define  MMQ_X_Q8_0_AMPERE 128
 #define  MMQ_Y_Q8_0_AMPERE 64
 #define NWARPS_Q8_0_AMPERE 4
-#endif
 #define  MMQ_X_Q8_0_PASCAL 64
 #define  MMQ_Y_Q8_0_PASCAL 64
 #define NWARPS_Q8_0_PASCAL 8
@@ -1580,15 +1550,9 @@ template <bool need_check> static void
 #define  MMQ_X_Q2_K_XE2    64
 #define  MMQ_Y_Q2_K_XE2    128
 #define NWARPS_Q2_K_XE2    8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q2_K_AMPERE MMQ_X_Q2_K_XE2
-#define  MMQ_Y_Q2_K_AMPERE MMQ_Y_Q2_K_XE2
-#define NWARPS_Q2_K_AMPERE NWARPS_Q2_K_XE2
-#else
 #define  MMQ_X_Q2_K_AMPERE 64
 #define  MMQ_Y_Q2_K_AMPERE 128
 #define NWARPS_Q2_K_AMPERE 4
-#endif
 #define  MMQ_X_Q2_K_PASCAL 64
 #define  MMQ_Y_Q2_K_PASCAL 64
 #define NWARPS_Q2_K_PASCAL 8
@@ -1628,15 +1592,9 @@ mul_mat_q2_K(
 #define  MMQ_X_Q3_K_XE2    64
 #define  MMQ_Y_Q3_K_XE2    128
 #define NWARPS_Q3_K_XE2    8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q3_K_AMPERE MMQ_X_Q3_K_XE2
-#define  MMQ_Y_Q3_K_AMPERE MMQ_Y_Q3_K_XE2
-#define NWARPS_Q3_K_AMPERE NWARPS_Q3_K_XE2
-#else
 #define  MMQ_X_Q3_K_AMPERE 128
 #define  MMQ_Y_Q3_K_AMPERE 128
 #define NWARPS_Q3_K_AMPERE 4
-#endif
 #define  MMQ_X_Q3_K_PASCAL 64
 #define  MMQ_Y_Q3_K_PASCAL 64
 #define NWARPS_Q3_K_PASCAL 8
@@ -1677,16 +1635,9 @@ mul_mat_q3_K(
 #define  MMQ_X_Q4_K_XE2    64
 #define  MMQ_Y_Q4_K_XE2    128
 #define NWARPS_Q4_K_XE2    8
-#if defined(SYCL_USE_XMX)
-// XE2 path uses larger tiles (MMQ doesn't use XMX instructions)
-#define  MMQ_X_Q4_K_AMPERE MMQ_X_Q4_K_XE2
-#define  MMQ_Y_Q4_K_AMPERE MMQ_Y_Q4_K_XE2
-#define NWARPS_Q4_K_AMPERE NWARPS_Q4_K_XE2
-#else
 #define  MMQ_X_Q4_K_AMPERE 64
 #define  MMQ_Y_Q4_K_AMPERE 128
 #define NWARPS_Q4_K_AMPERE 4
-#endif
 #define  MMQ_X_Q4_K_PASCAL 64
 #define  MMQ_Y_Q4_K_PASCAL 64
 #define NWARPS_Q4_K_PASCAL 8
@@ -1726,15 +1677,12 @@ template <bool need_check> static void
 #define  MMQ_X_Q5_K_XE2    64
 #define  MMQ_Y_Q5_K_XE2    128
 #define NWARPS_Q5_K_XE2    8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q5_K_AMPERE MMQ_X_Q5_K_XE2
-#define  MMQ_Y_Q5_K_AMPERE MMQ_Y_Q5_K_XE2
-#define NWARPS_Q5_K_AMPERE NWARPS_Q5_K_XE2
-#else
 #define  MMQ_X_Q5_K_AMPERE 64
 #define  MMQ_Y_Q5_K_AMPERE 128
 #define NWARPS_Q5_K_AMPERE 4
-#endif
+#define  MMQ_X_Q2_K_AMPERE 64
+#define  MMQ_Y_Q2_K_AMPERE 128
+#define NWARPS_Q2_K_AMPERE 4
 #define  MMQ_X_Q5_K_PASCAL 64
 #define  MMQ_Y_Q5_K_PASCAL 64
 #define NWARPS_Q5_K_PASCAL 8
@@ -1774,15 +1722,9 @@ mul_mat_q5_K(
 #define  MMQ_X_Q6_K_XE2    64
 #define  MMQ_Y_Q6_K_XE2    128
 #define NWARPS_Q6_K_XE2    8
-#if defined(SYCL_USE_XMX)
-#define  MMQ_X_Q6_K_AMPERE MMQ_X_Q6_K_XE2
-#define  MMQ_Y_Q6_K_AMPERE MMQ_Y_Q6_K_XE2
-#define NWARPS_Q6_K_AMPERE NWARPS_Q6_K_XE2
-#else
 #define  MMQ_X_Q6_K_AMPERE 64
 #define  MMQ_Y_Q6_K_AMPERE 64
 #define NWARPS_Q6_K_AMPERE 4
-#endif
 #define  MMQ_X_Q6_K_PASCAL 64
 #define  MMQ_Y_Q6_K_PASCAL 64
 #define NWARPS_Q6_K_PASCAL 8
