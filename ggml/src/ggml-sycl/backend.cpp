@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <assert.h>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -503,8 +504,16 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     GGML_SYCL_DEBUG("[SYCL] %s: about to wait on stream %p for device %d\n", __func__, (void*)stream, sycl_ctx->device);
+    
+    // Add timeout detection for debugging hangs
+    auto start = std::chrono::steady_clock::now();
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
-    GGML_SYCL_DEBUG("[SYCL] %s: wait completed successfully\n", __func__);
+    auto end = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    if (elapsed_ms > 5000) {
+        GGML_LOG_WARN("[SYCL] %s: wait took %ld ms (potential hang detected)\n", __func__, (long)elapsed_ms);
+    }
+    GGML_SYCL_DEBUG("[SYCL] %s: wait completed successfully (took %ld ms)\n", __func__, (long)elapsed_ms);
 
     GGML_UNUSED(backend);
 }

@@ -196,8 +196,8 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
                                                      /*num_src=*/2, " : converting src1 to Q8_1");
                 try {
-                    // Correct argument order: kx = row length (ne11 = nrows1), ky = number of rows (ne10)
-                    quantize_row_q8_1_sycl<quantize_f>(dev[i].src1_ddf, dev[i].src1_ddq, nrows1, ne10, src1_padded_col_size, stream);
+                    // kx = row length (ne10 = K dimension), ky = number of rows (nrows1)
+                    quantize_row_q8_1_sycl<quantize_f>(dev[i].src1_ddf, dev[i].src1_ddq, ne10, nrows1, src1_padded_col_size, stream);
                 } catch (sycl::exception const &exc) {
                     std::cerr << "Quantize_row_q8_1_sycl error" << exc.what() << "Exception caught at file:" << __FILE__
                               << ", line:" << __LINE__ << std::endl;
@@ -1222,6 +1222,13 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0
 #ifdef SYCL_USE_XMX
     use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
 #endif // SYCL_USE_XMX
+
+    // MMQ kernels with need_check=true (when nrows < mmq_y tile size) can have shared memory 
+    // write collisions that cause GPU hangs on Intel GPUs. Fall back to oneMKL when nrows
+    // is too small. The MMQ_Y tile sizes range from 32-128, so we use 128 as the minimum.
+    // See AGENTS.md for more details.
+    constexpr int64_t MMQ_MIN_NROWS = 128;
+    use_mul_mat_q = use_mul_mat_q && (src0->ne[1] >= MMQ_MIN_NROWS);
 
     // Dispatch becomes obscure with the reorder, MMVQ when the reorder optimization
     // is enabled takes precedence over DMMV, the current if-else implementation

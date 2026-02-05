@@ -10,8 +10,14 @@
   - P2P copies are opt-in via `GGML_SYCL_ENABLE_P2P=1` (may cause device-lost on some systems).
 - SYCL MMQ kernel known issues:
   - MMQ kernels with `need_check=true` (when nrows < mmq_y tile size) can have shared memory write collisions.
-  - Fixed by adding MMQ_MIN_NROWS=128 guard in ggml-sycl.cpp to fall back to oneMKL when nrows is too small.
+  - Fixed by adding MMQ_MIN_NROWS=128 guard in matmul.cpp to fall back to oneMKL when nrows is too small.
   - Test with: `./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q4_K"`
+- SYCL MMVQ quantization fix (Feb 2026):
+  - Fixed swapped arguments in `quantize_row_q8_1_sycl` call at line ~200 of matmul.cpp.
+  - Bug: `kx=nrows1, ky=ne10` was wrong; correct is `kx=ne10, ky=nrows1`.
+  - Symptom: MUL_MAT with quantized types (q4_K, q8_0, etc.) produced `ERR = inf` for n=2-8, m=16.
+  - Root cause: With kx=2 < QK8_1=32, `num_quant_blocks = ky * (kx/32) = 0`, so quantization kernel didn't run.
+  - Test: `GGML_SYCL_DISABLE_OPT=1 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q4_K"`
 
 ## Multi-Device SYCL Graphs (Experimental)
 
