@@ -697,12 +697,9 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
 
                     // Exclude known problematic MMQ types that cause GPU faults under SYCL graphs
                     // q5_0 and q8_0 with certain shapes have been observed to cause device loss
-                    // MXFP4 also causes device loss in graphs
+                    // F16, BF16, MXFP4 are now supported via graph-compatible tiled kernels
                     if (src0->type == GGML_TYPE_Q5_0 || 
-                        src0->type == GGML_TYPE_Q8_0 || 
-                        src0->type == GGML_TYPE_MXFP4 ||
-                        src0->type == GGML_TYPE_F16 ||
-                        src0->type == GGML_TYPE_BF16) {
+                        src0->type == GGML_TYPE_Q8_0) {
                         GGML_LOG_INFO("%s: disabling SYCL graphs for problematic MMQ type %s\n",
                             __func__, ggml_type_name(src0->type));
                         return graph_compat_t::DISABLED;
@@ -725,9 +722,6 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                          break;
                     }
                     if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && src1->ne[1] == 1 && src1->ne[3] == 1) {
-                        break;
-                    }
-                    if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1) {
                         break;
                     }
 
@@ -777,12 +771,17 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                     // - F16 x F16 -> F32: NOT supported (src1_ddf_i is float, not f16)
                     // - BF16 x BF16 -> F32: NOT supported (same reason)
                     // Check if the tiled GEMM supports this type combination
-                    // Currently only F32xF32 is fully tested for graph compatibility
+                    // F32xF32, F16xF32, BF16xF32, MXFP4xF32 are supported via graph-compatible kernels
                     bool tiled_gemm_supported = false;
                     if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
                         tiled_gemm_supported = true;
+                    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32) {
+                        tiled_gemm_supported = true;
+                    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32) {
+                        tiled_gemm_supported = true;
+                    } else if (src0->type == GGML_TYPE_MXFP4 && src1->type == GGML_TYPE_F32) {
+                        tiled_gemm_supported = true;
                     }
-                    // F16xF32, BF16xF32, MXFP4xF32 fall back to oneMKL (not graph compatible)
 
                     if (tiled_gemm_supported) {
                         break; // Proceed with graph

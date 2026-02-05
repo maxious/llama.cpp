@@ -80,6 +80,10 @@ detect_and_find_package(IntelSYCL)
 if (IntelSYCL_FOUND)
     # Use oneAPI CMake when possible
     target_link_libraries(ggml-sycl PRIVATE IntelSYCL::SYCL_CXX)
+    # Also explicitly link the SYCL runtime library to satisfy symbols (libsycl.so)
+    if (SYCL_LIBRARY)
+        target_link_libraries(ggml-sycl PRIVATE ${SYCL_LIBRARY})
+endif()
 else()
     # Fallback to the simplest way of enabling SYCL when using intel/llvm nightly for instance
     target_compile_options(ggml-sycl PRIVATE "-fsycl")
