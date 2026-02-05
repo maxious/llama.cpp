@@ -628,10 +628,22 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                 break;
             case GGML_OP_CONCAT:
                 break;
-            case GGML_OP_MUL_MAT_ID:
+                case GGML_OP_MUL_MAT_ID:
+            {
                 // Graph-compatible tiled implementation is now available.
                 // It runs entirely on device without host synchronization.
+                // However, it only supports F32 for src0 (weights), src1 (input), and dst (output).
+                // Disable graphs for unsupported type combinations to prevent memory corruption and device lost.
+                ggml_tensor * src0 = node->src[0];
+                ggml_tensor * src1 = node->src[1];
+                ggml_tensor * dst = node;
+                if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+                    GGML_LOG_INFO("%s: disabling SYCL graphs for MUL_MAT_ID with unsupported type combination (src0=%s, src1=%s, dst=%s)\n",
+                        __func__, ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type));
+                    return graph_compat_t::DISABLED;
+                }
                 break;
+            }
         case GGML_OP_SET_ROWS:
             // SET_ROWS uses USM memory and has implicit data dependencies.
             // We insert an explicit barrier in ggml_sycl_op_set_rows to ensure ordering.
