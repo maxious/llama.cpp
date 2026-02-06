@@ -1167,6 +1167,10 @@ static void ggml_sycl_op_mul_mat_tiled(
         launch_gemm_bf16_f32_tiled(stream, src1_bf16, (const sycl::ext::oneapi::bfloat16*)src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, false);
     } else if (src0->type == GGML_TYPE_MXFP4 && dst->type == GGML_TYPE_F32) {
         // MXFP4 graph support: use fused dequantization kernel
+        // Computes: C = A * B^T where B (src0) is MXFP4
+        // A = src1 (activations, F16 after conversion), N x K
+        // B = src0 (weights, MXFP4), M x K
+        // C = dst (output, F32), N x M
         
         // Convert src1_ddf_i (F32 -> F16)
         ggml_sycl_pool_alloc<sycl::half> src1_f16_alloc(ctx.pool(), N * K);
@@ -1178,8 +1182,8 @@ static void ggml_sycl_op_mul_mat_tiled(
             });
         });
 
-        // Use fused kernel
-        launch_gemm_mxfp4_f32_tiled(stream, src0_dd_i, src1_f16, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc, false);
+        // Use fused kernel: A=src1_f16 (N x K), B=src0 (M x K), C=dst (N x M)
+        launch_gemm_mxfp4_f32_tiled(stream, src1_f16, src0_dd_i, dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc);
     } else {
         // Fallback for unsupported types
         ggml_sycl_op_mul_mat_sycl(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low, row_high, src1_ncols, src1_padded_row_size, stream);

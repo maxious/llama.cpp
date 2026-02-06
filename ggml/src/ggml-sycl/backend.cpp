@@ -708,12 +708,9 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                         return graph_compat_t::DISABLED;
                     }
                     
-                    // MXFP4 tiled GEMM has precision issues - disable graphs for now
-                    // TODO: Fix MXFP4 tiled kernel precision
-                    if (src0->type == GGML_TYPE_MXFP4) {
-                        GGML_LOG_DEBUG("%s: disabling SYCL graphs for MXFP4 (tiled kernel precision issue)\n", __func__);
-                        return graph_compat_t::DISABLED;
-                    }
+                    // MXFP4 is now supported with the graph-compatible tiled kernel
+                    // The kernel aligns tile boundaries with MXFP4 block boundaries (BK=32=QK_MXFP4)
+                    // to maintain numerical accuracy with per-block E8M0 scaling
 
                     // Reordering logic:
                     // During graph recording, we disable reordering in matmul.cpp by checking force_graph_compatible.

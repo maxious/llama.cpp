@@ -26,6 +26,14 @@
   - Symptom: MUL_MAT with quantized types (q4_K, q8_0, etc.) produced `ERR = inf` for n=2-8, m=16.
   - Root cause: With kx=2 < QK8_1=32, `num_quant_blocks = ky * (kx/32) = 0`, so quantization kernel didn't run.
    - Test: `GGML_SYCL_DISABLE_OPT=1 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q4_K"`
+- SYCL MXFP4 Graph-Compatible Tiled GEMM (Feb 2026):
+  - Added `gemm_mxfp4_f32_tiled.hpp` for SYCL graph-compatible MXFP4 matrix multiplication.
+  - MXFP4 uses E2M1 format (4-bit) with per-block E8M0 scale (32 elements/block).
+  - Key fix: BK tile size MUST equal QK_MXFP4 (32) to align with MXFP4 block boundaries.
+  - Original bug: Argument order was swapped (src0/src1 inverted), causing completely wrong results.
+  - Dequantization: `value = e8m0_scale * kvalues_mxfp4[q4] * 0.5` (kvalues_mxfp4 is doubled for DP4A).
+  - Layout: `qs[j]` contains elements j (low nibble) and j+16 (high nibble).
+  - Test: `GGML_SYCL_DISABLE_GRAPH=0 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=mxfp4"`
 
 ## SYCL Runtime Architecture Detection
 
