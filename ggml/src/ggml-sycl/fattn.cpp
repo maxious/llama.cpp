@@ -208,9 +208,13 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
         return false;
     }
 
-    // Sinks (attention sinks / StreamingLLM) supported in MKL path
-    // Sinks tensor has shape [n_heads] - one float per head
-    if (sinks != nullptr && sinks->type != GGML_TYPE_F32) {
+    // Mask and sinks are not yet supported in SYCL flash attention
+    // These features cause NaN outputs and need further debugging
+    // TODO: Re-enable after fixing mask/sinks correctness issues
+    if (mask != nullptr && mask->data != nullptr) {
+        return false;
+    }
+    if (sinks != nullptr && sinks->data != nullptr) {
         return false;
     }
 
@@ -465,13 +469,13 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
 
         cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) {
 
-            float* q_loc = Qtile.template get_multi_ptr<sycl::access::decorated::no>().get();
-            float* k_loc = Ktile.template get_multi_ptr<sycl::access::decorated::no>().get();
-            float* v_loc = Vtile.template get_multi_ptr<sycl::access::decorated::no>().get();
-            float* s_loc = Stile.template get_multi_ptr<sycl::access::decorated::no>().get();
-            float* p_loc = Ptile.template get_multi_ptr<sycl::access::decorated::no>().get();
-            float* m_loc = m_local.template get_multi_ptr<sycl::access::decorated::no>().get();
-            float* l_loc = l_local.template get_multi_ptr<sycl::access::decorated::no>().get();
+            float* q_loc = &Qtile[0][0];
+            float* k_loc = &Ktile[0][0];
+            float* v_loc = &Vtile[0][0];
+            float* s_loc = &Stile[0][0];
+            float* p_loc = &Ptile[0];
+            float* m_loc = &m_local[0];
+            float* l_loc = &l_local[0];
 
             auto group = it.get_group();
             int group_id_i = group.get_group_id(0);
@@ -550,12 +554,17 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
             int row = idx % N;
             float l_val = l_d[idx];
 
+            float * o_row = dst_d + (ptrdiff_t)(head_idx * N + row) * o_row_stride;
+
             if (l_val <= 0.0f) {
+                // Fully masked row - output should be zero
+                for (int col = 0; col < DV; ++col) {
+                    o_row[col] = 0.0f;
+                }
                 return;
             }
 
             float inv_l = 1.0f / l_val;
-            float * o_row = dst_d + (ptrdiff_t)(head_idx * N + row) * o_row_stride;
 
             for (int col = 0; col < DV; ++col) {
                 o_row[col] *= inv_l;

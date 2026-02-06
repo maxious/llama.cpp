@@ -277,6 +277,9 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
         partials = (float *) sycl::malloc_device(partials_total * sizeof(float), *stream);
     }
 
+    // Zero partials buffer to prevent NaN from uninitialized memory
+    stream->memset(partials, 0, partials_total * sizeof(float));
+
     float * S_d = nullptr;
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
     if (use_async_mem) {
@@ -286,6 +289,9 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
     {
         S_d = (float *) sycl::malloc_device(n_heads * N * N_kv * sizeof(float), *stream);
     }
+
+    // Zero S_d buffer to prevent NaN from uninitialized memory
+    stream->memset(S_d, 0, n_heads * N * N_kv * sizeof(float));
 
     const int64_t lda_q = DQK;
     const int64_t lda_k = DQK;
@@ -347,13 +353,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     S_row[k] = s_val;
                     row_max = sycl::fmax(row_max, s_val);
                 }
-                float sink_contrib = 0.0f;
-                if (split == 0 && sinks_d != nullptr) {
-                    float sink_val = sinks_d[head];
-                    row_max = sycl::fmax(row_max, sink_val);
-                    sink_contrib = sycl::exp(sycl::fmax(sink_val - row_max, -20.0f));
-                }
-                float sum = sink_contrib;
+                float sum = 0.0f;
                 for (int64_t k = 0; k < kv_chunk_size; ++k) {
                     float exp_val = sycl::exp(sycl::fmax(S_row[k] - row_max, -20.0f));
                     S_row[k] = exp_val;
