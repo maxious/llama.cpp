@@ -1,6 +1,18 @@
 #pragma once
 #include "common.hpp"
 
+struct ggml_backend_sycl_buffer_context {
+    int device;
+    void * dev_ptr = nullptr;
+    queue_ptr stream;
+    std::string name;
+    optimize_feature opt_feature;
+    std::vector<ggml_tensor_extra_gpu *> tensor_extras;
+
+    ggml_backend_sycl_buffer_context(int device, void * dev_ptr, queue_ptr stream);
+    ~ggml_backend_sycl_buffer_context();
+};
+
 struct ggml_backend_sycl_buffer_type_context {
     int device;
     std::string name;
@@ -19,4 +31,4 @@ struct ggml_backend_sycl_split_buffer_type_context {
     std::array<float, GGML_SYCL_MAX_DEVICES> tensor_split;
 };
 
-void dev2dev_memcpy(sycl::queue &q_dst, sycl::queue &q_src, void *ptr_dst, const void *ptr_src, size_t size);
+void dev2dev_memcpy(sycl::queue &q_dst, sycl::queue &q_src, void *ptr_dst, const void *ptr_src, size_t size, int dev_src = -1, int dev_dst = -1);

@@ -44,6 +44,7 @@
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/backend.hpp"
 #include "ggml-sycl/common.hpp"
+#include "ggml-sycl/sycl_buffer.hpp"
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/presets.hpp"
@@ -469,28 +470,38 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend,
+static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend_src,
+                                               ggml_backend_t backend_dst,
                                                const ggml_tensor *src,
                                                ggml_tensor *dst) try {
-    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
-    bool is_cpy_supported                = dst->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) &&
-                            ggml_backend_buffer_is_sycl(src->buffer);
+    GGML_UNUSED(backend_src);
+    GGML_UNUSED(backend_dst);
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": dst", dst).c_str());
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(" src", src).c_str());
-    GGML_SYCL_DEBUG(" is_cpy_supported=%d\n", is_cpy_supported);
-    if (is_cpy_supported) {
-        /*
-        DPCT1009:215: SYCL uses exceptions to report errors and does not use the
-        error codes. The original code was commented out and a warning string
-        was inserted. You need to rewrite this code.
-        */
-        const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-        SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
-            dst->data, src->data, ggml_nbytes(dst))));
+
+    // Check if both buffers are SYCL buffers (can be on different devices)
+    if (ggml_backend_buffer_is_sycl(src->buffer) && ggml_backend_buffer_is_sycl(dst->buffer)) {
+        ggml_backend_sycl_buffer_context * src_ctx = (ggml_backend_sycl_buffer_context *)src->buffer->context;
+        ggml_backend_sycl_buffer_context * dst_ctx = (ggml_backend_sycl_buffer_context *)dst->buffer->context;
+
+        int dev_src = src_ctx->device;
+        int dev_dst = dst_ctx->device;
+        GGML_SYCL_DEBUG("[SYCL-P2P] cpy_tensor_async: dev %d -> dev %d, size=%zu\n", dev_src, dev_dst, ggml_nbytes(src));
+
+        // Get streams from either buffer's context
+        ggml_sycl_set_device(dst_ctx->device);
+        queue_ptr stream_dst = dst_ctx->stream;
+        queue_ptr stream_src = src_ctx->stream;
+        size_t size = ggml_nbytes(src);
+
+        // Use P2P-enabled memcpy (handles cross-device automatically)
+        dev2dev_memcpy(*stream_dst, *stream_src, dst->data, src->data, size,
+                       src_ctx->device, dst_ctx->device);
         return true;
     }
 
+    GGML_SYCL_DEBUG("[SYCL-P2P] cpy_tensor_async: not both SYCL buffers, falling back\n");
     return false;
 }
 catch (sycl::exception const &exc) {
@@ -1170,9 +1181,7 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .free                    = */ ggml_backend_sycl_free,
     /* .set_tensor_async        = */ ggml_backend_sycl_set_tensor_async,
     /* .get_tensor_async        = */ ggml_backend_sycl_get_tensor_async,
-    /* .cpy_tensor_async        = */ NULL, // ggml_backend_sycl_cpy_tensor_async,
-                                           // // TODO: update for the new
-                                           // interface
+    /* .cpy_tensor_async        = */ ggml_backend_sycl_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_sycl_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,

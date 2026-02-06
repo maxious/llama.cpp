@@ -62,34 +62,111 @@
 #include "sycl_defs.hpp"
 // sycl buffer
 
-struct ggml_backend_sycl_buffer_context {
-    int device;
-    void * dev_ptr = nullptr;
-    queue_ptr stream;
-    std::string name;
-    optimize_feature opt_feature;
-    std::vector<ggml_tensor_extra_gpu *> tensor_extras;
-
-    ggml_backend_sycl_buffer_context(int device, void * dev_ptr, queue_ptr stream) :
-        device(device), dev_ptr(dev_ptr), stream(stream) {
-            check_allow_gpu_index(device);
-            name = (GGML_SYCL_NAME + std::to_string(device));
-            opt_feature = ggml_sycl_info().devices[device].opt_feature;
-        }
-
-    ~ggml_backend_sycl_buffer_context() {
-        if (dev_ptr != nullptr) {
-            ggml_sycl_set_device(device);
-            SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(dev_ptr, *stream)));
-        }
-
-        //release extra used by tensors
-        for (ggml_tensor_extra_gpu * extra : tensor_extras) {
-            release_extra_gpu(extra);
-        }
-
-    }
+// ==================== P2P support ====================
+struct p2p_peer_state {
+    bool enabled = false;
+    bool can_access = false;
 };
+static p2p_peer_state g_p2p_states[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_DEVICES];
+static bool g_p2p_initialized = false;
+
+// Check if P2P access is supported between two devices
+static bool ggml_sycl_can_access_peer(int dev_src, int dev_dst) {
+    static bool force_p2p = (getenv("GGML_SYCL_FORCE_P2P") != nullptr);
+    static bool disable_p2p = (getenv("GGML_SYCL_DISABLE_P2P") != nullptr);
+    
+    if (disable_p2p) return false;
+    if (force_p2p) {
+        GGML_SYCL_DEBUG("[SYCL-P2P] Forcing P2P enable for device %d -> %d\n", dev_src, dev_dst);
+        return true;
+    }
+
+    try {
+        dpct::device_ext &device_src = dpct::dev_mgr::instance().get_device(dev_src);
+        dpct::device_ext &device_dst = dpct::dev_mgr::instance().get_device(dev_dst);
+        bool can_access = device_src.ext_oneapi_can_access_peer(
+            device_dst, sycl::ext::oneapi::peer_access::access_supported);
+        GGML_SYCL_DEBUG("[SYCL-P2P] Device %d -> %d: can_access=%d\n", dev_src, dev_dst, can_access);
+        return can_access;
+    } catch (const sycl::exception &e) {
+        GGML_SYCL_DEBUG("[SYCL-P2P] Device %d -> %d: exception - %s\n", dev_src, dev_dst, e.what());
+        return false;
+    }
+}
+
+// Enable P2P access between two devices
+static void ggml_sycl_enable_peer_access(int dev_src, int dev_dst) {
+    try {
+        dpct::device_ext &device_src = dpct::dev_mgr::instance().get_device(dev_src);
+        dpct::device_ext &device_dst = dpct::dev_mgr::instance().get_device(dev_dst);
+        device_src.ext_oneapi_enable_peer_access(device_dst);
+        g_p2p_states[dev_src][dev_dst].enabled = true;
+        GGML_SYCL_DEBUG("[SYCL-P2P] Enabled peer access from device %d to %d\n", dev_src, dev_dst);
+    } catch (const sycl::exception &e) {
+        GGML_SYCL_DEBUG("[SYCL-P2P] Failed to enable peer access from device %d to %d: %s\n", dev_src, dev_dst, e.what());
+        g_p2p_states[dev_src][dev_dst].can_access = false;
+        g_p2p_states[dev_src][dev_dst].enabled = false;
+    }
+}
+
+// Initialize P2P state matrix
+static void ggml_sycl_p2p_init() {
+    if (g_p2p_initialized) return;
+    int dev_count = ggml_sycl_info().device_count;
+    for (int i = 0; i < dev_count; ++i) {
+        for (int j = 0; j < dev_count; ++j) {
+            if (i != j) {
+                g_p2p_states[i][j].can_access = ggml_sycl_can_access_peer(i, j);
+            }
+        }
+    }
+    g_p2p_initialized = true;
+}
+// ====================================================
+
+void dev2dev_memcpy(sycl::queue &q_dst, sycl::queue &q_src, void *ptr_dst,
+                    const void *ptr_src, size_t size, int dev_src, int dev_dst) {
+    ggml_sycl_p2p_init();
+
+    bool use_p2p = false;
+    if (dev_src >= 0 && dev_dst >= 0 && dev_src != dev_dst) {
+        // Check if we need to enable P2P
+        if (g_p2p_states[dev_src][dev_dst].can_access && !g_p2p_states[dev_src][dev_dst].enabled) {
+            ggml_sycl_enable_peer_access(dev_src, dev_dst);
+        }
+        use_p2p = g_p2p_states[dev_src][dev_dst].enabled;
+    }
+
+    if (use_p2p) {
+        GGML_SYCL_DEBUG("[SYCL-P2P] Using direct D2D copy: %zu bytes from dev %d -> dev %d\n", size, dev_src, dev_dst);
+        q_src.memcpy(ptr_dst, ptr_src, size).wait();
+    } else {
+        if (dev_src != dev_dst) {
+            GGML_SYCL_DEBUG("[SYCL-P2P] P2P not available, falling back to host staging for dev %d -> dev %d\n", dev_src, dev_dst);
+        }
+        char *host_buf = (char *)malloc(size);
+        q_src.memcpy(host_buf, (const char *)ptr_src, size).wait();
+        q_dst.memcpy((char *)ptr_dst, host_buf, size).wait();
+        free(host_buf);
+    }
+}
+
+// Implementation of ggml_backend_sycl_buffer_context member functions
+ggml_backend_sycl_buffer_context::ggml_backend_sycl_buffer_context(int device, void * dev_ptr, queue_ptr stream) :
+    device(device), dev_ptr(dev_ptr), stream(stream) {
+        check_allow_gpu_index(device);
+        name = (GGML_SYCL_NAME + std::to_string(device));
+        opt_feature = ggml_sycl_info().devices[device].opt_feature;
+    }
+
+ggml_backend_sycl_buffer_context::~ggml_backend_sycl_buffer_context() {
+    if (dev_ptr != nullptr) {
+        ggml_sycl_set_device(device);
+        SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(dev_ptr, *stream)));
+    }
+}
+
+
 
 const char * ggml_backend_sycl_buffer_type_get_name(ggml_backend_buffer_type_t buft);
 
@@ -202,13 +279,7 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-void dev2dev_memcpy(sycl::queue &q_dst, sycl::queue &q_src, void *ptr_dst,
-                    const void *ptr_src, size_t size) {
-    char *host_buf = (char *)malloc(size);
-    q_src.memcpy(host_buf, (const char *)ptr_src, size).wait();
-    q_dst.memcpy((char *)ptr_dst, host_buf, size).wait();
-    free(host_buf);
-}
+
 
 static bool
 ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
@@ -250,21 +321,8 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         size_t size = ggml_nbytes(src);
 
         //todo. it's dirty solutino to walkaroud known issue:device2device cross GPUs.
-        dev2dev_memcpy(*stream_dst, *stream_src, dst->data, src->data, size);
-
-//todo, it's known issue：error in device2device cross GPUs. reused when the issue is fixed. DON"T remove
-#if 0
-        SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy(
-            (char *)dst->data, (const char *)src->data, size).wait()));
-
-        /*
-        DPCT1009:201: SYCL uses exceptions to report errors and does not use the
-        error codes. The original code was commented out and a warning string
-        was inserted. You need to rewrite this code.
-        */
-        SYCL_CHECK(CHECK_TRY_ERROR(
-            dpct::dev_mgr::instance().get_device(dst_ctx->device).queues_wait_and_throw()));
-#endif
+        dev2dev_memcpy(*stream_dst, *stream_src, dst->data, src->data, size,
+                       src_ctx->device, dst_ctx->device);
         return true;
     }
     return false;
@@ -930,7 +988,6 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
 }
 
 ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
-    GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_host_buffer_type\n");
     static struct ggml_backend_buffer_type ggml_backend_sycl_buffer_type_host = {
         /* .iface    = */ {
             /* .get_name         = */ ggml_backend_sycl_host_buffer_type_name,
