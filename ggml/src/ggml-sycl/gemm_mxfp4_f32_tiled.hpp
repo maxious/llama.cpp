@@ -228,4 +228,240 @@ inline void launch_gemm_mxfp4_f32_tiled(
     });
 }
 
+// =============================================================================
+// Indirect GEMM for MUL_MAT_ID (MoE expert dispatch)
+// =============================================================================
+// For MUL_MAT_ID, we compute C = A * B^T for a subset of rows determined by
+// expert routing. M_ptr contains the count of rows for this expert, and
+// offset_ptr contains the starting offset in the packed buffers.
+//
+// Convention for MUL_MAT_ID:
+//   A = src1_packed (activations, F32), [total_rows x K] but we process [M x K]
+//   B = expert weights (MXFP4), [N x K] where N is output dim
+//   C = dst_packed (output, F32), [total_rows x N] but we write [M x N]
+//
+// Note: In MUL_MAT_ID context, the dimensions are:
+//   M = number of rows assigned to this expert (dynamic, read from M_ptr)
+//   N = output dimension (weight matrix rows)  
+//   K = input dimension (weight matrix cols)
+
+template <int BM, int BN, int BK, int TM, int TN>
+inline void gemm_mxfp4_f32_tiled_kernel_indirect(
+    sycl::nd_item<2> it,
+    sycl::local_accessor<float, 1> tile_A,
+    sycl::local_accessor<float, 1> tile_B,
+    const float * __restrict__ A,           // src1_packed (activations, F32), M x K
+    const block_mxfp4 * __restrict__ B,     // weights (MXFP4), N x K
+    float * __restrict__ C,                  // dst_packed (output, F32), M x N
+    const int * __restrict__ M_ptr,         // pointer to row count for this expert
+    const int * __restrict__ offset_ptr,    // pointer to row offset in packed buffers
+    const int N, const int K,               // N = output dim, K = input dim
+    const float alpha, const float beta,
+    const int lda, const int ldb, const int ldc
+) {
+    // BK must match QK_MXFP4 for correct block alignment
+    static_assert(BK == QK_MXFP4, "BK must equal QK_MXFP4 for MXFP4 block alignment");
+    
+    const int M = *M_ptr;
+    if (M <= 0) return;
+    
+    const int offset = (offset_ptr) ? *offset_ptr : 0;
+    
+    // Apply offset to A and C (packed buffers)
+    // B (weights) doesn't need offset - it's passed as base + expert_idx * stride
+    const float * A_ptr = A + offset * lda;
+    float * C_ptr = C + offset * ldc;
+    
+    constexpr int WG_M = BM / TM;
+    constexpr int WG_N = BN / TN;
+    
+    const int block_row = it.get_group(0);  // M dimension (rows)
+    const int block_col = it.get_group(1);  // N dimension (cols/output)
+    
+    // Early exit if this workgroup is beyond the actual rows
+    if (block_row * BM >= M) return;
+    
+    const int thread_row = it.get_local_id(0);
+    const int thread_col = it.get_local_id(1);
+    const int thread_id = thread_row * WG_N + thread_col;
+    
+    const int row_start = block_row * BM + thread_row * TM;
+    const int col_start = block_col * BN + thread_col * TN;
+    
+    float acc[TM][TN];
+    #pragma unroll
+    for (int tm = 0; tm < TM; ++tm) {
+        #pragma unroll
+        for (int tn = 0; tn < TN; ++tn) {
+            acc[tm][tn] = 0.0f;
+        }
+    }
+    
+    constexpr int WG_SIZE = WG_M * WG_N;
+    constexpr int A_TILE_SIZE = BM * BK;
+    constexpr int B_TILE_SIZE = BN * BK;
+    constexpr int A_LOADS_PER_THREAD = (A_TILE_SIZE + WG_SIZE - 1) / WG_SIZE;
+    constexpr int B_LOADS_PER_THREAD = (B_TILE_SIZE + WG_SIZE - 1) / WG_SIZE;
+    
+    // Number of MXFP4 blocks per row of B
+    const int num_blocks_per_row = ldb / QK_MXFP4;
+    const int num_k_tiles = (K + BK - 1) / BK;
+    
+    for (int k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
+        const int k_start = k_tile * BK;
+        const int k_block = k_tile;  // Since BK == QK_MXFP4
+        
+        // Load A tile [BM x BK] from F32
+        #pragma unroll
+        for (int load = 0; load < A_LOADS_PER_THREAD; ++load) {
+            const int flat_idx = thread_id + load * WG_SIZE;
+            if (flat_idx < A_TILE_SIZE) {
+                const int tile_m = flat_idx / BK;
+                const int tile_k = flat_idx % BK;
+                const int global_row = block_row * BM + tile_m;
+                const int global_k = k_start + tile_k;
+                
+                float val = 0.0f;
+                if (global_row < M && global_k < K) {
+                    // A is row-major: A[m][k] at offset m*lda + k
+                    val = A_ptr[global_row * lda + global_k];
+                }
+                tile_A[tile_m * BK + tile_k] = val;
+            }
+        }
+        
+        // Load B tile [BN x BK] from MXFP4 and dequantize to float
+        // Since BK == QK_MXFP4, each k-tile corresponds exactly to one MXFP4 block
+        #pragma unroll
+        for (int load = 0; load < B_LOADS_PER_THREAD; ++load) {
+            const int flat_idx = thread_id + load * WG_SIZE;
+            if (flat_idx < B_TILE_SIZE) {
+                const int tile_n = flat_idx / BK;
+                const int tile_k = flat_idx % BK;
+                const int global_col = block_col * BN + tile_n;
+                const int global_k = k_start + tile_k;
+                
+                float val = 0.0f;
+                if (global_col < N && global_k < K) {
+                    // Block index: B[global_col] has (K/32) blocks
+                    // For this k_tile, we're loading exactly one block per row
+                    const int block_idx = global_col * num_blocks_per_row + k_block;
+                    const block_mxfp4& blk = B[block_idx];
+                    
+                    // Get the E8M0 scale for this block
+                    const float d = ggml_sycl_e8m0_to_fp32(blk.e);
+                    
+                    // Extract the 4-bit quantized value
+                    // MXFP4 layout: qs[j] contains elements j (low nibble) and j+16 (high nibble)
+                    uint8_t q4;
+                    if (tile_k < 16) {
+                        q4 = blk.qs[tile_k] & 0x0F;
+                    } else {
+                        q4 = blk.qs[tile_k - 16] >> 4;
+                    }
+                    
+                    // Dequantize: scale * lookup * 0.5 (because kvalues_mxfp4 is doubled)
+                    val = d * static_cast<float>(kvalues_mxfp4[q4]) * 0.5f;
+                }
+                tile_B[tile_n * BK + tile_k] = val;
+            }
+        }
+        
+        sycl::group_barrier(it.get_group());
+        
+        // Compute: C[m][n] += sum_k A[m][k] * B[n][k]
+        // This is the transposed multiply: C = A * B^T
+        #pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            float a_reg[TM];
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm) {
+                a_reg[tm] = tile_A[(thread_row * TM + tm) * BK + k];
+            }
+            
+            float b_reg[TN];
+            #pragma unroll
+            for (int tn = 0; tn < TN; ++tn) {
+                b_reg[tn] = tile_B[(thread_col * TN + tn) * BK + k];
+            }
+            
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm) {
+                #pragma unroll
+                for (int tn = 0; tn < TN; ++tn) {
+                    acc[tm][tn] = sycl::fma(a_reg[tm], b_reg[tn], acc[tm][tn]);
+                }
+            }
+        }
+        
+        sycl::group_barrier(it.get_group());
+    }
+    
+    // Write results: C[m][n]
+    #pragma unroll
+    for (int tm = 0; tm < TM; ++tm) {
+        const int global_row = row_start + tm;
+        if (global_row >= M) continue;
+        
+        #pragma unroll
+        for (int tn = 0; tn < TN; ++tn) {
+            const int global_col = col_start + tn;
+            if (global_col >= N) continue;
+            
+            const int c_idx = global_row * ldc + global_col;
+            if (beta == 0.0f) {
+                C_ptr[c_idx] = alpha * acc[tm][tn];
+            } else {
+                C_ptr[c_idx] = alpha * acc[tm][tn] + beta * C_ptr[c_idx];
+            }
+        }
+    }
+}
+
+// Launch function for indirect MXFP4->F32 GEMM (MUL_MAT_ID)
+// Computes: C = A * B^T where B is MXFP4, for a subset of rows
+// A: [max_M x K] (F32), B: [N x K] (MXFP4), C: [max_M x N] (F32)
+// M_ptr: pointer to actual row count, offset_ptr: pointer to row offset
+inline void launch_gemm_tiled_indirect_mxfp4(
+    sycl::queue * stream,
+    const float * A,              // src1_packed (activations, F32)
+    const block_mxfp4 * B,        // weights (MXFP4)
+    float * C,                     // dst_packed (output, F32)
+    const int * M_ptr,            // pointer to row count for this expert
+    const int * offset_ptr,       // pointer to row offset
+    const int max_M,              // max possible rows (for grid sizing)
+    const int N, const int K,     // N = output dim, K = input dim
+    const float alpha, const float beta,
+    const int lda, const int ldb, const int ldc
+) {
+    constexpr int BM = GEMM_MXFP4_F32_BM;  // 64
+    constexpr int BN = GEMM_MXFP4_F32_BN;  // 64
+    constexpr int BK = GEMM_MXFP4_F32_BK;  // 32 = QK_MXFP4
+    constexpr int TM = GEMM_MXFP4_F32_TM;  // 4
+    constexpr int TN = GEMM_MXFP4_F32_TN;  // 4
+    constexpr int WG_M = BM / TM;          // 16
+    constexpr int WG_N = BN / TN;          // 16
+    
+    const int grid_m = (max_M + BM - 1) / BM;
+    const int grid_n = (N + BN - 1) / BN;
+    
+    sycl::range<2> global(grid_m * WG_M, grid_n * WG_N);
+    sycl::range<2> local(WG_M, WG_N);
+    
+    stream->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> tile_A(sycl::range<1>(BM * BK), cgh);
+        sycl::local_accessor<float, 1> tile_B(sycl::range<1>(BN * BK), cgh);
+        
+        cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) {
+            gemm_mxfp4_f32_tiled_kernel_indirect<BM, BN, BK, TM, TN>(
+                it, tile_A, tile_B,
+                A, B, C,
+                M_ptr, offset_ptr, N, K,
+                alpha, beta,
+                lda, ldb, ldc
+            );
+        });
+    });
+}
+
 #endif // GGML_SYCL_GEMM_MXFP4_F32_TILED_HPP

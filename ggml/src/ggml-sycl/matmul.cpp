@@ -1594,6 +1594,21 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
                 1.0f, 0.0f,
                 K, K, N
             );
+        } else if (src0->type == GGML_TYPE_MXFP4) {
+             // MXFP4 weights with fused dequantization
+             // ldb = K (the full K dimension, used for block indexing: K/32 blocks per row)
+             const block_mxfp4 * weights = (const block_mxfp4 *)((const char *)src0_base + i * w_nb2);
+             launch_gemm_tiled_indirect_mxfp4(stream,
+                src1_packed,
+                weights,
+                dst_packed,
+                dev_expert_counts.get() + i,
+                dev_expert_offsets.get() + i,
+                total_rows, // max_M
+                N, K,
+                1.0f, 0.0f,
+                K, K, N
+            );
         } else {
              const float * weights = (const float *)((const char *)src0_base + i * w_nb2);
              launch_gemm_tiled_indirect(stream,

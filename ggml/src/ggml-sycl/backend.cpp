@@ -630,14 +630,20 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                 break;
                 case GGML_OP_MUL_MAT_ID:
             {
-                // Graph-compatible tiled implementation is now available.
-                // It runs entirely on device without host synchronization.
-                // However, it only supports F32 for src0 (weights), src1 (input), and dst (output).
-                // Disable graphs for unsupported type combinations to prevent memory corruption and device lost.
+                // Graph-compatible tiled implementation is available for MoE expert dispatch.
+                // Runs entirely on device without host synchronization.
+                // Supported weight types: F32, F16, BF16, MXFP4
+                // src1 (input) and dst (output) must be F32.
                 ggml_tensor * src0 = node->src[0];
                 ggml_tensor * src1 = node->src[1];
                 ggml_tensor * dst = node;
-                if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+                
+                bool src0_supported = (src0->type == GGML_TYPE_F32 ||
+                                       src0->type == GGML_TYPE_F16 ||
+                                       src0->type == GGML_TYPE_BF16 ||
+                                       src0->type == GGML_TYPE_MXFP4);
+                
+                if (!src0_supported || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
                     GGML_LOG_INFO("%s: disabling SYCL graphs for MUL_MAT_ID with unsupported type combination (src0=%s, src1=%s, dst=%s)\n",
                         __func__, ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type));
                     return graph_compat_t::DISABLED;
@@ -787,9 +793,9 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                     } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32) {
                         tiled_gemm_supported = true;
                     } else if (src0->type == GGML_TYPE_MXFP4 && src1->type == GGML_TYPE_F32) {
-                        // MXFP4 tiled kernel has precision issues - disable graphs until fixed
-                        // TODO: Fix MXFP4 tiled GEMM kernel precision
-                        tiled_gemm_supported = false;
+                        // MXFP4 tiled kernel is now graph-compatible
+                        // Uses BK=32=QK_MXFP4 to align with block boundaries
+                        tiled_gemm_supported = true;
                     }
 
                     if (tiled_gemm_supported) {
@@ -812,7 +818,7 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
     } else if (ggml_sycl_info().device_count > 1) {
         // Multi-device without split buffers: can still use single graph on primary device
         // But be conservative for now
-        GGML_LOG_INFO("%s: multi-device detected but no split buffers, using single-device graph\n", __func__);
+        GGML_SYCL_DEBUG("%s: multi-device detected but no split buffers, using single-device graph\n", __func__);
         return graph_compat_t::SINGLE_DEVICE;
     }
 

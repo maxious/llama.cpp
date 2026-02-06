@@ -34,6 +34,12 @@
   - Dequantization: `value = e8m0_scale * kvalues_mxfp4[q4] * 0.5` (kvalues_mxfp4 is doubled for DP4A).
   - Layout: `qs[j]` contains elements j (low nibble) and j+16 (high nibble).
   - Test: `GGML_SYCL_DISABLE_GRAPH=0 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=mxfp4"`
+- SYCL MXFP4 MUL_MAT_ID Support (Feb 2026):
+  - Added `launch_gemm_tiled_indirect_mxfp4` for MoE expert dispatch with MXFP4 weights.
+  - Enables SYCL graphs for models like Qwen3-Coder-30B-A3B with MXFP4 quantized MoE experts.
+  - Same block alignment constraint (BK=32=QK_MXFP4) and dequantization logic as MUL_MAT.
+  - Supported weight types in MUL_MAT_ID: F32, F16, BF16, MXFP4.
+  - Test: `GGML_SYCL_DISABLE_GRAPH=0 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p "type_a=mxfp4"`
 
 ## SYCL Runtime Architecture Detection
 
