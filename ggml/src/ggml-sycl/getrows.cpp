@@ -168,6 +168,111 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
     GGML_UNUSED(ctx);
 }
 
+// K-quant kernels
+static void k_get_rows_q4_k(
+    const void * src0, const int32_t * src1, float * dst,
+    int64_t ne00, int64_t ne12,
+    size_t s1, size_t s2, size_t s3,
+    size_t nb01, size_t nb02, size_t nb03,
+    size_t s10, size_t s11, size_t s12,
+    uint8_t * scales_local,
+    const sycl::nd_item<3> &item) {
+
+    const int i10 = item.get_group(1);
+    const int i11 = item.get_group(0) / ne12;
+    const int i12 = item.get_group(0) % ne12;
+
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+    float * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+    const void * src0_row = (const char *)src0 + i01*nb01 + i11*nb02 + i12*nb03;
+
+    dequantize_block_q4_K(src0_row, dst_row, scales_local, item);
+}
+
+static void k_get_rows_q6_k(
+    const void * src0, const int32_t * src1, float * dst,
+    int64_t ne00, int64_t ne12,
+    size_t s1, size_t s2, size_t s3,
+    size_t nb01, size_t nb02, size_t nb03,
+    size_t s10, size_t s11, size_t s12,
+    const sycl::nd_item<3> &item) {
+
+    const int i10 = item.get_group(1);
+    const int i11 = item.get_group(0) / ne12;
+    const int i12 = item.get_group(0) % ne12;
+
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+    float * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+    const void * src0_row = (const char *)src0 + i01*nb01 + i11*nb02 + i12*nb03;
+
+    dequantize_block_q6_K<float>(src0_row, dst_row, item);
+}
+
+static void get_rows_sycl_q4_k(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
+                                const ggml_tensor *src1, ggml_tensor *dst,
+                                const void *src0_dd, const int32_t *src1_dd,
+                                float *dst_dd, queue_ptr stream) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    // Q4_K needs 32 threads per block
+    const sycl::range<3> block_dims(1, 1, 32);
+    const int block_num_x = ne00 / QK_K;
+    const sycl::range<3> block_nums(ne11 * ne12, ne10, block_num_x);
+
+    // strides in elements
+    const size_t s1 = nb1 / sizeof(float);
+    const size_t s2 = nb2 / sizeof(float);
+    const size_t s3 = nb3 / sizeof(float);
+
+    const size_t s10 = nb10 / sizeof(int32_t);
+    const size_t s11 = nb11 / sizeof(int32_t);
+    const size_t s12 = nb12 / sizeof(int32_t);
+
+    stream->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<uint8_t, 1> scales_local(sycl::range<1>(K_SCALE_SIZE), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
+                k_get_rows_q4_k(
+                    src0_dd, src1_dd, dst_dd, ne00, ne12, s1, s2,
+                    s3, nb01, nb02, nb03, s10, s11, s12, get_pointer(scales_local), item);
+            });
+    });
+}
+
+static void get_rows_sycl_q6_k(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
+                                const ggml_tensor *src1, ggml_tensor *dst,
+                                const void *src0_dd, const int32_t *src1_dd,
+                                float *dst_dd, queue_ptr stream) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    // Q6_K needs 64 threads per block (QK_K=256, 4 values per thread?)
+    // dequantize_block_q6_K logic assumes 64 threads for QK_K=256
+    const sycl::range<3> block_dims(1, 1, 64);
+    const int block_num_x = ne00 / QK_K;
+    const sycl::range<3> block_nums(ne11 * ne12, ne10, block_num_x);
+
+    const size_t s1 = nb1 / sizeof(float);
+    const size_t s2 = nb2 / sizeof(float);
+    const size_t s3 = nb3 / sizeof(float);
+
+    const size_t s10 = nb10 / sizeof(int32_t);
+    const size_t s11 = nb11 / sizeof(int32_t);
+    const size_t s12 = nb12 / sizeof(int32_t);
+
+    stream->submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
+                k_get_rows_q6_k(
+                    src0_dd, src1_dd, dst_dd, ne00, ne12, s1, s2,
+                    s3, nb01, nb02, nb03, s10, s11, s12, item);
+            });
+    });
+}
+
 void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->src[1]->type == GGML_TYPE_I32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
@@ -211,8 +316,16 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
             get_rows_sycl<QK8_0, QR8_0, dequantize_q8_0>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
             src1_i32, (float *)dst->data, ctx.stream());
             break;
+        case GGML_TYPE_Q4_K:
+            get_rows_sycl_q4_k(ctx, dst->src[0], dst->src[1], dst, (const void *)dst->src[0]->data,
+            src1_i32, (float *)dst->data, ctx.stream());
+            break;
+        case GGML_TYPE_Q6_K:
+            get_rows_sycl_q6_k(ctx, dst->src[0], dst->src[1], dst, (const void *)dst->src[0]->data,
+            src1_i32, (float *)dst->data, ctx.stream());
+            break;
         default:
-            // TODO: k-quants
+            // TODO: other k-quants
             GGML_LOG_ERROR("%s: unsupported type: %s\n", __func__, ggml_type_name(dst->src[0]->type));
             GGML_ABORT("fatal error");
     }

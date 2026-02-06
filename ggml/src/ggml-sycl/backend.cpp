@@ -963,10 +963,7 @@ static ggml_status ggml_backend_sycl_multi_device_graph_compute(
     }
 
     // Phase 4: Execute graphs with inter-device synchronization
-    // Execute sequentially with barriers to ensure correct ordering.
-    // Future optimization: analyze dependencies and overlap where possible.
-
-    std::vector<sycl::event> prev_events;
+    // Execute concurrenty. Dependencies are handled by internal events (e.g. in MUL_MAT).
 
     for (auto & [device_id, cached_graph] : ctx.per_device_exec_graphs) {
         if (!cached_graph) continue;
@@ -974,18 +971,8 @@ static ggml_status ggml_backend_sycl_multi_device_graph_compute(
         ggml_sycl_set_device(device_id);
         queue_ptr stream = ctx.stream(device_id, 0);
 
-        // Wait for previous device(s) to complete
-        if (!prev_events.empty()) {
-            stream->ext_oneapi_submit_barrier(prev_events);
-        }
-
         // Execute this device's graph
         stream->ext_oneapi_graph(*cached_graph);
-
-        // Record completion event for next device
-        sycl::event completion = stream->ext_oneapi_submit_barrier();
-        prev_events.clear();
-        prev_events.push_back(completion);
 
         GGML_LOG_DEBUG("[SYCL-MULTI-GRAPH] Executed graph on device %d\n", device_id);
     }

@@ -1500,6 +1500,48 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
     // src1 is [K, total_rows] effectively
     const int64_t ne10 = src1->ne[0]; // K
 
+    // Handle split weights (src0)
+    // If src0 is split, each device processes a subset of rows (N).
+    // We assume split-mode row, where N is split across devices.
+    const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
+    int64_t row_low = 0;
+    int64_t row_high = N;
+    int64_t N_local = N;
+
+    if (split) {
+        ggml_backend_sycl_split_buffer_type_context * buft_ctx =
+            (ggml_backend_sycl_split_buffer_type_context *) src0->buffer->buft->context;
+        auto & tensor_split = buft_ctx->tensor_split;
+        
+        // Calculate row range for this device
+        // Matches logic in ggml_sycl_op_mul_mat
+        const int64_t rounding = 1; // MUL_MAT_ID supports arbitrary N usually, but let's check alignment
+        
+        if (ctx.device != 0) {
+            row_low = N * tensor_split[ctx.device];
+            if (row_low < N) {
+                row_low -= row_low % rounding;
+            }
+        }
+
+        if (ctx.device != ggml_sycl_info().device_count - 1) {
+            row_high = N * tensor_split[ctx.device + 1];
+            if (row_high < N) {
+                row_high -= row_high % rounding;
+            }
+        }
+        
+        // Ensure valid range
+        if (row_low >= row_high) {
+            // No work for this device
+            // We must still participate in any collective ops if they existed, but here we just return?
+            // Wait, we need to ensure stream state is valid.
+            return; 
+        }
+        
+        N_local = row_high - row_low;
+    }
+
     // Allocate temp buffers
     // 1. Expert counts and offsets
     ggml_sycl_pool_alloc<int> dev_expert_counts(ctx.pool(), n_experts);
@@ -1507,8 +1549,11 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
     ggml_sycl_pool_alloc<int> dev_row_dst_index(ctx.pool(), total_rows);
     
     // 2. Packed buffers
+    // src1 is broadcast/shared, so it's full size
     ggml_sycl_pool_alloc<char> dev_src1_packed(ctx.pool(), sizeof(float) * total_rows * ne10);
-    ggml_sycl_pool_alloc<char> dev_dst_packed(ctx.pool(), sizeof(float) * total_rows * N);
+    // dst is split if N is split. We compute [N_local, total_rows].
+    // dev_dst_packed stores the partial result for this device.
+    ggml_sycl_pool_alloc<char> dev_dst_packed(ctx.pool(), sizeof(float) * total_rows * N_local);
     ggml_sycl_pool_alloc<mmid_row_mapping> dev_dst_mapping(ctx.pool(), total_rows);
 
     queue_ptr stream = ctx.stream();
@@ -1562,14 +1607,42 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
         });
     });
 
-    const size_t w_nb2 = src0->nb[2];
+    // Adjust stride for weights: if split, each expert is smaller [K, N_local]
+    // If src0 buffer is split, it is compacted. So stride is K * N_local * sizeof(type).
+    // src0->nb[2] usually reflects the FULL stride if not adjusted?
+    // Wait, ggml split buffer type adjusts the tensor shape/stride?
+    // ggml_backend_sycl_buffer_type splits the storage.
+    // But tensor dimensions in `src0` might still reflect the full tensor if not reshaped?
+    // In `MUL_MAT`, it uses `src0_dd` allocation which is compact.
+    // Here `src0->data` is used.
+    // If `src0` is a view on a split buffer, `src0->data` points to device memory.
+    // We assume `src0` describes the FULL tensor, but `src0->data` points to the LOCAL slice?
+    // No, standard GGML split logic:
+    // The backend receives the full tensor struct, but `data` points to the split buffer.
+    // We need to calculate the correct offset between experts.
+    // Expert size in bytes = K * N_local * type_size.
+    
+    size_t expert_stride = src0->nb[2];
+    if (split) {
+        // If split, the buffer is compact on device.
+        // Stride is derived from N_local.
+        // Assuming row-major [Expert, N, K] or [Expert, K, N]?
+        // src0 is [K, N, Experts].
+        // Stride nb[2] is stride between experts.
+        // nb[0] = type_size
+        // nb[1] = K * type_size
+        // nb[2] = N * K * type_size
+        // If split, N becomes N_local.
+        expert_stride = K * N_local * ggml_type_size(src0->type);
+    }
+
     const float * src0_base = (const float *)src0->data;
     const float * src1_packed = (const float *)dev_src1_packed.get();
     float * dst_packed = (float *)dev_dst_packed.get();
     
     for (int i = 0; i < n_experts; ++i) {
         if (src0->type == GGML_TYPE_F16) {
-             const sycl::half * weights = (const sycl::half *)((const char *)src0_base + i * w_nb2);
+             const sycl::half * weights = (const sycl::half *)((const char *)src0_base + i * expert_stride);
              launch_gemm_tiled_indirect_f32_f16(stream,
                 src1_packed,
                 weights,
@@ -1577,12 +1650,12 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
                 dev_expert_counts.get() + i,
                 dev_expert_offsets.get() + i,
                 total_rows, // max_M
-                N, K,
+                N_local, K,
                 1.0f, 0.0f,
-                K, K, N
+                K, K, N_local
             );
         } else if (src0->type == GGML_TYPE_BF16) {
-             const sycl::ext::oneapi::bfloat16 * weights = (const sycl::ext::oneapi::bfloat16 *)((const char *)src0_base + i * w_nb2);
+             const sycl::ext::oneapi::bfloat16 * weights = (const sycl::ext::oneapi::bfloat16 *)((const char *)src0_base + i * expert_stride);
              launch_gemm_tiled_indirect_f32_bf16(stream,
                 src1_packed,
                 weights,
@@ -1590,14 +1663,14 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
                 dev_expert_counts.get() + i,
                 dev_expert_offsets.get() + i,
                 total_rows, // max_M
-                N, K,
+                N_local, K,
                 1.0f, 0.0f,
-                K, K, N
+                K, K, N_local
             );
         } else if (src0->type == GGML_TYPE_MXFP4) {
              // MXFP4 weights with fused dequantization
              // ldb = K (the full K dimension, used for block indexing: K/32 blocks per row)
-             const block_mxfp4 * weights = (const block_mxfp4 *)((const char *)src0_base + i * w_nb2);
+             const block_mxfp4 * weights = (const block_mxfp4 *)((const char *)src0_base + i * expert_stride);
              launch_gemm_tiled_indirect_mxfp4(stream,
                 src1_packed,
                 weights,
@@ -1605,12 +1678,12 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
                 dev_expert_counts.get() + i,
                 dev_expert_offsets.get() + i,
                 total_rows, // max_M
-                N, K,
+                N_local, K,
                 1.0f, 0.0f,
-                K, K, N
+                K, K, N_local
             );
         } else {
-             const float * weights = (const float *)((const char *)src0_base + i * w_nb2);
+             const float * weights = (const float *)((const char *)src0_base + i * expert_stride);
              launch_gemm_tiled_indirect(stream,
                 src1_packed,
                 weights,
@@ -1618,9 +1691,9 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
                 dev_expert_counts.get() + i,
                 dev_expert_offsets.get() + i,
                 total_rows, // max_M
-                N, K,
+                N_local, K,
                 1.0f, 0.0f,
-                K, K, N
+                K, K, N_local
             );
         }
     }
@@ -1632,10 +1705,12 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
         int64_t dst_ne0 = dst->ne[0];
         size_t dst_nb1 = dst->nb[1];
         size_t dst_nb2 = dst->nb[2];
+        
+        char * dst_data_offset = dst_data + row_low * sizeof(float);
 
         size_t global_range = ((total_rows + 255) / 256) * 256;
         cgh.parallel_for(sycl::nd_range<1>(global_range, 256), [=](sycl::nd_item<1> item) {
-             k_unpack_experts(dst_data, packed_data, map_data, dst_ne0, dst_nb1, dst_nb2, total_rows, item);
+             k_unpack_experts(dst_data_offset, packed_data, map_data, N_local, dst_nb1, dst_nb2, total_rows, item);
         });
     });
 }
@@ -1652,8 +1727,6 @@ void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
     const ggml_tensor *src0 = dst->src[0];
     const ggml_tensor *src1 = dst->src[1];
-    GGML_ASSERT(!ggml_backend_buffer_is_sycl_split(src0->buffer) && "mul_mat_id does not support split buffers");
-
     const ggml_tensor *ids = dst->src[2];
     GGML_TENSOR_BINARY_OP_LOCALS
 
