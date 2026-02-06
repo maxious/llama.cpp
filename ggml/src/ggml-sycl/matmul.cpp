@@ -1489,15 +1489,6 @@ static void k_unpack_experts(
     }
 }
 
-    const float * src_ptr = (const float *)(dst_packed) + i * ne0;
-    float * dst_ptr = (float *)(dst_original + i1*nb1 + i2*nb2);
-
-    for (int j = 0; j < ne0; ++j) {
-        dst_ptr[j] = src_ptr[j];
-    }
-}
-}
-
 static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
     const ggml_tensor *src0 = dst->src[0]; // Weights [K, N, Expert]
     const ggml_tensor *src1 = dst->src[1]; // Input [K, Batch]
