@@ -23,6 +23,7 @@ inline size_t compute_shmem_size(int DQK, int DV) {
     size += FATTN_BK * DV;                // shV
     size += 2 * FATTN_BQ;                 // row_max + row_sum
     size += FATTN_BQ * DV;                // sh_acc
+    size += FATTN_BQ * FATTN_BK;          // shS (logits/scores - separate from shK!)
     return size * sizeof(float);
 }
 
@@ -71,10 +72,10 @@ inline void ggml_sycl_op_flash_attn_fused(
 
     stream->submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> shmem_acc(sycl::range<1>(shmem_elems), cgh);
-        float* shmem = shmem_acc.get_multi_ptr<sycl::access::decorated::no>().get();
 
         cgh.parallel_for(sycl::nd_range<2>(global, local),
             [=](sycl::nd_item<2> it) [[intel::kernel_args_restrict]] {
+                float* shmem = &shmem_acc[0];
                 const int q_block_idx = it.get_group(0);
                 const int head_idx = it.get_group(1);
                 const int local_id = it.get_local_id(0);
@@ -93,6 +94,7 @@ inline void ggml_sycl_op_flash_attn_fused(
                 float* row_max = shV + BK * DV;
                 float* row_sum = row_max + BQ;
                 float* sh_acc = row_sum + BQ;
+                float* shS = sh_acc + BQ * DV;  // Separate buffer for logits/scores
 
                 // Initialize per-thread accumulators
                 const int rows_per_thread = (BQ + WG_M - 1) / WG_M;
@@ -186,7 +188,7 @@ inline void ggml_sycl_op_flash_attn_fused(
                                     logit += mask[q_idx * mask_stride + global_k];
                                 }
                             }
-                            shK[q_local * BK + k] = logit;
+                            shS[q_local * BK + k] = logit;
                             m_split = sycl::fmax(m_split, logit);
                         }
 
@@ -209,8 +211,8 @@ inline void ggml_sycl_op_flash_attn_fused(
                         // Compute exp and accumulate PV
                         float l_split = 0.0f;
                         for (int k = 0; k < kv_chunk; ++k) {
-                            float exp_val = sycl::exp(sycl::fmax(shK[q_local * BK + k] - m_new, -20.0f));
-                            shK[q_local * BK + k] = exp_val;
+                            float exp_val = sycl::exp(sycl::fmax(shS[q_local * BK + k] - m_new, -20.0f));
+                            shS[q_local * BK + k] = exp_val;
                             l_split += exp_val;
                             for (int d = 0; d < DV; ++d) {
                                 sh_acc[q_local * DV + d] += exp_val * shV[k * DV + d];
