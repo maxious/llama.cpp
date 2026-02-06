@@ -211,10 +211,10 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     // Mask and sinks are not yet supported in SYCL flash attention
     // These features cause NaN outputs and need further debugging
     // TODO: Re-enable after fixing mask/sinks correctness issues
-    if (mask != nullptr && mask->data != nullptr) {
+    if (mask != nullptr) {
         return false;
     }
-    if (sinks != nullptr && sinks->data != nullptr) {
+    if (sinks != nullptr) {
         return false;
     }
 
@@ -617,6 +617,13 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     const ggml_tensor * mask = dst->src[3];
     float scale = 1.0f;
     std::memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    // Early exit: mask and sinks are not yet supported in SYCL flash attention
+    // Return without launching any GPU kernels to prevent memory corruption
+    if (mask != nullptr || sinks != nullptr) {
+        GGML_SYCL_DEBUG("ggml_sycl: Flash attention with mask/sinks not supported, skipping GPU execution\n");
+        return;
+    }
 
 #ifdef GGML_SYCL_USE_INTEL_ONEMKL
     // Check if oneMKL is forced first (before XMX check)
