@@ -694,14 +694,24 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
 #ifdef SYCL_USE_XMX
                     use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
 #endif
+                    // Must match matmul.cpp: MMQ needs minimum row count to avoid shared memory issues
+                    constexpr int64_t MMQ_MIN_NROWS = 128;
+                    use_mul_mat_q = use_mul_mat_q && (src0->ne[1] >= MMQ_MIN_NROWS);
+                    use_mul_mat_q = use_mul_mat_q && (src1->ne[1] >= MMQ_MIN_NROWS);
 
                     // Exclude known problematic MMQ types that cause GPU faults under SYCL graphs
                     // q5_0 and q8_0 with certain shapes have been observed to cause device loss
-                    // F16, BF16, MXFP4 are now supported via graph-compatible tiled kernels
                     if (src0->type == GGML_TYPE_Q5_0 || 
                         src0->type == GGML_TYPE_Q8_0) {
                         GGML_LOG_INFO("%s: disabling SYCL graphs for problematic MMQ type %s\n",
                             __func__, ggml_type_name(src0->type));
+                        return graph_compat_t::DISABLED;
+                    }
+                    
+                    // MXFP4 tiled GEMM has precision issues - disable graphs for now
+                    // TODO: Fix MXFP4 tiled kernel precision
+                    if (src0->type == GGML_TYPE_MXFP4) {
+                        GGML_LOG_DEBUG("%s: disabling SYCL graphs for MXFP4 (tiled kernel precision issue)\n", __func__);
                         return graph_compat_t::DISABLED;
                     }
 
@@ -780,7 +790,9 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                     } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32) {
                         tiled_gemm_supported = true;
                     } else if (src0->type == GGML_TYPE_MXFP4 && src1->type == GGML_TYPE_F32) {
-                        tiled_gemm_supported = true;
+                        // MXFP4 tiled kernel has precision issues - disable graphs until fixed
+                        // TODO: Fix MXFP4 tiled GEMM kernel precision
+                        tiled_gemm_supported = false;
                     }
 
                     if (tiled_gemm_supported) {
