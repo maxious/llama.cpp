@@ -1463,19 +1463,23 @@ static void k_pack_experts(
 static void k_unpack_experts(
     char * __restrict__ dst_original,
     const char * __restrict__ dst_packed,
-    const mmid_row_mapping * __restrict__ dst_mapping,
+    const mmid_row_mapping * __restrict__ row_mapping,
     int64_t ne0,
     size_t nb1, size_t nb2,
+    int64_t row_low, int64_t row_high, // device row range [row_low, row_high)
     int total_rows,
     sycl::nd_item<1> item) {
 
     int i = item.get_global_id(0);
     if (i >= total_rows) return;
 
-    const int32_t i1 = dst_mapping[i].i1;
-    if (i1 < 0) return; // Invalid/Skipped row
+    const int32_t i1 = row_mapping[i].i1;
+    const int32_t i2 = row_mapping[i].i2;
 
-    const int32_t i2 = dst_mapping[i].i2;
+    // Skip rows not belonging to this device's split
+    if (i1 < row_low || i1 >= row_high) {
+        return;
+    }
 
     const float * src_ptr = (const float *)(dst_packed) + i * ne0;
     float * dst_ptr = (float *)(dst_original + i1*nb1 + i2*nb2);
@@ -1483,6 +1487,15 @@ static void k_unpack_experts(
     for (int j = 0; j < ne0; ++j) {
         dst_ptr[j] = src_ptr[j];
     }
+}
+
+    const float * src_ptr = (const float *)(dst_packed) + i * ne0;
+    float * dst_ptr = (float *)(dst_original + i1*nb1 + i2*nb2);
+
+    for (int j = 0; j < ne0; ++j) {
+        dst_ptr[j] = src_ptr[j];
+    }
+}
 }
 
 static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
@@ -1706,11 +1719,12 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
         size_t dst_nb1 = dst->nb[1];
         size_t dst_nb2 = dst->nb[2];
         
-        char * dst_data_offset = dst_data + row_low * sizeof(float);
+        int64_t low = row_low;
+        int64_t high = row_high;
 
         size_t global_range = ((total_rows + 255) / 256) * 256;
         cgh.parallel_for(sycl::nd_range<1>(global_range, 256), [=](sycl::nd_item<1> item) {
-             k_unpack_experts(dst_data_offset, packed_data, map_data, N_local, dst_nb1, dst_nb2, total_rows, item);
+             k_unpack_experts(dst_data, packed_data, map_data, N_local, dst_nb1, dst_nb2, low, high, total_rows, item);
         });
     });
 }
