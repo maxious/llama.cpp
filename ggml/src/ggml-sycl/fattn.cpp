@@ -208,16 +208,6 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
         return false;
     }
 
-    // Mask and sinks are not yet supported in SYCL flash attention
-    // These features cause NaN outputs and need further debugging
-    // TODO: Re-enable after fixing mask/sinks correctness issues
-    if (mask != nullptr) {
-        return false;
-    }
-    if (sinks != nullptr) {
-        return false;
-    }
-
     if (Q == nullptr || K == nullptr || V == nullptr) {
         return false;
     }
@@ -638,13 +628,6 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     float scale = 1.0f;
     std::memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
-    // Early exit: mask and sinks are not yet supported in SYCL flash attention
-    // Return without launching any GPU kernels to prevent memory corruption
-    if (mask != nullptr || sinks != nullptr) {
-        GGML_SYCL_DEBUG("ggml_sycl: Flash attention with mask/sinks not supported, skipping GPU execution\n");
-        return;
-    }
-
 #ifdef GGML_SYCL_USE_INTEL_ONEMKL
     // Check if oneMKL is forced first (before XMX check)
     static bool sycl_use_mkl = false;
@@ -680,7 +663,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
 
     // Use oneMKL KV-split path when MKL is available and needed
     // KV-split handles both short and long contexts efficiently (n_splits=1 for short contexts)
-    if (sycl_use_mkl || use_mkl_for_sinks || small_batch) {
+    if (sycl_use_mkl || use_mkl_for_sinks || small_batch || mask != nullptr) {
         if (DQK == 576 && DV == 512) {
             ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
             return;
@@ -745,7 +728,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         }
 
         // If we get here and it was mandatory MKL, then we should probably abort or warn
-        if (sycl_use_mkl || use_mkl_for_sinks) {
+        if (sycl_use_mkl || use_mkl_for_sinks || mask != nullptr) {
             GGML_ABORT("ggml_sycl: oneMKL flash attention path failed (unsupported head size); XMX is required but fallback failed\n");
         }
     }
