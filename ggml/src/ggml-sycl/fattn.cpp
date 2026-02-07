@@ -110,7 +110,6 @@ inline xmx_tile_kind ggml_sycl_flash_attn_get_tile_kind(sycl::device device) {
 // oneMKL is only used when XMX is not available or explicitly disabled.
 // Set GGML_SYCL_FLASH_ATTN_MKL=1 to force oneMKL even when XMX is available.
 inline bool ggml_sycl_flash_attn_use_mkl(sycl::device device) {
-#ifdef GGML_SYCL_USE_INTEL_ONEMKL
     // Check if user explicitly wants oneMKL
     static bool mkl_forced = false;
     static bool env_checked = false;
@@ -129,7 +128,6 @@ inline bool ggml_sycl_flash_attn_use_mkl(sycl::device device) {
     if (!ggml_sycl_flash_attn_has_xmx(device)) {
         return true;
     }
-#endif
     return false;
 }
 
@@ -598,9 +596,7 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
 
 // XMX flash attention implementations moved to fattn_xmx.cpp
 
-#ifdef GGML_SYCL_USE_INTEL_ONEMKL
 #include "fattn_mkl.hpp"
-#endif
 
 void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
@@ -628,7 +624,6 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     float scale = 1.0f;
     std::memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
-#ifdef GGML_SYCL_USE_INTEL_ONEMKL
     // Check if oneMKL is forced first (before XMX check)
     static bool sycl_use_mkl = false;
     static bool mkl_checked = false;
@@ -732,7 +727,6 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
             GGML_ABORT("ggml_sycl: oneMKL flash attention path failed (unsupported head size); XMX is required but fallback failed\n");
         }
     }
-    #endif // GGML_SYCL_USE_INTEL_ONEMKL
 
     // ============================================================================
     // Fused Single-Kernel Flash Attention (Graph-Compatible)
@@ -997,12 +991,10 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
             GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention not supported for head size DQK=%ld DV=%ld, falling back\n", actual_d, actual_dv);
         } catch (const std::exception& e) {
             GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention failed: %s, falling back to non-XMX path\n", e.what());
-#ifdef GGML_SYCL_USE_INTEL_ONEMKL
             if (DQK == 576 && DV == 512) {
                 ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
                 return;
             }
-#endif
          }
      }
  #endif

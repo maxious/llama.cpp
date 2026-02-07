@@ -3,7 +3,6 @@
 
 #include "fattn.hpp"
 
-#ifdef GGML_SYCL_USE_INTEL_ONEMKL
 #include "fattn_common.hpp"
 #include "common.hpp"
 #include "gemm_tiled.hpp"
@@ -436,5 +435,3 @@ template void ggml_sycl_op_flash_attn_mkl<256, 256>(ggml_backend_sycl_context &,
 template void ggml_sycl_op_flash_attn_mkl<512, 512>(ggml_backend_sycl_context &, ggml_tensor *);
 template void ggml_sycl_op_flash_attn_mkl<576, 512>(ggml_backend_sycl_context &, ggml_tensor *);
 template void ggml_sycl_op_flash_attn_mkl<576, 576>(ggml_backend_sycl_context &, ggml_tensor *);
-
-#endif // GGML_SYCL_USE_INTEL_ONEMKL

@@ -142,7 +142,6 @@ if (GGML_SYCL_TARGET STREQUAL "INTEL")
     endif()
     find_package(MKL REQUIRED)
     target_link_libraries(ggml-sycl PRIVATE MKL::MKL_SYCL::BLAS)
-    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_USE_INTEL_ONEMKL)
 else()
     # default for other target
     message(FATAL_ERROR "GGML_SYCL_TARGET is not supported")
