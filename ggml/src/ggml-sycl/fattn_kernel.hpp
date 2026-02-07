@@ -159,7 +159,7 @@ inline void flash_attn_mul_mat_PV_kernel(
             acc += p_row[k] * v_row[j];
         }
 
-        o_row[j] = acc;
+        o_row[j] += acc;
     }
 }
 

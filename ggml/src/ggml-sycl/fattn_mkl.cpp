@@ -2,12 +2,6 @@
 // Split from fattn.cpp refactoring
 
 #include "fattn.hpp"
-#include "fattn_common.hpp"
-#include "common.hpp"
-#include "gemm_tiled.hpp"
-#include <oneapi/mkl.hpp>
-#include <cmath>
-#include <cstring>
 
 #ifdef GGML_SYCL_USE_INTEL_ONEMKL
 #include "fattn_common.hpp"
@@ -16,6 +10,10 @@
 #include <oneapi/mkl.hpp>
 #include <cmath>
 #include <cstring>
+#if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
+#include <sycl/ext/oneapi/experimental/async_alloc/async_alloc.hpp>
+namespace syclex = sycl::ext::oneapi::experimental;
+#endif
 
 template<int64_t DQK, int64_t DV>
 void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -394,23 +392,49 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
     }
 
     float * O_d = (float *) dst->data;
-    const int64_t o_stride_head = dst->nb[1] / sizeof(float);
-    const int64_t o_stride_seq = dst->nb[2] / sizeof(float);
+    // Output layout is permuted: ne = [DV, n_heads, N, batch]
+    // nb[1] = stride between heads, nb[2] = stride between sequence positions
+    const int64_t o_nb1 = dst->nb[1] / sizeof(float);  // stride between heads (ne[1]=n_heads)
+    const int64_t o_nb2 = dst->nb[2] / sizeof(float);  // stride between seq positions (ne[2]=N)
 
     stream->submit([&](sycl::handler& cgh) {
         cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_heads * N, DV), sycl::range<2>(1, DV)), 
             [=](sycl::nd_item<2> it) {
-            flash_attn_combine_splits_kernel<DV>(it, partials, O_d, n_splits, n_heads, N, partial_size, o_stride_head, o_stride_seq);
+            // combine kernel params: (o_head_stride, o_row_stride)
+            // head_stride = nb[1] (distance between heads)
+            // row_stride = nb[2] (distance between sequence positions)
+            flash_attn_combine_splits_kernel<DV>(it, partials, O_d, n_splits, n_heads, N, partial_size, o_nb1, o_nb2);
         });
     });
 
-    if (!g_ggml_sycl_use_async_mem_op) {
+    if (!use_async_mem) {
+        stream->wait();
         sycl::free(partials, *stream);
         sycl::free(S_d, *stream);
         sycl::free(Q_d_f32, *stream);
         sycl::free(K_d_f32, *stream);
         if (mask_d_f32_alloc) sycl::free(mask_d_f32_alloc, *stream);
-        if (V_d_f32_alloc && !V_is_K_view) sycl::free(V_d_f32_alloc, *stream);
+        if (V_d_f32_alloc) sycl::free(V_d_f32_alloc, *stream);
     }
 }
+
+// Explicit template instantiations for all head sizes used by ggml_sycl_op_flash_attn
+template void ggml_sycl_op_flash_attn_mkl<32, 32>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<40, 40>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<48, 48>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<56, 56>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<64, 64>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<72, 72>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<80, 80>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<88, 88>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<96, 96>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<104, 104>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<112, 112>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<128, 128>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<192, 192>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<256, 256>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<512, 512>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<576, 512>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_mkl<576, 576>(ggml_backend_sycl_context &, ggml_tensor *);
+
 #endif // GGML_SYCL_USE_INTEL_ONEMKL

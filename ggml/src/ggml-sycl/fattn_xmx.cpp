@@ -1137,8 +1137,10 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
 
     // Output reorder kernels depend on XMX kernel completion
     std::vector<sycl::event> reorder_events;
-    const int64_t dst_stride_seq = dst->nb[1] / sizeof(float);
-    const int64_t dst_stride_head = dst->nb[2] / sizeof(float);
+    // Output layout is permuted: ne = [DV, n_heads, N, batch]
+    // nb[1] = stride between heads (dim 1), nb[2] = stride between seq positions (dim 2)
+    const int64_t dst_stride_head = dst->nb[1] / sizeof(float);
+    const int64_t dst_stride_seq  = dst->nb[2] / sizeof(float);
     const int64_t dst_stride_batch = dst->nb[3] / sizeof(float);
     
     for (int64_t b = 0; b < batch; ++b) {
@@ -1454,8 +1456,12 @@ void ggml_sycl_op_flash_attn_coopmat_kvsplit(ggml_backend_sycl_context & ctx, gg
         }
     }
 
-    // Output buffer (temporary in float)
+    // Output buffer
     float * O_d = (float *) dst->data;
+    // Output layout is permuted: ne = [DV, n_heads, N, batch]
+    // nb[1] = stride between heads, nb[2] = stride between seq positions
+    const int64_t o_head_stride = dst->nb[1] / sizeof(float);
+    const int64_t o_seq_stride  = dst->nb[2] / sizeof(float);
     const int64_t o_row_stride = V_HEAD_DIM;
 
     // Compute shared memory size for the kernel
@@ -1533,7 +1539,7 @@ void ggml_sycl_op_flash_attn_coopmat_kvsplit(ggml_backend_sycl_context & ctx, gg
         });
     }
 
-    // Reduction kernel to combine partials
+    // Reduction kernel to combine partials into permuted output layout
     stream->submit([&](sycl::handler& cgh) {
         cgh.parallel_for(sycl::nd_range<2>(
             sycl::range<2>(n_heads * N, V_HEAD_DIM),
@@ -1546,17 +1552,16 @@ void ggml_sycl_op_flash_attn_coopmat_kvsplit(ggml_backend_sycl_context & ctx, gg
                 n_heads,
                 N,
                 partial_size,
-                V_HEAD_DIM,  // o_head_stride (V_HEAD_DIM)
-                o_row_stride
+                o_head_stride,
+                o_seq_stride
             );
         });
     });
 
     // Cleanup
-    if (!use_async_mem) {
-        sycl::free(partials, *stream);
-        if (mask_d_f32_alloc) sycl::free(mask_d_f32_alloc, *stream);
-    }
+    stream->wait();
+    sycl::free(partials, *stream);
+    if (mask_d_f32_alloc) sycl::free(mask_d_f32_alloc, *stream);
     sycl::free(l_d, *stream);
     sycl::free(m_d, *stream);
 }

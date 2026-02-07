@@ -78,8 +78,8 @@ inline void ggml_sycl_op_flash_attn_fused(
                 float* shmem = &shmem_acc[0];
                 const int q_block_idx = it.get_group(0);
                 const int head_idx = it.get_group(1);
-                const int local_id = it.get_local_id(0);
                 const int lane_in_wg = it.get_local_linear_id();
+                const int wg_col = it.get_local_id(1);
 
                 const int q_start = q_block_idx * BQ;
                 if (q_start >= N) return;
@@ -96,21 +96,16 @@ inline void ggml_sycl_op_flash_attn_fused(
                 float* sh_acc = row_sum + BQ;
                 float* shS = sh_acc + BQ * DV;  // Separate buffer for logits/scores
 
-                // Initialize per-thread accumulators
-                const int rows_per_thread = (BQ + WG_M - 1) / WG_M;
-                const int my_row_start = local_id;
-                for (int r = 0; r < rows_per_thread; ++r) {
-                    int q_local = my_row_start + r * WG_M;
-                    if (q_local < BQ) {
-                        int q_idx = q_start + q_local;
-                        if (q_idx < N) {
-                            row_max[q_local] = -1.0e20f;
-                            row_sum[q_local] = 0.0f;
-                            for (int d = 0; d < DV; ++d) {
-                                sh_acc[q_local * DV + d] = 0.0f;
-                            }
-                        }
+                // Initialize per-row accumulators cooperatively
+                for (int idx = lane_in_wg; idx < BQ; idx += FATTN_WG_SIZE) {
+                    int q_idx = q_start + idx;
+                    if (q_idx < N) {
+                        row_max[idx] = -1.0e20f;
+                        row_sum[idx] = 0.0f;
                     }
+                }
+                for (int idx = lane_in_wg; idx < BQ * DV; idx += FATTN_WG_SIZE) {
+                    sh_acc[idx] = 0.0f;
                 }
                 it.barrier(sycl::access::fence_space::local_space);
 
@@ -166,10 +161,11 @@ inline void ggml_sycl_op_flash_attn_fused(
                     }
                     it.barrier(sycl::access::fence_space::local_space);
 
-                    // Process each query row assigned to this thread
-                    for (int r = 0; r < rows_per_thread; ++r) {
-                        int q_local = my_row_start + r * WG_M;
-                        if (q_local >= BQ) continue;
+                    // Each row is processed by exactly one thread (wg_col==0)
+                    // to avoid shared memory write races on sh_acc/row_max/row_sum
+                    if (wg_col == 0) {
+                    const int local_row = it.get_local_id(0);
+                    for (int q_local = local_row; q_local < BQ; q_local += WG_M) {
                         int q_idx = q_start + q_local;
                         if (q_idx >= N) continue;
 
@@ -229,23 +225,22 @@ inline void ggml_sycl_op_flash_attn_fused(
                         row_max[q_local] = m_new;
                         row_sum[q_local] = row_sum[q_local] * alpha_prev + l_split;
                     }
+                    } // end if (wg_col == 0)
                     it.barrier(sycl::access::fence_space::local_space);
                 }  // end splits
 
-                // Final normalization and store
+                // Final normalization and store - cooperative across all threads
                 it.barrier(sycl::access::fence_space::local_space);
-                for (int r = 0; r < rows_per_thread; ++r) {
-                    int q_local = my_row_start + r * WG_M;
-                    if (q_local >= BQ) continue;
+                for (int idx = lane_in_wg; idx < BQ * DV; idx += FATTN_WG_SIZE) {
+                    int q_local = idx / DV;
+                    int d = idx % DV;
                     int q_idx = q_start + q_local;
                     if (q_idx >= N) continue;
 
                     float inv_l = 1.0f / (row_sum[q_local] > 1e-10f ? row_sum[q_local] : 1.0f);
-                    for (int d = 0; d < DV; ++d) {
-                        ptrdiff_t o_idx = (ptrdiff_t)head_idx * strides.o_stride_head + 
-                                          (ptrdiff_t)q_idx * strides.o_stride_seq + d;
-                        O[o_idx] = sh_acc[q_local * DV + d] * inv_l;
-                    }
+                    ptrdiff_t o_idx = (ptrdiff_t)head_idx * strides.o_stride_head + 
+                                      (ptrdiff_t)q_idx * strides.o_stride_seq + d;
+                    O[o_idx] = sh_acc[q_local * DV + d] * inv_l;
                 }
             });
     });

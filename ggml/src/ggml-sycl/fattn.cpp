@@ -304,7 +304,11 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     const ptrdiff_t q_row_stride = Q->nb[1] / (ptrdiff_t)sizeof(float);
     const ptrdiff_t k_row_stride = K->nb[1] / (ptrdiff_t)sizeof(float);
     const ptrdiff_t v_row_stride = V->nb[1] / (ptrdiff_t)sizeof(float);
-    const ptrdiff_t o_row_stride = dst->nb[1] / (ptrdiff_t)sizeof(float);
+    // Output layout is permuted: ne = [DV, n_heads, N, batch]
+    // nb[1] = stride between heads (ne[1]=n_heads)
+    // nb[2] = stride between sequence positions (ne[2]=N)
+    const ptrdiff_t o_head_stride = dst->nb[1] / (ptrdiff_t)sizeof(float);
+    const ptrdiff_t o_seq_stride  = dst->nb[2] / (ptrdiff_t)sizeof(float);
 
     // Handle FP16 by dequantizing to F32 first
     if (is_f16) {
@@ -454,6 +458,20 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     float * l_d = (float *) sycl::malloc_device(N * n_heads * sizeof(float), *stream);
     float * m_d = (float *) sycl::malloc_device(N * n_heads * sizeof(float), *stream);
 
+    // Initialize l_d=0 and m_d=-1e20f so the softmax first-block detection works
+    stream->memset(l_d, 0, N * n_heads * sizeof(float));
+    {
+        const int64_t total_lm = N * n_heads;
+        stream->submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::range<1>(total_lm), [=](sycl::id<1> idx) {
+                m_d[idx] = -1.0e20f;
+            });
+        });
+    }
+
+    // Initialize output to zero so P@V can accumulate across KV blocks
+    stream->memset(dst_d, 0, ggml_nbytes(dst));
+
     // Launch: grid is (Br * Tr, Tc * n_heads) for processing all heads
     sycl::range<2> global(Br * Tr, Tc * n_heads);
     sycl::range<2> local(Br, 1);
@@ -481,8 +499,8 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
             int group_id_i = group.get_group_id(0);
             int group_id_j = group.get_group_id(1);
 
-            // Head index from group_id_j
-            int head_idx = group_id_j;
+            // Decompose group_id_j into head and KV-block indices
+            int head_idx = group_id_j / Tc;
             int kv_head_idx = head_idx / gqa_ratio;  // Which K/V head this Q head maps to
 
             int row0 = group_id_i * Br;
@@ -496,7 +514,7 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
             const float* Q_block = Q_d_f32 + (ptrdiff_t)(head_idx * N + row0) * q_row_stride;
             const float* K_block = K_d_f32 + (ptrdiff_t)(kv_head_idx * N_kv + col0) * k_row_stride;
             const float* V_block = V_d_f32 + (ptrdiff_t)(kv_head_idx * N_kv + col0) * v_row_stride;
-            float*       O_block = dst_d + (ptrdiff_t)(head_idx * N + row0) * o_row_stride;
+            float*       O_block = dst_d + (ptrdiff_t)head_idx * o_head_stride + (ptrdiff_t)row0 * o_seq_stride;
 
             // Row statistics offsets
             float* l_row = l_d + (ptrdiff_t)(head_idx * N + row0);
@@ -538,7 +556,7 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
                 it,
                 p_loc, (ptrdiff_t)Bc,
                 V_block, v_row_stride,
-                O_block, o_row_stride,
+                O_block, o_seq_stride,
                 Br, Bc
             );
 
@@ -554,7 +572,7 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
             int row = idx % N;
             float l_val = l_d[idx];
 
-            float * o_row = dst_d + (ptrdiff_t)(head_idx * N + row) * o_row_stride;
+            float * o_row = dst_d + (ptrdiff_t)head_idx * o_head_stride + (ptrdiff_t)row * o_seq_stride;
 
             if (l_val <= 0.0f) {
                 // Fully masked row - output should be zero
@@ -571,6 +589,8 @@ void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * ds
             }
         });
     });
+
+    stream->wait();
 
     sycl::free(l_d, *stream);
     sycl::free(m_d, *stream);
@@ -639,24 +659,6 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                     device.get_info<sycl::info::device::name>().c_str());
         }
     }
-
-    // Sinks (attention sinks / StreamingLLM) only supported in MKL path
-    // XMX cooperative matrix kernels don't support sinks yet
-    const bool use_mkl_for_sinks = (sinks != nullptr);
-
-    // Use MKL for small batch sizes (N < 32) as it's often faster for small batches
-    // Set GGML_SYCL_FLASH_ATTN_FORCE_XMX=1 to bypass this and use XMX for all batch sizes
-    static bool force_xmx = false;
-    static bool force_xmx_checked = false;
-    if (!force_xmx_checked) {
-        const char* env = getenv("GGML_SYCL_FLASH_ATTN_FORCE_XMX");
-        force_xmx = (env != nullptr && strcmp(env, "1") == 0);
-        force_xmx_checked = true;
-        if (force_xmx) {
-            GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention FORCED for all batch sizes by environment variable\n");
-        }
-    }
-    const bool small_batch = !force_xmx && (N < 32);
 
     // Sinks (attention sinks / StreamingLLM) only supported in MKL path
     // XMX cooperative matrix kernels don't support sinks yet
@@ -757,7 +759,10 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     // stride loading from ggml tensor layout.
     // Supported: head sizes up to 128 (shared memory constraints), F16/BF16/F32.
     // This replaces the host-side sequential KV split loop in the MKL path.
-    if (DQK <= 128 && DV <= 128 && DQK == DV) {
+    // DISABLED: Fused path has a shared memory race condition fix (wg_col==0 guard)
+    // that serializes computation to 1/16 threads, causing GPU watchdog timeouts.
+    // Until the fused kernel is properly parallelized, route through MKL or fallback.
+    if (false && DQK <= 128 && DV <= 128 && DQK == DV) {
         // Prepare mask pointer (only F32 mask supported for now)
         const float* mask_d = nullptr;
         int64_t mask_stride = 0;

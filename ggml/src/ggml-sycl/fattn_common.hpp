@@ -116,8 +116,10 @@ inline fattn_tensor_strides compute_tensor_strides(const ggml_tensor * Q, const 
     s.v_stride_head = V->nb[2] / v_elem_size;
 
     // Output strides in elements (always F32)
-    s.o_stride_seq = dst->nb[1] / sizeof(float);
-    s.o_stride_head = dst->nb[2] / sizeof(float);
+    // Output layout is permuted: ne = [DV, n_heads, N, batch]
+    // nb[1] = stride between heads (dim 1), nb[2] = stride between seq positions (dim 2)
+    s.o_stride_head = dst->nb[1] / sizeof(float);
+    s.o_stride_seq  = dst->nb[2] / sizeof(float);
 
     return s;
 }
