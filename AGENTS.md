@@ -307,6 +307,26 @@ export GGML_SYCL_FLASH_ATTN_FORCE_XMX=1
 2. **Enable Direct Loading** (`GGML_SYCL_FLASH_ATTN_DIRECT=1`) to reduce memory bandwidth usage.
 3. The system now automatically handles block size optimization for GLM-4.7 to prevent resource exhaustion.
 
+## Debugging Tips
+
+### Accessing Full Tool Output
+
+When tool output is truncated due to size, it is saved to a file in `~/.local/share/opencode/tool-output/`. You can grep these files to analyze results without re-running commands:
+
+```bash
+# List recent tool output files
+ls -la ~/.local/share/opencode/tool-output/
+
+# Grep for specific patterns in the full output
+# Example: Count failing tests
+grep -E "\[FLASH_ATTN_EXT\]" ~/.local/share/opencode/tool-output/tool_c3775e2b9001JgNldEcogTl2hu | grep -c "FAIL"
+
+# Example: Extract error values
+grep -E "\[FLASH_ATTN_EXT\].*FAIL" ~/.local/share/opencode/tool-output/tool_c3775e2b9001JgNldEcogTl2hu | grep -oE "ERR = [0-9.]+" | sort -n | uniq -c
+```
+
+This is useful for analyzing large test outputs without re-running the entire command.
+
 ## Graph-Compatible GEMM
 
 ### Background
@@ -371,4 +391,69 @@ icpx -fsycl -O3 -DGGML_SYCL_USE_INTEL_ONEMKL tests/test-gemm-sycl.cpp -o test-ge
   -lmkl_sycl -lmkl_intel_lp64 -lmkl_core -lmkl_sequential
 ./test-gemm-sycl
 ```
+
+## SYCL Flash Attention Sink Handling Fix (Feb 2026)
+
+### Problem
+
+The SYCL MKL flash attention implementation (`fattn_mkl.cpp`) was failing when the `sinks` parameter (sinks=1) was used. All tests with `sinks=1` showed excessive error rates (~0.1-0.5 vs expected <0.0005).
+
+**Root cause**: The `flash_attn_combine_splits_kernel` in `fattn_common.hpp` retrieved the `sinks_d` pointer from the destination tensor but never used it in the online softmax reduction. The kernel was effectively ignoring sink values.
+
+### Solution
+
+Modified `ggml/src/ggml-sycl/fattn_common.hpp` (lines 130-189):
+
+1. Added `const float * sinks_d = nullptr` parameter to `flash_attn_combine_splits_kernel`
+2. Implemented sink adjustment after combining splits:
+   ```cpp
+   float ms_factor = 1.0f;
+   if (sinks_d != nullptr) {
+       float sink = sinks_d[head];
+       if (sink > m_max) {
+           ms_factor = sycl::exp(m_max - sink);
+           l_final = l_final * ms_factor + 1.0f;
+       } else {
+           l_final += sycl::exp(sink - m_max);
+       }
+   }
+   ```
+3. When `ms_factor != 1.0f`, scale the output sum before division:
+   ```cpp
+   if (ms_factor != 1.0f) {
+       #pragma unroll
+       for (int j = 0; j < BK; j++) {
+           sum[j] /= l_final;
+           sum[j] *= ms_factor;
+       }
+   } else {
+       #pragma unroll
+       for (int j = 0; j < BK; j++) {
+           sum[j] /= l_final;
+       }
+   }
+   ```
+
+Updated callers:
+- `ggml/src/ggml-sycl/fattn_mkl.cpp` (line ~406): Pass `sinks_d` to kernel
+- `ggml/src/ggml-sycl/fattn_xmx.cpp` (line ~1557): Explicitly pass `nullptr` (XMX still lacks sink support)
+
+### Verification
+
+**Tests**: `./build-sycl/bin/test-backend-ops -b SYCL0 -o FLASH_ATTN_EXT`
+- Before fix: 796 failures (all with `sinks=1`)
+- After fix: **1904 tests OK, 0 FAIL** for F32/F16 KV types
+- Full SYCL suite: 6425/6653 tests passed (228 remaining failures are unrelated ROPE_BACK issues)
+
+**Oracle Review**: Confirmed mathematical correctness, thread safety, and consistency with CPU reference implementation (`ggml-cpu/ops.cpp`).
+
+**Diagnostics**: No type errors or warnings in modified files.
+
+### Technical Details
+
+The sink represents a virtual token with attention value 0.0 at the end of the KV sequence. The online softmax adjustment:
+- If `sink > current_max`: rebase everything to the sink, scaling previous sums by `exp(old_max - sink)`
+- If `sink <= current_max`: simply add `exp(sink - current_max)` to the normalization sum
+
+The implementation matches the CPU reference's logic exactly, just relocated to the split-combination phase (SYCL MKL path) rather than the per-chunk phase (CPU).
 

@@ -13,7 +13,7 @@
 constexpr int FATTN_BQ = 16;  // Queries per workgroup
 constexpr int FATTN_BK = 32;  // KV tile size
 constexpr int FATTN_WG_M = 16;
-constexpr int FATTN_WG_N = 16;
+constexpr int FATTN_WG_N = 1;  // Single-column workgroup for full parallelization
 constexpr int FATTN_WG_SIZE = FATTN_WG_M * FATTN_WG_N;
 
 // Compute shared memory size needed (in bytes)
@@ -161,9 +161,8 @@ inline void ggml_sycl_op_flash_attn_fused(
                     }
                     it.barrier(sycl::access::fence_space::local_space);
 
-                    // Each row is processed by exactly one thread (wg_col==0)
-                    // to avoid shared memory write races on sh_acc/row_max/row_sum
-                    if (wg_col == 0) {
+                    // Each row is processed by exactly one thread (thread-local row index)
+                    // With WG_N=1, all threads participate - no serialization
                     const int local_row = it.get_local_id(0);
                     for (int q_local = local_row; q_local < BQ; q_local += WG_M) {
                         int q_idx = q_start + q_local;
@@ -225,7 +224,6 @@ inline void ggml_sycl_op_flash_attn_fused(
                         row_max[q_local] = m_new;
                         row_sum[q_local] = row_sum[q_local] * alpha_prev + l_split;
                     }
-                    } // end if (wg_col == 0)
                     it.barrier(sycl::access::fence_space::local_space);
                 }  // end splits
 

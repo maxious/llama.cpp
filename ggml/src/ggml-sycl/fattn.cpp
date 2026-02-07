@@ -742,10 +742,8 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     // stride loading from ggml tensor layout.
     // Supported: head sizes up to 128 (shared memory constraints), F16/BF16/F32.
     // This replaces the host-side sequential KV split loop in the MKL path.
-    // DISABLED: Fused path has a shared memory race condition fix (wg_col==0 guard)
-    // that serializes computation to 1/16 threads, causing GPU watchdog timeouts.
-    // Until the fused kernel is properly parallelized, route through MKL or fallback.
-    if (false && DQK <= 128 && DV <= 128 && DQK == DV) {
+    // The kernel has been parallelized with WG_N=1 to utilize all workgroup threads.
+    if (DQK <= 128 && DV <= 128 && DQK == DV) {
         // Prepare mask pointer (only F32 mask supported for now)
         const float* mask_d = nullptr;
         int64_t mask_stride = 0;

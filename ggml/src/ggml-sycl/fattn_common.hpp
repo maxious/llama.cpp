@@ -137,7 +137,8 @@ inline void flash_attn_combine_splits_kernel(
     int N,
     int partial_size,
     int o_head_stride,
-    int o_row_stride
+    int o_row_stride,
+    const float * sinks_d = nullptr
 ) {
     int q_idx = it.get_group(0);
     int tid = it.get_local_id(1);
@@ -159,11 +160,28 @@ inline void flash_attn_combine_splits_kernel(
         scales[i] = scale;
         l_final += l * scale;
     }
+
+    // Apply attention sinks if present (like a virtual token with zero value)
+    float ms_factor = 1.0f;  // multiplier for O when sink > m_max
+    if (sinks_d != nullptr) {
+        float sink = sinks_d[head];  // sink per head
+        if (sink > m_max) {
+            ms_factor = sycl::exp(m_max - sink);
+            l_final = l_final * ms_factor + 1.0f;
+        } else {
+            l_final += sycl::exp(sink - m_max);
+        }
+    }
+
     for (int d = tid; d < DV; d += it.get_local_range(1)) {
         float o_sum = 0.0f;
         for (int i = 0; i < n_splits; ++i) {
             float o_val = q_partials[i * partial_size + 2 + d];
             o_sum += o_val * scales[i];
+        }
+        // If sink was greater than previous max, scale down the O sum to match
+        if (sinks_d != nullptr && ms_factor != 1.0f) {
+            o_sum *= ms_factor;
         }
         float res = o_sum / (l_final > 1e-10f ? l_final : 1.0f);
         dst[head * o_head_stride + q * o_row_stride + d] = res;

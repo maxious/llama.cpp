@@ -403,7 +403,7 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // combine kernel params: (o_head_stride, o_row_stride)
             // head_stride = nb[1] (distance between heads)
             // row_stride = nb[2] (distance between sequence positions)
-            flash_attn_combine_splits_kernel<DV>(it, partials, O_d, n_splits, n_heads, N, partial_size, o_nb1, o_nb2);
+            flash_attn_combine_splits_kernel<DV>(it, partials, O_d, n_splits, n_heads, N, partial_size, o_nb1, o_nb2, sinks_d);
         });
     });
 

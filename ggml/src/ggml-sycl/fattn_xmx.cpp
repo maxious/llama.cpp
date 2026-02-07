@@ -1553,7 +1553,8 @@ void ggml_sycl_op_flash_attn_coopmat_kvsplit(ggml_backend_sycl_context & ctx, gg
                 N,
                 partial_size,
                 o_head_stride,
-                o_seq_stride
+                o_seq_stride,
+                nullptr  // sinks not supported in XMX path yet
             );
         });
     });
