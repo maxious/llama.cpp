@@ -210,6 +210,26 @@ static void k_get_rows_q6_k(
     dequantize_block_q6_K<float>(src0_row, dst_row, item);
 }
 
+static void k_get_rows_mxfp4(
+    const void * src0, const int32_t * src1, float * dst,
+    int64_t ne00, int64_t ne12,
+    size_t s1, size_t s2, size_t s3,
+    size_t nb01, size_t nb02, size_t nb03,
+    size_t s10, size_t s11, size_t s12,
+    const sycl::nd_item<3> &item) {
+
+    const int i10 = item.get_group(1);
+    const int i11 = item.get_group(0) / ne12;
+    const int i12 = item.get_group(0) % ne12;
+
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+    float * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+    const void * src0_row = (const char *)src0 + i01*nb01 + i11*nb02 + i12*nb03;
+
+    dequantize_block_mxfp4(src0_row, dst_row, item);
+}
+
 static void get_rows_sycl_q4_k(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
                                 const ggml_tensor *src1, ggml_tensor *dst,
                                 const void *src0_dd, const int32_t *src1_dd,
@@ -273,6 +293,36 @@ static void get_rows_sycl_q6_k(ggml_backend_sycl_context & ctx, const ggml_tenso
     });
 }
 
+static void get_rows_sycl_mxfp4(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
+                                const ggml_tensor *src1, ggml_tensor *dst,
+                                const void *src0_dd, const int32_t *src1_dd,
+                                float *dst_dd, queue_ptr stream) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    // MXFP4 needs 32 threads per block
+    const sycl::range<3> block_dims(1, 1, 32);
+    const int block_num_x = ne00 / QK_K;
+    const sycl::range<3> block_nums(ne11 * ne12, ne10, block_num_x);
+
+    const size_t s1 = nb1 / sizeof(float);
+    const size_t s2 = nb2 / sizeof(float);
+    const size_t s3 = nb3 / sizeof(float);
+
+    const size_t s10 = nb10 / sizeof(int32_t);
+    const size_t s11 = nb11 / sizeof(int32_t);
+    const size_t s12 = nb12 / sizeof(int32_t);
+
+    stream->submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(32)]] {
+                k_get_rows_mxfp4(
+                    src0_dd, src1_dd, dst_dd, ne00, ne12, s1, s2,
+                    s3, nb01, nb02, nb03, s10, s11, s12, item);
+            });
+    });
+}
+
 void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->src[1]->type == GGML_TYPE_I32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
@@ -322,6 +372,10 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
             break;
         case GGML_TYPE_Q6_K:
             get_rows_sycl_q6_k(ctx, dst->src[0], dst->src[1], dst, (const void *)dst->src[0]->data,
+            src1_i32, (float *)dst->data, ctx.stream());
+            break;
+        case GGML_TYPE_MXFP4:
+            get_rows_sycl_mxfp4(ctx, dst->src[0], dst->src[1], dst, (const void *)dst->src[0]->data,
             src1_i32, (float *)dst->data, ctx.stream());
             break;
         default:
