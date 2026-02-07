@@ -88,7 +88,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
-#ifdef DEBUG_sycl_MALLOC
+#ifdef DEBUG_SYCL_MALLOC
         int nnz = 0;
         size_t max_size = 0;
 #endif
@@ -97,7 +97,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         for (int i = 0; i < MAX_SYCL_BUFFERS; ++i) {
             ggml_sycl_buffer& b = buffer_pool[i];
             if (b.ptr != nullptr) {
-#ifdef DEBUG_sycl_MALLOC
+#ifdef DEBUG_SYCL_MALLOC
                 ++nnz;
                 if (b.size > max_size) max_size = b.size;
 #endif
