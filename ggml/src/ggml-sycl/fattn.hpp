@@ -9,16 +9,16 @@
 void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 // Fused single-kernel flash attention (runtime DQK, DV)
-// Template parameter T: element type of Q, K, V (float, sycl::half, sycl::ext::oneapi::bfloat16)
-template <typename T>
+// Template parameters: QType, KVType, MaskT
+template <typename QType, typename KVType = QType, typename MaskT = float>
 void ggml_sycl_op_flash_attn_fused(
     sycl::queue* stream,
-    const T* Q, const T* K, const T* V,
+    const QType* Q, const KVType* K, const KVType* V,
     float* O,
     int N, int N_kv,
     int n_heads, int n_kv_heads, int gqa_ratio,
     float scale,
-    const float* mask, int64_t mask_stride,
+    const MaskT* mask, int64_t mask_stride,
     const float* sinks,
     const fattn_tensor_strides& strides,
     int DQK, int DV);

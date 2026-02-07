@@ -45,16 +45,18 @@ inline float load_as_float<sycl::ext::oneapi::bfloat16>(const sycl::ext::oneapi:
 #endif
 
 // Single-kernel fused flash attention (runtime DQK, DV)
-// T: element type of Q, K, V (float, half, bfloat16)
-template <typename T>
+// QType: element type of Q (float, half, bfloat16)
+// KVType: element type of K, V (float, half, bfloat16)
+// MaskT: element type of mask (float, half)
+template <typename QType, typename KVType, typename MaskT>
 inline void ggml_sycl_op_flash_attn_fused(
     sycl::queue* stream,
-    const T* Q, const T* K, const T* V,
+    const QType* Q, const KVType* K, const KVType* V,
     float* O,
     const int N, const int N_kv,
     const int n_heads, const int n_kv_heads, const int gqa_ratio,
     const float scale,
-    const float* mask, const int64_t mask_stride,
+    const MaskT* mask, const int64_t mask_stride,
     const float* sinks,
     const fattn_tensor_strides& strides,
     int DQK, int DV
@@ -118,7 +120,7 @@ inline void ggml_sycl_op_flash_attn_fused(
                     if (q_idx < N && d < DQK) {
                         ptrdiff_t global_idx = (ptrdiff_t)head_idx * strides.q_stride_head + 
                                                (ptrdiff_t)q_idx * strides.q_stride_seq + d;
-                        shQ[q_local * DQK + d] = load_as_float<T>(&Q[global_idx]);
+                        shQ[q_local * DQK + d] = load_as_float<QType>(&Q[global_idx]);
                     } else {
                         shQ[q_local * DQK + d] = 0.0f;
                     }
@@ -141,7 +143,7 @@ inline void ggml_sycl_op_flash_attn_fused(
                         if (kv_idx < N_kv && d < DQK) {
                             ptrdiff_t global_idx = (ptrdiff_t)kv_head_idx * strides.k_stride_head + 
                                                    (ptrdiff_t)kv_idx * strides.k_stride_seq + d;
-                            shK[k_local * DQK + d] = load_as_float<T>(&K[global_idx]);
+                            shK[k_local * DQK + d] = load_as_float<KVType>(&K[global_idx]);
                         } else {
                             shK[k_local * DQK + d] = 0.0f;
                         }
@@ -155,7 +157,7 @@ inline void ggml_sycl_op_flash_attn_fused(
                         if (kv_idx < N_kv && d < DV) {
                             ptrdiff_t global_idx = (ptrdiff_t)kv_head_idx * strides.v_stride_head + 
                                                    (ptrdiff_t)kv_idx * strides.v_stride_seq + d;
-                            shV[v_local * DV + d] = load_as_float<T>(&V[global_idx]);
+                            shV[v_local * DV + d] = load_as_float<KVType>(&V[global_idx]);
                         } else {
                             shV[v_local * DV + d] = 0.0f;
                         }

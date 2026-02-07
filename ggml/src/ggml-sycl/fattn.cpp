@@ -654,7 +654,100 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
             GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention FORCED for all batch sizes by environment variable\n");
         }
     }
+#ifdef GGML_SYCL_GRAPH
+    // MKL kernels are not graph-compatible, so avoid forcing them for small batches when graphs are enabled
+    const bool small_batch = false;
+#else
     const bool small_batch = !force_xmx && (N < 32);
+#endif
+
+    // ============================================================================
+    // Fused Single-Kernel Flash Attention (Graph-Compatible)
+    // ============================================================================
+    // This is a new implementation that fuses QK, softmax, and PV into a single
+    // kernel without host-side split loops. It uses online softmax and direct
+    // stride loading from ggml tensor layout.
+    // Supported: head sizes up to 128 (shared memory constraints), F16/BF16/F32.
+    // This replaces the host-side sequential KV split loop in the MKL path.
+    // The kernel has been parallelized with WG_N=1 to utilize all workgroup threads.
+    if (DQK <= 128 && DV <= 128 && DQK == DV) {
+        // Check if mask type is supported
+        bool mask_supported = (mask == nullptr || mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16);
+        
+        if (mask_supported) {
+            // Compute tensor strides for direct loading
+            fattn_tensor_strides strides = compute_tensor_strides(Q, K, V, dst);
+            
+            GGML_SYCL_DEBUG("Fused strides: Q_seq=%ld Q_head=%ld K_seq=%ld K_head=%ld V_seq=%ld V_head=%ld\n",
+                    strides.q_stride_seq, strides.q_stride_head,
+                    strides.k_stride_seq, strides.k_stride_head,
+                    strides.v_stride_seq, strides.v_stride_head);
+            
+            // Helper to dispatch based on mask type and KV type
+            auto dispatch_mask_kv = [&](auto t_q, auto t_kv) {
+                using QType = decltype(t_q);
+                using KVType = decltype(t_kv);
+                
+                if (mask == nullptr || mask->type == GGML_TYPE_F32) {
+                    const float* mask_d = (mask) ? (const float*)mask->data : nullptr;
+                    int64_t mask_stride = (mask) ? mask->nb[1] / sizeof(float) : 0;
+                    ggml_sycl_op_flash_attn_fused<QType, KVType, float>(
+                        ctx.stream(),
+                        (const QType*)Q->data, (const KVType*)K->data, (const KVType*)V->data,
+                        (float*)dst->data,
+                        N, N_kv, n_heads, n_kv_heads, gqa_ratio, scale,
+                        mask_d, mask_stride,
+                        sinks ? (const float*)sinks->data : nullptr,
+                        strides,
+                        DQK, DV);
+                } else { // F16 mask
+                    const sycl::half* mask_d = (const sycl::half*)mask->data;
+                    int64_t mask_stride = mask->nb[1] / sizeof(sycl::half);
+                    ggml_sycl_op_flash_attn_fused<QType, KVType, sycl::half>(
+                        ctx.stream(),
+                        (const QType*)Q->data, (const KVType*)K->data, (const KVType*)V->data,
+                        (float*)dst->data,
+                        N, N_kv, n_heads, n_kv_heads, gqa_ratio, scale,
+                        mask_d, mask_stride,
+                        sinks ? (const float*)sinks->data : nullptr,
+                        strides,
+                        DQK, DV);
+                }
+            };
+            
+            // Helper to dispatch KV type
+            auto dispatch_kv = [&](auto t_q) {
+                if (K->type == GGML_TYPE_F16) {
+                    dispatch_mask_kv(t_q, sycl::half{});
+                } else if (K->type == GGML_TYPE_BF16) {
+                    #ifdef SYCL_EXT_ONEAPI_BFLOAT16_MATH_FUNCTIONS
+                    dispatch_mask_kv(t_q, sycl::ext::oneapi::bfloat16{});
+                    #else
+                    // Fallback to MKL if BF16 not supported
+                    #endif
+                } else if (K->type == GGML_TYPE_F32) {
+                    dispatch_mask_kv(t_q, float{});
+                }
+            };
+
+            // Dispatch based on Q data type
+            if (Q->type == GGML_TYPE_F16) {
+                GGML_SYCL_DEBUG("ggml_sycl: Using fused flash attention (F16) DQK=%ld DV=%ld\n", DQK, DV);
+                dispatch_kv(sycl::half{});
+                return;
+            } else if (Q->type == GGML_TYPE_BF16) {
+                #ifdef SYCL_EXT_ONEAPI_BFLOAT16_MATH_FUNCTIONS
+                GGML_SYCL_DEBUG("ggml_sycl: Using fused flash attention (BF16) DQK=%ld DV=%ld\n", DQK, DV);
+                dispatch_kv(sycl::ext::oneapi::bfloat16{});
+                return;
+                #endif
+            } else if (Q->type == GGML_TYPE_F32) {
+                GGML_SYCL_DEBUG("ggml_sycl: Using fused flash attention (F32) DQK=%ld DV=%ld\n", DQK, DV);
+                dispatch_kv(float{});
+                return;
+            }
+        }
+    }
 
     // Use oneMKL KV-split path when MKL is available and needed
     // KV-split handles both short and long contexts efficiently (n_splits=1 for short contexts)
@@ -727,79 +820,6 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
             GGML_ABORT("ggml_sycl: oneMKL flash attention path failed (unsupported head size); XMX is required but fallback failed\n");
         }
     }
-
-    // ============================================================================
-    // Fused Single-Kernel Flash Attention (Graph-Compatible)
-    // ============================================================================
-    // This is a new implementation that fuses QK, softmax, and PV into a single
-    // kernel without host-side split loops. It uses online softmax and direct
-    // stride loading from ggml tensor layout.
-    // Supported: head sizes up to 128 (shared memory constraints), F16/BF16/F32.
-    // This replaces the host-side sequential KV split loop in the MKL path.
-    // The kernel has been parallelized with WG_N=1 to utilize all workgroup threads.
-    if (DQK <= 128 && DV <= 128 && DQK == DV) {
-        // Prepare mask pointer (only F32 mask supported for now)
-        const float* mask_d = nullptr;
-        int64_t mask_stride = 0;
-        if (mask != nullptr && mask->data != nullptr) {
-            if (mask->type == GGML_TYPE_F32) {
-                mask_d = (const float*)mask->data;
-                mask_stride = mask->nb[1] / sizeof(float);
-            } else {
-                // Fused path only supports F32 mask; other types will fall back
-                mask_d = nullptr;
-            }
-        }
-
-        // Compute tensor strides for direct loading
-        fattn_tensor_strides strides = compute_tensor_strides(Q, K, V, dst);
-
-        // Dispatch based on Q data type
-        if (Q->type == GGML_TYPE_F16) {
-            GGML_SYCL_DEBUG("ggml_sycl: Using fused flash attention (F16) DQK=%d DV=%d\n", DQK, DV);
-            ggml_sycl_op_flash_attn_fused<sycl::half>(
-                ctx.stream(),
-                (const sycl::half*)Q, (const sycl::half*)K, (const sycl::half*)V,
-                (float*)dst->data,
-                N, N_kv, n_heads, n_kv_heads, gqa_ratio, scale,
-                mask_d, mask_stride,
-                sinks ? (const float*)sinks->data : nullptr,
-                strides,
-                DQK, DV);
-            return;
-        } else if (Q->type == GGML_TYPE_BF16) {
-            #ifdef SYCL_EXT_ONEAPI_BFLOAT16_MATH_FUNCTIONS
-            GGML_SYCL_DEBUG("ggml_sycl: Using fused flash attention (BF16) DQK=%d DV=%d\n", DQK, DV);
-            ggml_sycl_op_flash_attn_fused<sycl::ext::oneapi::bfloat16>(
-                ctx.stream(),
-                (const sycl::ext::oneapi::bfloat16*)Q,
-                (const sycl::ext::oneapi::bfloat16*)K,
-                (const sycl::ext::oneapi::bfloat16*)V,
-                (float*)dst->data,
-                N, N_kv, n_heads, n_kv_heads, gqa_ratio, scale,
-                mask_d, mask_stride,
-                sinks ? (const float*)sinks->data : nullptr,
-                strides,
-                DQK, DV);
-            return;
-            #endif
-        } else if (Q->type == GGML_TYPE_F32) {
-            GGML_SYCL_DEBUG("ggml_sycl: Using fused flash attention (F32) DQK=%d DV=%d\n", DQK, DV);
-            ggml_sycl_op_flash_attn_fused<float>(
-                ctx.stream(),
-                (const float*)Q, (const float*)K, (const float*)V,
-                (float*)dst->data,
-                N, N_kv, n_heads, n_kv_heads, gqa_ratio, scale,
-                mask_d, mask_stride,
-                sinks ? (const float*)sinks->data : nullptr,
-                strides,
-                DQK, DV);
-            return;
-        }
-    }
-
-    GGML_SYCL_DEBUG("ggml_sycl: Fused flash attention not applicable (DQK=%ld DV=%ld type=%s), falling back\n",
-            DQK, DV, ggml_type_name(Q->type));
 
 #ifdef SYCL_EXT_COOPERATIVE_MATRICES
     // Try XMX path if device supports it

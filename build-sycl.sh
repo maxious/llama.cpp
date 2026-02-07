@@ -18,7 +18,6 @@ ENABLE_BF16=true
 ENABLE_ASAN=false
 ENABLE_UBSAN=false
 ENABLE_AOT=""
-ENABLE_XE2=false
 BUILD_TYPE="Release"
 
 while [[ "$1" == --* ]]; do
@@ -69,13 +68,9 @@ while [[ "$1" == --* ]]; do
                 shift
             fi
             ;;
-        --xe2)
-            ENABLE_XE2=true
-            shift
-            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--clean] [--no-f16] [--no-bf16] [--asan] [--ubsan] [--sanitize] [--aot <target>] [--xe2]"
+            echo "Usage: $0 [--clean] [--no-f16] [--no-bf16] [--asan] [--ubsan] [--sanitize] [--aot <target>]"
             echo ""
             echo "Note: FP16 and BF16 are enabled by default for Intel GPUs."
             echo ""
@@ -83,10 +78,6 @@ while [[ "$1" == --* ]]; do
             echo "  --asan     Enable Address Sanitizer (ASAN) for memory error detection"
             echo "  --ubsan    Enable Undefined Behavior Sanitizer (UBSAN)"
             echo "  --sanitize Enable both ASAN and UBSAN (equivalent to --asan --ubsan)"
-            echo ""
-            echo "XE2/XMX options:"
-            echo "  --xe2       Enable XE2 (XMX cooperative matrix) support with JIT compilation"
-            echo "              Use this with GGML_SYCL_FLASH_ATTN_FORCE_XMX=1 to test XMX kernels"
             echo ""
             echo "AOT (Ahead-of-Time) compilation:"
             echo "  --aot [target]  Enable AOT compilation for specified Intel GPU target"
@@ -96,10 +87,6 @@ while [[ "$1" == --* ]]; do
             echo ""
             echo "Example with AOT for Battlemage:"
             echo "  ./build-sycl.sh --aot"
-            echo ""
-            echo "Example with XE2 JIT for testing:"
-            echo "  ./build-sycl.sh --xe2"
-            echo "  GGML_SYCL_FLASH_ATTN_FORCE_XMX=1 ./build-sycl/bin/llama-completion ..."
             echo ""
             echo "Example with sanitizers for debugging:"
             echo "  ./build-sycl.sh --asan"
@@ -132,6 +119,7 @@ source /opt/intel/oneapi/setvars.sh --force > /dev/null 2>&1 || true
 echo "Configuring CMake..."
 CMAKE_OPTS=(
     -DGGML_SYCL=ON
+    -DGGML_SYCL_GRAPH=OFF
     -DCMAKE_C_COMPILER=/opt/intel/oneapi/compiler/2025.3/bin/icx
     -DCMAKE_CXX_COMPILER=/opt/intel/oneapi/compiler/2025.3/bin/icpx
     -DLLAMA_CURL=OFF
@@ -179,11 +167,6 @@ if [[ -n "$ENABLE_AOT" ]]; then
     echo "Enabling AOT compilation for target: $ENABLE_AOT"
     CMAKE_OPTS+=(-DGGML_SYCL_DEVICE_ARCH="$ENABLE_AOT")
 fi
-
-# Always enable XE2 (XMX) support by default unless explicitly controlled
-# The code now detects support at runtime via tile_kind
-echo "Enabling XE2 (XMX cooperative matrix) support for JIT..."
-CMAKE_OPTS+=(-DGGML_SYCL_XE2=ON)
 
 cmake .. "${CMAKE_OPTS[@]}"
 
