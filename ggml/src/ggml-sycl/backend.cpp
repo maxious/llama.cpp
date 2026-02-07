@@ -328,6 +328,7 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             ggml_sycl_op_soft_max_back(ctx, dst);
             break;
         case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
             ggml_sycl_rope(ctx, dst);
             break;
         case GGML_OP_IM2COL:
@@ -1548,6 +1549,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             return max_bias == 0.0f;
         }
         case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
         case GGML_OP_IM2COL:
             return true;
         case GGML_OP_UPSCALE:
