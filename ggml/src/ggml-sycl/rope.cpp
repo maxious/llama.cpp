@@ -35,7 +35,8 @@ static void rope_yarn(
 }
 
 template <typename T, bool has_ff>
-static void rope_norm(const T * x, T * dst, const int ne0, const int ne1, const int ne2, const int s1, const int s2, const int n_dims,
+static void rope_norm(const T * x, T * dst, const int ne0, const int ne1, const int ne2, const int s1, const int s2, const int s3,
+                      const int d1, const int d2, const int d3, const int n_dims,
                       const int32_t * pos, float freq_scale, float ext_factor, float attn_factor,
                       const rope_corr_dims corr_dims, const float theta_scale, const float * freq_factors,
                       const sycl::nd_item<3> & item_ct1) {
@@ -45,21 +46,22 @@ static void rope_norm(const T * x, T * dst, const int ne0, const int ne1, const 
         return;
     }
 
-    const int row = item_ct1.get_local_range(0) * item_ct1.get_group(0) + item_ct1.get_local_id(0);
+    const int row_dst = item_ct1.get_local_range(0) * item_ct1.get_group(0) + item_ct1.get_local_id(0);
 
-    const int row0     = row % ne1;
-    const int channel0 = row / ne1;
+    const int i1 = row_dst % ne1;
+    const int i2 = (row_dst / ne1) % ne2;
+    const int i3 = row_dst / (ne1 * ne2);
 
-    const int i  = row * ne0 + i0;
-    const int i2 = channel0 * s2 + row0 * s1 + i0;
+    const int ix   = i3 * s3 + i2 * s2 + i1 * s1 + i0;
+    const int idst = i3 * d3 + i2 * d2 + i1 * d1 + i0;
 
     if (i0 >= n_dims) {
-        dst[i + 0] = x[i2 + 0];
-        dst[i + 1] = x[i2 + 1];
+        dst[idst + 0] = x[ix + 0];
+        dst[idst + 1] = x[ix + 1];
         return;
     }
 
-    const float theta_base = pos[channel0 % ne2] * sycl::pow(theta_scale, i0 / 2.0f);
+    const float theta_base = pos[i2] * sycl::pow(theta_scale, i0 / 2.0f);
 
     const float freq_factor = has_ff ? freq_factors[i0 / 2] : 1.0f;
 
@@ -68,39 +70,40 @@ static void rope_norm(const T * x, T * dst, const int ne0, const int ne1, const 
 
     rope_yarn(theta_base / freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, &cos_theta, &sin_theta);
 
-    const float x0 = x[i2 + 0];
-    const float x1 = x[i2 + 1];
+    const float x0 = x[ix + 0];
+    const float x1 = x[ix + 1];
 
-    dst[i + 0] = x0 * cos_theta - x1 * sin_theta;
-    dst[i + 1] = x0 * sin_theta + x1 * cos_theta;
+    dst[idst + 0] = x0 * cos_theta - x1 * sin_theta;
+    dst[idst + 1] = x0 * sin_theta + x1 * cos_theta;
 }
 
 template <typename T, bool has_ff>
-static void rope_neox(const T * x, T * dst, const int ne0, const int ne1, const int ne2, const int s1, const int s2, const int n_dims,
-                      const int32_t * pos, const float freq_scale, const float ext_factor, const float attn_factor,
-                      const rope_corr_dims corr_dims, const float theta_scale, const float * freq_factors,
-                      const sycl::nd_item<3> & item_ct1) {
+static void rope_neox(const T * x, T * dst, const int ne0, const int ne1, const int ne2, const int s1, const int s2, const int s3,
+                      const int d1, const int d2, const int d3, const int n_dims, const int32_t * pos, const float freq_scale,
+                      const float ext_factor, const float attn_factor, const rope_corr_dims corr_dims, const float theta_scale,
+                      const float * freq_factors, const sycl::nd_item<3> & item_ct1) {
     const int i0 = 2 * (item_ct1.get_local_range(1) * item_ct1.get_group(1) + item_ct1.get_local_id(1));
 
     if (i0 >= ne0) {
         return;
     }
 
-    const int row = item_ct1.get_local_range(0) * item_ct1.get_group(0) + item_ct1.get_local_id(0);
+    const int row_dst = item_ct1.get_local_range(0) * item_ct1.get_group(0) + item_ct1.get_local_id(0);
 
-    const int row0     = row % ne1;
-    const int channel0 = row / ne1;
+    const int i1 = row_dst % ne1;
+    const int i2 = (row_dst / ne1) % ne2;
+    const int i3 = row_dst / (ne1 * ne2);
 
-    const int i  = row * ne0 + i0 / 2;
-    const int i2 = channel0 * s2 + row0 * s1 + i0 / 2;
+    const int ix   = i3 * s3 + i2 * s2 + i1 * s1 + i0 / 2;
+    const int idst = i3 * d3 + i2 * d2 + i1 * d1 + i0 / 2;
 
     if (i0 >= n_dims) {
-        dst[i + i0 / 2 + 0] = x[i2 + i0 / 2 + 0];
-        dst[i + i0 / 2 + 1] = x[i2 + i0 / 2 + 1];
+        dst[idst + i0 / 2 + 0] = x[ix + i0 / 2 + 0];
+        dst[idst + i0 / 2 + 1] = x[ix + i0 / 2 + 1];
         return;
     }
 
-    const float theta_base = pos[channel0 % ne2] * sycl::pow(theta_scale, i0 / 2.0f);
+    const float theta_base = pos[i2] * sycl::pow(theta_scale, i0 / 2.0f);
 
     const float freq_factor = has_ff ? freq_factors[i0 / 2] : 1.0f;
 
@@ -109,30 +112,31 @@ static void rope_neox(const T * x, T * dst, const int ne0, const int ne1, const 
 
     rope_yarn(theta_base / freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, &cos_theta, &sin_theta);
 
-    const float x0 = x[i2 + 0];
-    const float x1 = x[i2 + n_dims / 2];
+    const float x0 = x[ix + 0];
+    const float x1 = x[ix + n_dims / 2];
 
-    dst[i + 0]          = x0 * cos_theta - x1 * sin_theta;
-    dst[i + n_dims / 2] = x0 * sin_theta + x1 * cos_theta;
+    dst[idst + 0]          = x0 * cos_theta - x1 * sin_theta;
+    dst[idst + n_dims / 2] = x0 * sin_theta + x1 * cos_theta;
 }
 
 template <typename T, bool has_ff>
 static void rope_multi(const T * x, T * dst, const int ne0, const int ne1, const int ne2, const size_t s1,
-                        const size_t s2, const int n_dims, const int32_t * pos, const float freq_scale,
-                        const float ext_factor, const float attn_factor, const rope_corr_dims corr_dims,
-                        const float theta_scale, const float * freq_factors, const mrope_sections sections,
-                        const bool is_imrope, const sycl::nd_item<3> & item_ct1) {
-    // get index pos
+                        const size_t s2, const size_t s3, const size_t d1, const size_t d2, const size_t d3,
+                        const int n_dims, const int32_t * pos, const float freq_scale, const float ext_factor,
+                        const float attn_factor, const rope_corr_dims corr_dims, const float theta_scale,
+                        const float * freq_factors, const mrope_sections sections, const bool is_imrope,
+                        const sycl::nd_item<3> & item_ct1) {
     const int i0 = 2 * (item_ct1.get_group(1) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1));
     if (i0 >= ne0) {
         return;
     }
     const int    row_dst   = (item_ct1.get_group(0) * item_ct1.get_local_range(0)) + item_ct1.get_local_id(0);
 
-    const int    row_x     = row_dst % ne1;
-    const int    channel_x = row_dst / ne1;
-    const int    idst      = (row_dst * ne0) + (i0 / 2);
-    const size_t ix        = ((size_t) channel_x * s2) + ((size_t) row_x * s1) + (i0 / 2);
+    const int    i1        = row_dst % ne1;
+    const int    i2        = (row_dst / ne1) % ne2;
+    const int    i3        = row_dst / (ne1 * ne2);
+    const size_t ix        = ((size_t) i3 * s3) + ((size_t) i2 * s2) + ((size_t) i1 * s1) + (i0 / 2);
+    const size_t idst      = ((size_t) i3 * d3) + ((size_t) i2 * d2) + ((size_t) i1 * d1) + (i0 / 2);
 
     if (i0 >= n_dims) {
         dst[idst + i0 / 2 + 0] = x[ix + i0 / 2 + 0];
@@ -144,31 +148,29 @@ static void rope_multi(const T * x, T * dst, const int ne0, const int ne1, const
     const int sec_w = sections.v[1] + sections.v[0];
     const int sector = (i0 / 2) % sect_dims;
 
-
     float theta_base = 0.0;
-    const int channel_idx = channel_x % ne2;
     if (is_imrope) {
         if (sector % 3 == 1 && sector < 3 * sections.v[1]) {
-            theta_base = pos[channel_idx + ne2 * 1]*sycl::pow(theta_scale, i0/2.0f);
+            theta_base = pos[i2 + ne2 * 1]*sycl::pow(theta_scale, i0/2.0f);
         } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {
-            theta_base = pos[channel_idx + ne2 * 2]*sycl::pow(theta_scale, i0/2.0f);
+            theta_base = pos[i2 + ne2 * 2]*sycl::pow(theta_scale, i0/2.0f);
         } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {
-            theta_base = pos[channel_idx]*sycl::pow(theta_scale, i0/2.0f);
+            theta_base = pos[i2]*sycl::pow(theta_scale, i0/2.0f);
         } else {
-            theta_base = pos[channel_idx + ne2 * 3]*sycl::pow(theta_scale, i0/2.0f);
+            theta_base = pos[i2 + ne2 * 3]*sycl::pow(theta_scale, i0/2.0f);
         }
     } else {
         if (sector < sections.v[0]) {
-            theta_base = pos[channel_idx]*sycl::pow(theta_scale, i0/2.0f);
+            theta_base = pos[i2]*sycl::pow(theta_scale, i0/2.0f);
         }
         else if (sector >= sections.v[0] && sector < sec_w) {
-            theta_base = pos[channel_idx + ne2 * 1]*sycl::pow(theta_scale, i0/2.0f);
+            theta_base = pos[i2 + ne2 * 1]*sycl::pow(theta_scale, i0/2.0f);
         }
         else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
-            theta_base = pos[channel_idx + ne2 * 2]*sycl::pow(theta_scale, i0/2.0f);
+            theta_base = pos[i2 + ne2 * 2]*sycl::pow(theta_scale, i0/2.0f);
         }
         else if (sector >= sec_w + sections.v[2]) {
-            theta_base = pos[channel_idx + ne2 * 3]*sycl::pow(theta_scale, i0/2.0f);
+            theta_base = pos[i2 + ne2 * 3]*sycl::pow(theta_scale, i0/2.0f);
         }
     }
 
@@ -179,7 +181,6 @@ static void rope_multi(const T * x, T * dst, const int ne0, const int ne1, const
     const float x0 = x[ix + 0];
     const float x1 = x[ix + n_dims/2];
 
-    // store results in dst
     dst[idst + 0]      = x0 * cos_theta - x1 * sin_theta;
     dst[idst + n_dims/2] = x0 * sin_theta + x1 * cos_theta;
 }
@@ -188,32 +189,31 @@ static void rope_multi(const T * x, T * dst, const int ne0, const int ne1, const
 
 template <typename T, bool has_ff>
 static void rope_vision(const T * x, T * dst, const int ne0, const int ne1, const int ne2, const size_t s1,
-                        const size_t s2, const int n_dims, const int32_t * pos, const float freq_scale,
-                        const float ext_factor, const float attn_factor, const rope_corr_dims corr_dims,
-                        const float theta_scale, const float * freq_factors, const mrope_sections sections,
-                        const sycl::nd_item<3> & item_ct1) {
-    // get index pos
+                        const size_t s2, const size_t s3, const size_t d1, const size_t d2, const size_t d3,
+                        const int n_dims, const int32_t * pos, const float freq_scale, const float ext_factor,
+                        const float attn_factor, const rope_corr_dims corr_dims, const float theta_scale,
+                        const float * freq_factors, const mrope_sections sections, const sycl::nd_item<3> & item_ct1) {
     const int i0 = 2 * (item_ct1.get_group(1) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1));
     if (i0 >= ne0) {
         return;
     }
     const int    row_dst   = (item_ct1.get_group(0) * item_ct1.get_local_range(0)) + item_ct1.get_local_id(0);
-    const int    row_x     = row_dst % ne1;
-    const int    channel_x = row_dst / ne1;
-    const int    idst      = (row_dst * ne0) + (i0 / 2);
-    const size_t ix        = ((size_t) channel_x * s2) + ((size_t) row_x * s1) + (i0 / 2);
+    const int    i1        = row_dst % ne1;
+    const int    i2        = (row_dst / ne1) % ne2;
+    const int    i3        = row_dst / (ne1 * ne2);
+    const size_t ix        = ((size_t) i3 * s3) + ((size_t) i2 * s2) + ((size_t) i1 * s1) + (i0 / 2);
+    const size_t idst      = ((size_t) i3 * d3) + ((size_t) i2 * d2) + ((size_t) i1 * d1) + (i0 / 2);
 
     const int sect_dims = sections.v[0] + sections.v[1];
     const int sector    = (i0 / 2) % sect_dims;
 
     float theta_base = 0.0f;
-    const int channel_idx = channel_x % ne2;
     if (sector < sections.v[0]) {
         const int p = sector;
-        theta_base  = pos[channel_idx] * sycl::pow(theta_scale, (float) p);
+        theta_base  = pos[i2] * sycl::pow(theta_scale, (float) p);
     } else {
         const int p = sector - sections.v[0];
-        theta_base  = pos[channel_idx + ne2] * sycl::pow(theta_scale, (float) p);
+        theta_base  = pos[i2 + ne2] * sycl::pow(theta_scale, (float) p);
     }
 
     const float freq_factor = has_ff ? freq_factors[i0 / 2] : 1.0f;
@@ -223,15 +223,14 @@ static void rope_vision(const T * x, T * dst, const int ne0, const int ne1, cons
     const float x0 = x[ix + 0];
     const float x1 = x[ix + n_dims];
 
-    // store results in dst
     dst[idst + 0]      = x0 * cos_theta - x1 * sin_theta;
     dst[idst + n_dims] = x0 * sin_theta + x1 * cos_theta;
 }
 
 template <typename T>
-static void rope_norm_sycl(const T * x, T * dst, const int ne0, const int ne1, const int ne2, const int s1, const int s2,
-                           const int n_dims, int nr, const int32_t * pos, const float freq_scale, const float freq_base,
-                           const float ext_factor, const float attn_factor, const rope_corr_dims corr_dims,
+static void rope_norm_sycl(const T * x, T * dst, const int ne0, const int ne1, const int ne2, const int s1, const int s2, const int s3,
+                           const int d1, const int d2, const int d3, const int n_dims, int nr, const int32_t * pos, const float freq_scale,
+                           const float freq_base, const float ext_factor, const float attn_factor, const rope_corr_dims corr_dims,
                            const float * freq_factors, queue_ptr stream) {
     GGML_ASSERT(ne0 % 2 == 0);
     const sycl::range<3> block_dims(1, SYCL_ROPE_BLOCK_SIZE, 1);
@@ -243,32 +242,22 @@ static void rope_norm_sycl(const T * x, T * dst, const int ne0, const int ne1, c
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
 
     if (freq_factors == nullptr) {
-        /*
-        DPCT1049:40: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
         stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-            rope_norm<T, false>(x, dst, ne0, ne1, ne2, s1, s2, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims,
-                                theta_scale, freq_factors, item_ct1);
+            rope_norm<T, false>(x, dst, ne0, ne1, ne2, s1, s2, s3, d1, d2, d3, n_dims, pos, freq_scale, ext_factor, attn_factor,
+                                corr_dims, theta_scale, freq_factors, item_ct1);
         });
     } else {
-        /*
-        DPCT1049:41: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
         stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-            rope_norm<T, true>(x, dst, ne0, ne1, ne2, s1, s2, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims,
-                               theta_scale, freq_factors, item_ct1);
+            rope_norm<T, true>(x, dst, ne0, ne1, ne2, s1, s2, s3, d1, d2, d3, n_dims, pos, freq_scale, ext_factor, attn_factor,
+                               corr_dims, theta_scale, freq_factors, item_ct1);
         });
     }
 }
 
 template <typename T>
-static void rope_neox_sycl(const T * x, T * dst, const int ne0, const int ne1, const int ne2, const int s1, const int s2,
-                           const int n_dims, const int nr, const int32_t * pos, const float freq_scale,
-                           const float freq_base, const float ext_factor, const float attn_factor,
+static void rope_neox_sycl(const T * x, T * dst, const int ne0, const int ne1, const int ne2, const int s1, const int s2, const int s3,
+                           const int d1, const int d2, const int d3, const int n_dims, const int nr, const int32_t * pos,
+                           const float freq_scale, const float freq_base, const float ext_factor, const float attn_factor,
                            const rope_corr_dims corr_dims, const float * freq_factors, queue_ptr stream) {
     GGML_ASSERT(ne0 % 2 == 0);
     const sycl::range<3> block_dims(1, SYCL_ROPE_BLOCK_SIZE, 1);
@@ -281,23 +270,24 @@ static void rope_neox_sycl(const T * x, T * dst, const int ne0, const int ne1, c
 
     if (freq_factors == nullptr) {
         stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-            rope_neox<T, false>(x, dst, ne0, ne1, ne2, s1, s2, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims,
-                                theta_scale, freq_factors, item_ct1);
+            rope_neox<T, false>(x, dst, ne0, ne1, ne2, s1, s2, s3, d1, d2, d3, n_dims, pos, freq_scale, ext_factor, attn_factor,
+                                corr_dims, theta_scale, freq_factors, item_ct1);
         });
     } else {
         stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-            rope_neox<T, true>(x, dst, ne0, ne1, ne2, s1, s2, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims,
-                               theta_scale, freq_factors, item_ct1);
+            rope_neox<T, true>(x, dst, ne0, ne1, ne2, s1, s2, s3, d1, d2, d3, n_dims, pos, freq_scale, ext_factor, attn_factor,
+                               corr_dims, theta_scale, freq_factors, item_ct1);
         });
     }
 }
 
 template <typename T>
 static void rope_multi_sycl(const T * x, T * dst, const int ne0, const int ne1, const int ne2, const size_t s1,
-                             const size_t s2, const int n_dims, const int nr, const int32_t * pos,
-                             const float freq_scale, const float freq_base, const float ext_factor,
-                             const float attn_factor, const rope_corr_dims corr_dims, const float * freq_factors,
-                             const mrope_sections sections, const bool is_imrope, queue_ptr stream) {
+                             const size_t s2, const size_t s3, const size_t d1, const size_t d2, const size_t d3,
+                             const int n_dims, const int nr, const int32_t * pos, const float freq_scale,
+                             const float freq_base, const float ext_factor, const float attn_factor,
+                             const rope_corr_dims corr_dims, const float * freq_factors, const mrope_sections sections,
+                             const bool is_imrope, queue_ptr stream) {
     GGML_ASSERT(ne0 % 2 == 0);
     const sycl::range<3>    block_dims(1, SYCL_ROPE_BLOCK_SIZE, 1);
     const int               n_blocks_y = ceil_div(ne0, (2 * SYCL_ROPE_BLOCK_SIZE));
@@ -305,20 +295,18 @@ static void rope_multi_sycl(const T * x, T * dst, const int ne0, const int ne1, 
     const sycl::nd_range<3> nd_range(grid_dims * block_dims, block_dims);
 
     const float theta_scale = std::pow(freq_base, -2.0f / n_dims);
-    // Add FP16 capability check if T could be sycl::half
     if constexpr (std::is_same_v<T, sycl::half>) {
         dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
     }
-    // launch kernel
     if (freq_factors == nullptr) {
         stream->parallel_for(nd_range, [=](sycl::nd_item<3> item_ct1) {
-            rope_multi<T, false>(x, dst, ne0, ne1, ne2, s1, s2, n_dims, pos, freq_scale, ext_factor, attn_factor,
-                                  corr_dims, theta_scale, freq_factors, sections, is_imrope, item_ct1);
+            rope_multi<T, false>(x, dst, ne0, ne1, ne2, s1, s2, s3, d1, d2, d3, n_dims, pos, freq_scale, ext_factor,
+                                  attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope, item_ct1);
         });
     } else {
         stream->parallel_for(nd_range, [=](sycl::nd_item<3> item_ct1) {
-            rope_multi<T, true>(x, dst, ne0, ne1, ne2, s1, s2, n_dims, pos, freq_scale, ext_factor, attn_factor,
-                                 corr_dims, theta_scale, freq_factors, sections, is_imrope, item_ct1);
+            rope_multi<T, true>(x, dst, ne0, ne1, ne2, s1, s2, s3, d1, d2, d3, n_dims, pos, freq_scale, ext_factor,
+                                  attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope, item_ct1);
         });
     }
 }
@@ -329,10 +317,11 @@ static void rope_multi_sycl(const T * x, T * dst, const int ne0, const int ne1, 
 // rope vision
 template <typename T>
 static void rope_vision_sycl(const T * x, T * dst, const int ne0, const int ne1, const int ne2, const size_t s1,
-                             const size_t s2, const int n_dims, const int nr, const int32_t * pos,
-                             const float freq_scale, const float freq_base, const float ext_factor,
-                             const float attn_factor, const rope_corr_dims corr_dims, const float * freq_factors,
-                             const mrope_sections sections, queue_ptr stream) {
+                             const size_t s2, const size_t s3, const size_t d1, const size_t d2, const size_t d3,
+                             const int n_dims, const int nr, const int32_t * pos, const float freq_scale,
+                             const float freq_base, const float ext_factor, const float attn_factor,
+                             const rope_corr_dims corr_dims, const float * freq_factors, const mrope_sections sections,
+                             queue_ptr stream) {
     GGML_ASSERT(ne0 % 2 == 0);
     const sycl::range<3>    block_dims(1, SYCL_ROPE_BLOCK_SIZE, 1);
     const int               n_blocks_y = ceil_div(ne0, (2 * SYCL_ROPE_BLOCK_SIZE));
@@ -340,20 +329,18 @@ static void rope_vision_sycl(const T * x, T * dst, const int ne0, const int ne1,
     const sycl::nd_range<3> nd_range(grid_dims * block_dims, block_dims);
 
     const float theta_scale = std::pow(freq_base, -2.0f / n_dims);
-    // Add FP16 capability check if T could be sycl::half
     if constexpr (std::is_same_v<T, sycl::half>) {
         dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
     }
-    // launch kernel
     if (freq_factors == nullptr) {
         stream->parallel_for(nd_range, [=](sycl::nd_item<3> item_ct1) {
-            rope_vision<T, false>(x, dst, ne0, ne1, ne2, s1, s2, n_dims, pos, freq_scale, ext_factor, attn_factor,
-                                  corr_dims, theta_scale, freq_factors, sections, item_ct1);
+            rope_vision<T, false>(x, dst, ne0, ne1, ne2, s1, s2, s3, d1, d2, d3, n_dims, pos, freq_scale, ext_factor,
+                                  attn_factor, corr_dims, theta_scale, freq_factors, sections, item_ct1);
         });
     } else {
         stream->parallel_for(nd_range, [=](sycl::nd_item<3> item_ct1) {
-            rope_vision<T, true>(x, dst, ne0, ne1, ne2, s1, s2, n_dims, pos, freq_scale, ext_factor, attn_factor,
-                                 corr_dims, theta_scale, freq_factors, sections, item_ct1);
+            rope_vision<T, true>(x, dst, ne0, ne1, ne2, s1, s2, s3, d1, d2, d3, n_dims, pos, freq_scale, ext_factor,
+                                 attn_factor, corr_dims, theta_scale, freq_factors, sections, item_ct1);
         });
     }
 }
@@ -370,6 +357,11 @@ inline void ggml_sycl_op_rope(ggml_backend_sycl_context & ctx, ggml_tensor *dst)
 
     const size_t s01 = dst->src[0]->nb[1] / ggml_type_size(dst->src[0]->type);
     const size_t s02 = dst->src[0]->nb[2] / ggml_type_size(dst->src[0]->type);
+    const size_t s03 = dst->src[0]->nb[3] / ggml_type_size(dst->src[0]->type);
+
+    const size_t d01 = dst->nb[1] / ggml_type_size(dst->type);
+    const size_t d02 = dst->nb[2] / ggml_type_size(dst->type);
+    const size_t d03 = dst->nb[3] / ggml_type_size(dst->type);
 
 
     //const int n_past      = ((int32_t *) dst->op_params)[0];
@@ -425,12 +417,13 @@ inline void ggml_sycl_op_rope(ggml_backend_sycl_context & ctx, ggml_tensor *dst)
     if (is_neox) {
         GGML_SYCL_DEBUG("%s: neox path\n", __func__);
         if (dst->src[0]->type == GGML_TYPE_F32) {
-            rope_neox_sycl((const float *) dst->src[0]->data, (float *) dst->data, ne00, ne01, ne02, s01, s02, n_dims, nr,
-                           pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims, freq_factors, main_stream);
+            rope_neox_sycl((const float *) dst->src[0]->data, (float *) dst->data, ne00, ne01, ne02, s01, s02, s03,
+                           d01, d02, d03, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
+                           freq_factors, main_stream);
         } else if (dst->src[0]->type == GGML_TYPE_F16) {
-            rope_neox_sycl((const sycl::half *) dst->src[0]->data, (sycl::half *) dst->data, ne00, ne01, ne02, s01, s02,
-                           n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims, freq_factors,
-                           main_stream);
+            rope_neox_sycl((const sycl::half *) dst->src[0]->data, (sycl::half *) dst->data, ne00, ne01, ne02, s01, s02, s03,
+                           d01, d02, d03, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
+                           freq_factors, main_stream);
         } else {
             GGML_ABORT("fatal error");
         }
@@ -438,12 +431,12 @@ inline void ggml_sycl_op_rope(ggml_backend_sycl_context & ctx, ggml_tensor *dst)
         GGML_SYCL_DEBUG("%s: mrope path\n", __func__);
         if (dst->src[0]->type == GGML_TYPE_F16) {
             rope_multi_sycl((const sycl::half *)dst->src[0]->data, (sycl::half *)dst->data, ne00, ne01, ne02, s01,
-                s02, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
+                s02, s03, d01, d02, d03, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
                 freq_factors, sections, is_imrope, main_stream);
         } else if (dst->src[0]->type == GGML_TYPE_F32) {
-            rope_multi_sycl((const float *) dst->src[0]->data, (float *) dst->data, ne00, ne01, ne02, s01, s02, n_dims,
-                             nr, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims, freq_factors, sections,
-                             is_imrope, main_stream);
+            rope_multi_sycl((const float *) dst->src[0]->data, (float *) dst->data, ne00, ne01, ne02, s01, s02, s03,
+                             d01, d02, d03, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
+                             freq_factors, sections, is_imrope, main_stream);
         } else {
             GGML_ABORT("Fatal error: Tensor type unsupported!");
         }
@@ -451,24 +444,25 @@ inline void ggml_sycl_op_rope(ggml_backend_sycl_context & ctx, ggml_tensor *dst)
         GGML_SYCL_DEBUG("%s: vision path\n", __func__);
         if (dst->src[0]->type == GGML_TYPE_F16) {
             rope_vision_sycl((const sycl::half *) dst->src[0]->data, (sycl::half *) dst->data, ne00, ne01, ne02, s01,
-                             s02, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
-                             freq_factors, sections, main_stream);
+                             s02, s03, d01, d02, d03, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor,
+                             corr_dims, freq_factors, sections, main_stream);
         } else if (dst->src[0]->type == GGML_TYPE_F32) {
-            rope_vision_sycl((const float *) dst->src[0]->data, (float *) dst->data, ne00, ne01, ne02, s01, s02, n_dims,
-                             nr, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims, freq_factors, sections,
-                             main_stream);
+            rope_vision_sycl((const float *) dst->src[0]->data, (float *) dst->data, ne00, ne01, ne02, s01, s02, s03,
+                             d01, d02, d03, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
+                             freq_factors, sections, main_stream);
         } else {
             GGML_ABORT("Fatal error: Tensor type unsupported!");
         }
     } else {
         GGML_SYCL_DEBUG("%s: norm path\n", __func__);
         if (dst->src[0]->type == GGML_TYPE_F32) {
-            rope_norm_sycl((const float *) dst->src[0]->data, (float *) dst->data, ne00, ne01, ne02, s01, s02, n_dims, nr,
-                           pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims, freq_factors, main_stream);
+            rope_norm_sycl((const float *) dst->src[0]->data, (float *) dst->data, ne00, ne01, ne02, s01, s02, s03,
+                           d01, d02, d03, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
+                           freq_factors, main_stream);
         } else if (dst->src[0]->type == GGML_TYPE_F16) {
-            rope_norm_sycl((const sycl::half *) dst->src[0]->data, (sycl::half *) dst->data, ne00, ne01, ne02, s01, s02,
-                           n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims, freq_factors,
-                           main_stream);
+            rope_norm_sycl((const sycl::half *) dst->src[0]->data, (sycl::half *) dst->data, ne00, ne01, ne02, s01, s02, s03,
+                           d01, d02, d03, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
+                           freq_factors, main_stream);
         } else {
             GGML_ABORT("fatal error");
         }
