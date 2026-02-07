@@ -59,10 +59,11 @@ inline void ggml_sycl_op_flash_attn_fused(
     const fattn_tensor_strides& strides,
     int DQK, int DV
 ) {
-    constexpr int BQ = FATTN_BQ;
-    constexpr int BK = FATTN_BK;
-    constexpr int WG_M = FATTN_WG_M;
-    constexpr int WG_N = FATTN_WG_N;
+     (void)n_kv_heads;  // Suppress unused parameter warning (GQA ratio uses n_heads/n_kv_heads, but n_kv_heads itself not needed directly)
+     constexpr int BQ = FATTN_BQ;
+     constexpr int BK = FATTN_BK;
+     constexpr int WG_M = FATTN_WG_M;
+     constexpr int WG_N = FATTN_WG_N;
 
     const int num_q_blocks = (N + BQ - 1) / BQ;
     sycl::range<2> global(num_q_blocks * WG_M, n_heads * WG_N);

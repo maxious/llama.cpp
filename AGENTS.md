@@ -307,6 +307,33 @@ export GGML_SYCL_FLASH_ATTN_FORCE_XMX=1
 2. **Enable Direct Loading** (`GGML_SYCL_FLASH_ATTN_DIRECT=1`) to reduce memory bandwidth usage.
 3. The system now automatically handles block size optimization for GLM-4.7 to prevent resource exhaustion.
 
+### Sink Support in XMX
+
+The XMX flash attention path originally did not support attention sinks. Sink support has been implemented by passing the sinks tensor to the `flash_attn_combine_splits_kernel` in the reduction phase, matching the MKL implementation. This allows XMX to be used with models that use attention sinks (e.g., StreamingLLM) when the dispatch routes to XMX.
+
+### Flash Attention Dispatch Order
+
+The SYCL flash attention dispatch follows this order:
+
+1. **MKL path** (oneMKL) is selected when:
+   - MKL is forced (`GGML_SYCL_FLASH_ATTN_MKL=1`), OR
+   - Device lacks XMX support, OR
+   - `sinks != nullptr` (attention sinks), OR
+   - `mask != nullptr` (causal/block mask), OR
+   - Batch size `N < 32` (small batch optimization)
+
+2. **Fused single-kernel path** is selected when:
+   - No mask, no sinks, batch size `N >= 32`, AND
+   - Head sizes satisfy `DQK <= 128 && DV <= 128 && DQK == DV`
+
+3. **XMX path** (cooperative matrix) is selected when:
+   - Device supports XMX and none of the above conditions apply.
+   - Includes both direct loading and KV-split variants.
+
+4. **Fallback** (basic implementation) if none of the above are applicable.
+
+The fused kernel is now stable and passes all tests for its intended configuration (mask=0, sinks=0, N>=32). The XMX path now supports sinks via the combine kernel. Both paths are fully functional.
+
 ## Debugging Tips
 
 ### Accessing Full Tool Output

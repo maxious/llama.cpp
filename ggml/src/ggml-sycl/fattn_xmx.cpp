@@ -1383,6 +1383,7 @@ void ggml_sycl_op_flash_attn_coopmat_kvsplit(ggml_backend_sycl_context & ctx, gg
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
 
     dpct::queue_ptr stream = ctx.stream();
 
@@ -1454,6 +1455,12 @@ void ggml_sycl_op_flash_attn_coopmat_kvsplit(ggml_backend_sycl_context & ctx, gg
             mask_d = mask_d_f32_alloc;
             mask_stride_val = mask_n_kv;
         }
+    }
+
+    // Prepare sinks if needed (sinks are F32 per-head values)
+    const float * sinks_d = nullptr;
+    if (sinks != nullptr && sinks->data != nullptr) {
+        sinks_d = (const float*)sinks->data;
     }
 
     // Output buffer
@@ -1554,7 +1561,7 @@ void ggml_sycl_op_flash_attn_coopmat_kvsplit(ggml_backend_sycl_context & ctx, gg
                 partial_size,
                 o_head_stride,
                 o_seq_stride,
-                nullptr  // sinks not supported in XMX path yet
+                sinks_d
             );
         });
     });
