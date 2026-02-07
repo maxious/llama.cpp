@@ -10,8 +10,8 @@ struct mrope_sections {
     int v[4];
 };
 
-static float rope_yarn_ramp(const float low, const float high, const int i0) {
-    const float y = (i0 / 2 - low) / sycl::max(0.001f, high - low);
+static float rope_yarn_ramp(const float low, const float high, const int64_t i0) {
+    const float y = (i0 / 2.0f - low) / sycl::max(0.001f, high - low);
     return 1.0f - sycl::min(1.0f, sycl::max(0.0f, y));
 }
 
@@ -45,7 +45,7 @@ static void rope_norm(const T * x, T * dst, const int ne0, const int ne1, const 
         return;
     }
 
-    const int row = item_ct1.get_local_range(2) * item_ct1.get_group(2) + item_ct1.get_local_id(2);
+    const int row = item_ct1.get_local_range(0) * item_ct1.get_group(0) + item_ct1.get_local_id(0);
 
     const int row0     = row % ne1;
     const int channel0 = row / ne1;
@@ -85,7 +85,7 @@ static void rope_neox(const T * x, T * dst, const int ne0, const int ne1, const 
         return;
     }
 
-    const int row = item_ct1.get_local_range(2) * item_ct1.get_group(2) + item_ct1.get_local_id(2);
+    const int row = item_ct1.get_local_range(0) * item_ct1.get_group(0) + item_ct1.get_local_id(0);
 
     const int row0     = row % ne1;
     const int channel0 = row / ne1;
@@ -125,7 +125,7 @@ static void rope_multi(const T * x, T * dst, const int ne0, const int ne1, const
     if (i0 >= ne0) {
         return;
     }
-    const int    row_dst   = (item_ct1.get_group(2) * item_ct1.get_local_range(2)) + item_ct1.get_local_id(2);
+    const int    row_dst   = (item_ct1.get_group(0) * item_ct1.get_local_range(0)) + item_ct1.get_local_id(0);
 
     const int    row_x     = row_dst % ne1;
     const int    channel_x = row_dst / ne1;
@@ -193,7 +193,7 @@ static void rope_vision(const T * x, T * dst, const int ne0, const int ne1, cons
     if (i0 >= ne0) {
         return;
     }
-    const int    row_dst   = (item_ct1.get_group(2) * item_ct1.get_local_range(2)) + item_ct1.get_local_id(2);
+    const int    row_dst   = (item_ct1.get_group(0) * item_ct1.get_local_range(0)) + item_ct1.get_local_id(0);
     const int    row_x     = row_dst % ne1;
     const int    channel_x = row_dst / ne1;
     const int    idst      = (row_dst * ne0) + (i0 / 2);
@@ -231,7 +231,7 @@ static void rope_norm_sycl(const T * x, T * dst, const int ne0, const int ne1, c
     GGML_ASSERT(ne0 % 2 == 0);
     const sycl::range<3> block_dims(1, SYCL_ROPE_BLOCK_SIZE, 1);
     const int            num_blocks_x = ceil_div(ne0, (2 * SYCL_ROPE_BLOCK_SIZE));
-    const sycl::range<3> block_nums(1, num_blocks_x, nr);
+    const sycl::range<3> block_nums(nr, num_blocks_x, 1);
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
 
@@ -268,7 +268,7 @@ static void rope_neox_sycl(const T * x, T * dst, const int ne0, const int ne1, c
     GGML_ASSERT(ne0 % 2 == 0);
     const sycl::range<3> block_dims(1, SYCL_ROPE_BLOCK_SIZE, 1);
     const int            num_blocks_x = ceil_div(ne0, (2 * SYCL_ROPE_BLOCK_SIZE));
-    const sycl::range<3> block_nums(1, num_blocks_x, nr);
+    const sycl::range<3> block_nums(nr, num_blocks_x, 1);
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
 
@@ -296,7 +296,7 @@ static void rope_multi_sycl(const T * x, T * dst, const int ne0, const int ne1, 
     GGML_ASSERT(ne0 % 2 == 0);
     const sycl::range<3>    block_dims(1, SYCL_ROPE_BLOCK_SIZE, 1);
     const int               n_blocks_y = ceil_div(ne0, (2 * SYCL_ROPE_BLOCK_SIZE));
-    const sycl::range<3>    grid_dims(1, n_blocks_y, nr);
+    const sycl::range<3>    grid_dims(nr, n_blocks_y, 1);
     const sycl::nd_range<3> nd_range(grid_dims * block_dims, block_dims);
 
     const float theta_scale = std::pow(freq_base, -2.0f / n_dims);
@@ -331,7 +331,7 @@ static void rope_vision_sycl(const T * x, T * dst, const int ne0, const int ne1,
     GGML_ASSERT(ne0 % 2 == 0);
     const sycl::range<3>    block_dims(1, SYCL_ROPE_BLOCK_SIZE, 1);
     const int               n_blocks_y = ceil_div(ne0, (2 * SYCL_ROPE_BLOCK_SIZE));
-    const sycl::range<3>    grid_dims(1, n_blocks_y, nr);
+    const sycl::range<3>    grid_dims(nr, n_blocks_y, 1);
     const sycl::nd_range<3> nd_range(grid_dims * block_dims, block_dims);
 
     const float theta_scale = std::pow(freq_base, -2.0f / n_dims);
