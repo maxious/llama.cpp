@@ -217,6 +217,41 @@ inline void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     dsti->d = sumq2 > 0 ? sumqx / sumq2 : d;
 }
 
+__dpct_inline__ int best_index_mxfp4(float x, float d) {
+    int best_index = 0;
+    float best_err = sycl::fabs(kvalues_mxfp4[0] * d - x);
+    for (int i = 1; i < 16; i++) {
+        float err = sycl::fabs(kvalues_mxfp4[i] * d - x);
+        if (err < best_err) {
+            best_index = i;
+            best_err = err;
+        }
+    }
+    return best_index;
+}
+
+inline void cpy_blck_f32_mxfp4(const char * cxi, char * cdsti) {
+    const float * xi   = (const float *) cxi;
+    block_mxfp4 * dsti = (block_mxfp4 *) cdsti;
+
+    float amax = 0.0f;
+    for (int j = 0; j < QK_MXFP4; j++) {
+        amax = sycl::fmax(amax, sycl::fabs(xi[j]));
+    }
+
+    const uint8_t e = amax > 0.0f ? (uint8_t) (sycl::floor(sycl::log2(amax)) - 2 + 127) : 0;
+    const float d = ggml_sycl_e8m0_to_fp32(e) * 0.5f;
+
+    dsti->e = e;
+
+    for (int j = 0; j < QK_MXFP4 / 2; ++j) {
+        const uint8_t x0 = best_index_mxfp4(xi[0 + j], d);
+        const uint8_t x1 = best_index_mxfp4(xi[QK_MXFP4 / 2 + j], d);
+
+        dsti->qs[j] = x0 | (x1 << 4);
+    }
+}
+
 void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1);
 void ggml_sycl_dup(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
