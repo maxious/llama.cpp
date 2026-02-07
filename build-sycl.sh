@@ -115,6 +115,13 @@ fi
 
 # Create build directory
 mkdir -p build-sycl
+
+# Clean stale library symlinks that can cause "failed to create symbolic link" errors
+# These may block linking if they exist from a previous build
+if [ -d "build-sycl/bin" ]; then
+    rm -f build-sycl/bin/libggml.so* build-sycl/bin/libggml-sycl.so* 2>/dev/null || true
+fi
+
 cd build-sycl
 
 # Source oneAPI environment (required for SYCL and oneDNN)
