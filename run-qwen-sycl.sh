@@ -22,9 +22,9 @@ fi
 # Run llama-server with Qwen 0.6B model (fully GPU accelerated)
 # -ngl 99: All layers fit in GPU memory (1.2GB model)
 # -c 2048: Context size
-./build/bin/llama-server --model ./koboldcpp/Qwen3-0.6B-ICM-DPO.f16.gguf \
+#./build/bin/llama-server --model ./models/koboldcpp/Qwen3-0.6B-ICM-DPO.f16.gguf \
+./build/bin/llama-server --model ./models/koboldcpp/Qwen3-Coder-30B-A3B-Instruct-MXFP4_MOE.gguf \
   --port 5000 --host 0.0.0.0 --jinja \
-  --n-gpu-layers 99 \
-  -c 2048 \
-  -fit on \
-  --verbose
+  --fit-ctx 262144 \
+  -fit on
+
