@@ -1405,11 +1405,13 @@ void ggml_sycl_op_flash_attn_coopmat_kvsplit(ggml_backend_sycl_context & ctx, gg
     const int64_t partial_size = 2 + (N * V_HEAD_DIM);  // M, L, and O in float
     const int64_t partials_total = n_splits * n_heads * partial_size;
 
+#if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
     bool use_async_mem = false;
 #ifdef GGML_SYCL_GRAPH
     extern int g_ggml_sycl_disable_graph;
     extern int g_ggml_sycl_use_async_mem_op;
     use_async_mem = !g_ggml_sycl_disable_graph && g_ggml_sycl_use_async_mem_op;
+#endif
 #endif
 
     // Allocate partials buffer

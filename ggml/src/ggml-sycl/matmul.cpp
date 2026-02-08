@@ -363,7 +363,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                 // add event for the main device to wait on until other device is done
                 if (split && (i != ctx.device || is != 0)) {
                     GGML_SYCL_DEBUG("[SYCL][MUL_MAT]DEVICE %d (stream %d) RECORDING completion event at events[%d][%d]=%p\n",
-                        i, (int)is, i, is, (void*)(src0_extra->events[i][is]));
+                        i, (int)is, i, (int)is, (void*)(src0_extra->events[i][is]));
                     SYCL_CHECK(CHECK_TRY_ERROR(
                         *src0_extra->events[i][is] =
                             stream->ext_oneapi_submit_barrier()));
@@ -1095,7 +1095,7 @@ static void ggml_sycl_op_mul_mat_xmx(
     const int64_t N = src1_ncols;
     const int64_t K = src0->ne[0];
 
-    int id = get_current_device_id();
+    // int id = get_current_device_id(); // unused
     // dst is N x M (row-major), ne0=M (inner dim), ne1=N (outer dim)
     const int64_t ldc = dst->ne[0]; 
 
@@ -1706,7 +1706,7 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
         char * dst_data = (char *)dst->data;
         const char * packed_data = dev_dst_packed.get();
         mmid_row_mapping * map_data = dev_dst_mapping.get();
-        int64_t dst_ne0 = dst->ne[0];
+        // int64_t dst_ne0 = dst->ne[0]; // unused
         size_t dst_nb1 = dst->nb[1];
         size_t dst_nb2 = dst->nb[2];
         

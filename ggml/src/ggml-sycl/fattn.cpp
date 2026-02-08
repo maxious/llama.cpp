@@ -273,7 +273,7 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
+    // const ggml_tensor * sinks = dst->src[4]; // unused
 
     float scale, max_bias, logit_softcap;
 

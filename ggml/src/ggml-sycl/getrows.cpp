@@ -171,7 +171,7 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
 // K-quant kernels
 static void k_get_rows_q4_k(
     const void * src0, const int32_t * src1, float * dst,
-    int64_t ne00, int64_t ne12,
+    int64_t /*ne00*/, int64_t ne12,
     size_t s1, size_t s2, size_t s3,
     size_t nb01, size_t nb02, size_t nb03,
     size_t s10, size_t s11, size_t s12,
@@ -192,7 +192,7 @@ static void k_get_rows_q4_k(
 
 static void k_get_rows_q6_k(
     const void * src0, const int32_t * src1, float * dst,
-    int64_t ne00, int64_t ne12,
+    int64_t /*ne00*/, int64_t ne12,
     size_t s1, size_t s2, size_t s3,
     size_t nb01, size_t nb02, size_t nb03,
     size_t s10, size_t s11, size_t s12,
@@ -212,7 +212,7 @@ static void k_get_rows_q6_k(
 
 static void k_get_rows_mxfp4(
     const void * src0, const int32_t * src1, float * dst,
-    int64_t ne00, int64_t ne12,
+    int64_t /*ne00*/, int64_t ne12,
     size_t s1, size_t s2, size_t s3,
     size_t nb01, size_t nb02, size_t nb03,
     size_t s10, size_t s11, size_t s12,
@@ -260,6 +260,7 @@ static void get_rows_sycl_q4_k(ggml_backend_sycl_context & ctx, const ggml_tenso
                     s3, nb01, nb02, nb03, s10, s11, s12, get_pointer(scales_local), item);
             });
     });
+    GGML_UNUSED(ctx);
 }
 
 static void get_rows_sycl_q6_k(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
@@ -291,6 +292,7 @@ static void get_rows_sycl_q6_k(ggml_backend_sycl_context & ctx, const ggml_tenso
                     s3, nb01, nb02, nb03, s10, s11, s12, item);
             });
     });
+    GGML_UNUSED(ctx);
 }
 
 static void get_rows_sycl_mxfp4(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
@@ -321,6 +323,7 @@ static void get_rows_sycl_mxfp4(ggml_backend_sycl_context & ctx, const ggml_tens
                     s3, nb01, nb02, nb03, s10, s11, s12, item);
             });
     });
+    GGML_UNUSED(ctx);
 }
 
 void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {

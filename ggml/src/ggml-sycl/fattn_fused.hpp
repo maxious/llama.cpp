@@ -82,7 +82,7 @@ inline void ggml_sycl_op_flash_attn_fused(
                 const int q_block_idx = it.get_group(0);
                 const int head_idx = it.get_group(1);
                 const int lane_in_wg = it.get_local_linear_id();
-                const int wg_col = it.get_local_id(1);
+                // const int wg_col = it.get_local_id(1); // unused
 
                 const int q_start = q_block_idx * BQ;
                 if (q_start >= N) return;
