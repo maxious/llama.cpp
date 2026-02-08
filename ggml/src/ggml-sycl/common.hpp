@@ -86,9 +86,6 @@ extern int g_ggml_sycl_prioritize_dmmv;
 
 // define for XMX in Intel GPU
 // TODO: currently, it's not used for XMX really.
-#if !defined(GGML_SYCL_FORCE_MMQ)
-    #define SYCL_USE_XMX
-#endif
 
 // max batch size to use MMQ kernels when tensor cores are available
 #define MMQ_MAX_BATCH_SIZE 32

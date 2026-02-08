@@ -1581,6 +1581,10 @@ template void ggml_sycl_op_flash_attn_coopmat_padded<56, 56, 64, 64>(ggml_backen
 template void ggml_sycl_op_flash_attn_coopmat_padded<72, 72, 80, 80>(ggml_backend_sycl_context&, ggml_tensor*);
 template void ggml_sycl_op_flash_attn_coopmat_padded<88, 88, 96, 96>(ggml_backend_sycl_context&, ggml_tensor*);
 template void ggml_sycl_op_flash_attn_coopmat_padded<104, 104, 112, 112>(ggml_backend_sycl_context&, ggml_tensor*);
+template void ggml_sycl_op_flash_attn_coopmat_padded<64, 64, 64, 64>(ggml_backend_sycl_context&, ggml_tensor*);
+template void ggml_sycl_op_flash_attn_coopmat_padded<96, 96, 96, 96>(ggml_backend_sycl_context&, ggml_tensor*);
+template void ggml_sycl_op_flash_attn_coopmat_padded<128, 128, 128, 128>(ggml_backend_sycl_context&, ggml_tensor*);
+template void ggml_sycl_op_flash_attn_coopmat_padded<256, 256, 256, 256>(ggml_backend_sycl_context&, ggml_tensor*);
 
 template void ggml_sycl_op_flash_attn_coopmat_direct<32, 32>(ggml_backend_sycl_context&, ggml_tensor*);
 template void ggml_sycl_op_flash_attn_coopmat_direct<64, 64>(ggml_backend_sycl_context&, ggml_tensor*);
@@ -1606,4 +1610,3 @@ template void ggml_sycl_op_flash_attn_coopmat_kvsplit<576, 512, 8, 16, 16, 8, 16
 template void ggml_sycl_op_flash_attn_coopmat_kvsplit<576, 512, 8, 16, 16, 8, 16, fattn_input_type::f32, true>(ggml_backend_sycl_context&, ggml_tensor*);
 
 #endif // SYCL_EXT_ONEAPI_MATRIX
-

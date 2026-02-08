@@ -27,11 +27,7 @@ file(GLOB   GGML_HEADERS_SYCL "*.hpp")
 file(GLOB   GGML_SOURCES_SYCL "*.cpp")
 target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
 
-# Enable SYCL matrix extension for XMX (cooperative matrices)
-target_compile_definitions(ggml-sycl PRIVATE SYCL_EXT_ONEAPI_MATRIX)
-
-# Disable fused flash attention to test XMX path
-target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_FLASH_ATTN_DISABLE_FUSED)
+# SYCL backend library definition
 
 if (WIN32)
     # To generate a Visual Studio solution, using Intel C++ Compiler for ggml-sycl is mandatory

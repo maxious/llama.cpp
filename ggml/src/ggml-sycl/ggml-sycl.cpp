@@ -315,13 +315,11 @@ void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_F16: no\n");
 #endif
 
-/* NOT REMOVE, keep it for next optimize for XMX.
 #if defined(SYCL_USE_XMX)
-        fprintf(stderr, "%s: SYCL_USE_XMX: yes\n", __func__);
+        GGML_LOG_INFO("  SYCL_USE_XMX: yes\n");
 #else
-        fprintf(stderr, "%s: SYCL_USE_XMX: no\n", __func__);
+        GGML_LOG_INFO("  SYCL_USE_XMX: no\n");
 #endif
-*/
         // Currently, we only use async malloc / free when graphs are enabled as it is required for the calls to be
         // properly recorded. As this SYCL extension matures it may be beneficial to enable as the default path and in
         // other places.

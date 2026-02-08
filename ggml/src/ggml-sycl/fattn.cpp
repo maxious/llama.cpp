@@ -148,6 +148,85 @@ inline bool ggml_sycl_flash_attn_use_direct() {
 }
 
 #ifdef SYCL_EXT_ONEAPI_MATRIX
+inline bool ggml_sycl_flash_attn_xmx_allow_head(int64_t head_size) {
+    static bool allowlist_all = false;
+    static bool allowlist_checked = false;
+    static std::vector<int64_t> allowlist;
+
+    if (!allowlist_checked) {
+        const char* env = getenv("GGML_SYCL_FLASH_ATTN_XMX_ALLOWLIST");
+        if (env == nullptr) {
+            allowlist = {64, 96, 128, 256};
+        } else if (strcmp(env, "all") == 0) {
+            allowlist_all = true;
+        } else {
+            const char* cursor = env;
+            while (*cursor != '\0') {
+                while (*cursor == ' ' || *cursor == ',') {
+                    ++cursor;
+                }
+                if (*cursor == '\0') {
+                    break;
+                }
+                char* end = nullptr;
+                long value = std::strtol(cursor, &end, 10);
+                if (end != cursor) {
+                    allowlist.push_back(value);
+                    cursor = end;
+                } else {
+                    ++cursor;
+                }
+            }
+        }
+        allowlist_checked = true;
+        if (!allowlist_all) {
+            std::string list;
+            for (size_t i = 0; i < allowlist.size(); ++i) {
+                list += std::to_string(allowlist[i]);
+                if (i + 1 < allowlist.size()) {
+                    list += ",";
+                }
+            }
+            GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention allowlist: %s\n", list.empty() ? "(none)" : list.c_str());
+        }
+    }
+
+    if (allowlist_all) {
+        return true;
+    }
+
+    return std::find(allowlist.begin(), allowlist.end(), head_size) != allowlist.end();
+}
+
+inline size_t ggml_sycl_flash_attn_xmx_shmem_bytes(int64_t dqk, int64_t dv, int block_m, int block_n) {
+    const size_t q_stride = static_cast<size_t>(dqk + 8);
+    const size_t k_stride = static_cast<size_t>(dqk + 8);
+    const size_t v_stride = static_cast<size_t>(dv + 8);
+    const size_t p_stride = static_cast<size_t>(block_n + 8);
+    const size_t v_t_stride = static_cast<size_t>(block_n + 8);
+
+    const size_t bf16_bytes = (static_cast<size_t>(block_m) * q_stride
+        + static_cast<size_t>(block_n) * k_stride
+        + static_cast<size_t>(block_n) * v_stride
+        + static_cast<size_t>(block_m) * p_stride
+        + static_cast<size_t>(dv) * v_t_stride) * sizeof(sycl::half);
+
+    const size_t float_bytes = (static_cast<size_t>(block_m) * (block_n + 8)
+        + static_cast<size_t>(block_m) * 3
+        + static_cast<size_t>(block_m) * static_cast<size_t>(dv)) * sizeof(float);
+
+    return bf16_bytes + float_bytes;
+}
+
+inline bool ggml_sycl_flash_attn_xmx_shmem_ok(sycl::device device, size_t required_bytes) {
+    const size_t local_mem_bytes = device.get_info<sycl::info::device::local_mem_size>();
+    const size_t headroom = 4096;
+    if (local_mem_bytes <= headroom) {
+        return false;
+    }
+    return required_bytes + headroom <= local_mem_bytes;
+}
+
 // Check if tensor layout is compatible with direct stride loading
 // Requirements:
 // - Inner dimension (dim=0) must be contiguous (nb[0] == element_size)
@@ -661,6 +740,331 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     const bool small_batch = !force_xmx && (N < 32);
 #endif
 
+#ifdef SYCL_EXT_ONEAPI_MATRIX
+    auto try_xmx = [&]() -> bool {
+        static bool sycl_use_xmx = false;
+        static bool xmx_checked = false;
+        static bool use_direct_loading = false;
+        static bool direct_checked = false;
+
+        sycl::device device = ctx.stream()->get_device();
+        const std::string device_name = device.get_info<sycl::info::device::name>();
+        const bool direct_disabled_b60 = (device_name.find("B60") != std::string::npos);
+        if (!xmx_checked) {
+            sycl_use_xmx = ggml_sycl_flash_attn_has_xmx(device);
+            xmx_checked = true;
+            xmx_tile_kind tile_kind = ggml_sycl_flash_attn_get_tile_kind(device);
+            const char * tile_str = (tile_kind == xmx_tile_kind::tile_dg2) ? "DG2 (nsize=8)" : "PVC/B60 (nsize=16)";
+            GGML_SYCL_DEBUG("ggml_sycl: XMX detection: device=%s, has_xmx=%d, tile_kind=%s\n",
+                    device.get_info<sycl::info::device::name>().c_str(), sycl_use_xmx, tile_str);
+            if (sycl_use_xmx) {
+                GGML_SYCL_DEBUG("ggml_sycl: Using XMX (cooperative matrix) for flash attention with %s tiles\n", tile_str);
+            }
+        }
+
+        if (!direct_checked) {
+            use_direct_loading = ggml_sycl_flash_attn_use_direct();
+            direct_checked = true;
+            if (use_direct_loading) {
+                if (direct_disabled_b60) {
+                    use_direct_loading = false;
+                    GGML_SYCL_DEBUG("ggml_sycl: Disabling direct XMX flash attention on %s (B60)\n",
+                            device_name.c_str());
+                }
+            }
+        }
+
+        if (!sycl_use_xmx || sycl_use_mkl || use_mkl_for_sinks || small_batch || mask != nullptr) {
+            return false;
+        }
+
+        if (!ggml_sycl_flash_attn_xmx_allow_head(DQK)) {
+            GGML_SYCL_DEBUG("ggml_sycl: XMX head size %ld not in allowlist, falling back\n", DQK);
+            return false;
+        }
+
+        const int64_t actual_d = Q->ne[0];
+        const int64_t actual_dv = V->ne[0];
+        const int64_t padded_d = get_padded_head_size(actual_d);
+        const int64_t padded_dv = get_padded_head_size(actual_dv);
+
+        // Try direct loading path first if enabled and compatible
+        bool direct_supported_shape = (actual_d == actual_dv && actual_d == padded_d) || (actual_d == 576 && actual_dv == 512);
+
+        if (use_direct_loading && direct_supported_shape && can_use_direct_loading(Q, K, V, dst) && n_splits == 1) {
+            try {
+                if (actual_d == 576 && actual_dv == 512) {
+                     // Use smaller blocks (8x16) for GLM-4.7 to fit in SLM (DQK=576 needs large SLM)
+                     const size_t shmem_bytes = ggml_sycl_flash_attn_xmx_shmem_bytes(actual_d, actual_dv, 8, 16);
+                     if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, shmem_bytes)) {
+                         GGML_SYCL_DEBUG("ggml_sycl: XMX direct flash attention rejected (576/512) - shmem=%zu bytes exceeds device limit\n", shmem_bytes);
+                         return false;
+                     }
+                     GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (576/512)\n");
+                     ggml_sycl_op_flash_attn_coopmat_direct<576, 512, 8, 16>(ctx, dst);
+                     return true;
+                }
+                switch (actual_d) {
+                    case 32:
+                        if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, ggml_sycl_flash_attn_xmx_shmem_bytes(actual_d, actual_dv, 32, 32))) {
+                            GGML_SYCL_DEBUG("ggml_sycl: XMX direct flash attention rejected (32) - shmem exceeds device limit\n");
+                            return false;
+                        }
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (32)\n");
+                        ggml_sycl_op_flash_attn_coopmat_direct<32, 32>(ctx, dst);
+                        return true;
+                    case 64:
+                        if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, ggml_sycl_flash_attn_xmx_shmem_bytes(actual_d, actual_dv, 32, 32))) {
+                            GGML_SYCL_DEBUG("ggml_sycl: XMX direct flash attention rejected (64) - shmem exceeds device limit\n");
+                            return false;
+                        }
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (64)\n");
+                        ggml_sycl_op_flash_attn_coopmat_direct<64, 64>(ctx, dst);
+                        return true;
+                    case 96:
+                        if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, ggml_sycl_flash_attn_xmx_shmem_bytes(actual_d, actual_dv, 32, 32))) {
+                            GGML_SYCL_DEBUG("ggml_sycl: XMX direct flash attention rejected (96) - shmem exceeds device limit\n");
+                            return false;
+                        }
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (96)\n");
+                        ggml_sycl_op_flash_attn_coopmat_direct<96, 96>(ctx, dst);
+                        return true;
+                    case 128:
+                        if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, ggml_sycl_flash_attn_xmx_shmem_bytes(actual_d, actual_dv, 32, 32))) {
+                            GGML_SYCL_DEBUG("ggml_sycl: XMX direct flash attention rejected (128) - shmem exceeds device limit\n");
+                            return false;
+                        }
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (128)\n");
+                        ggml_sycl_op_flash_attn_coopmat_direct<128, 128>(ctx, dst);
+                        return true;
+                    case 256:
+                        if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, ggml_sycl_flash_attn_xmx_shmem_bytes(actual_d, actual_dv, 32, 32))) {
+                            GGML_SYCL_DEBUG("ggml_sycl: XMX direct flash attention rejected (256) - shmem exceeds device limit\n");
+                            return false;
+                        }
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (256)\n");
+                        ggml_sycl_op_flash_attn_coopmat_direct<256, 256>(ctx, dst);
+                        return true;
+                    case 512:
+                        if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, ggml_sycl_flash_attn_xmx_shmem_bytes(actual_d, actual_dv, 32, 32))) {
+                            GGML_SYCL_DEBUG("ggml_sycl: XMX direct flash attention rejected (512) - shmem exceeds device limit\n");
+                            return false;
+                        }
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (512)\n");
+                        ggml_sycl_op_flash_attn_coopmat_direct<512, 512>(ctx, dst);
+                        return true;
+                    default:
+                        break;
+                }
+            } catch (const std::exception& e) {
+                GGML_SYCL_DEBUG("ggml_sycl: Direct loading kernel failed: %s, falling back to repack kernel\n", e.what());
+            }
+        }
+
+        try {
+            // XMX KV-split path for large contexts (n_splits > 1)
+            if (n_splits > 1) {
+                bool shape_supported = (actual_d == actual_dv && actual_d == padded_d && actual_dv == padded_d);
+                if (shape_supported) {
+                    if (actual_d == 576 && actual_dv == 512) {
+                        const size_t shmem_bytes = ggml_sycl_flash_attn_xmx_shmem_bytes(actual_d, actual_dv, 8, 16);
+                        if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, shmem_bytes)) {
+                            GGML_SYCL_DEBUG("ggml_sycl: XMX KV-split flash attention rejected (576/512) - shmem=%zu bytes exceeds device limit\n", shmem_bytes);
+                            return false;
+                        }
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX KV-split flash attention (576/512)\n");
+                        if (is_f16) {
+                            ggml_sycl_op_flash_attn_coopmat_kvsplit<576, 512, 8, 16, 16, 8, 16, fattn_input_type::f16, true>(ctx, dst);
+                        } else {
+                            ggml_sycl_op_flash_attn_coopmat_kvsplit<576, 512, 8, 16, 16, 8, 16, fattn_input_type::f32, true>(ctx, dst);
+                        }
+                        return true;
+                    }
+                    const size_t shmem_bytes = ggml_sycl_flash_attn_xmx_shmem_bytes(actual_d, actual_dv, 32, 32);
+                    if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, shmem_bytes)) {
+                        GGML_SYCL_DEBUG("ggml_sycl: XMX KV-split flash attention rejected (DQK=%ld DV=%ld) - shmem=%zu bytes exceeds device limit\n",
+                                actual_d, actual_dv, shmem_bytes);
+                        return false;
+                    }
+                    switch (actual_d) {
+                        case 32:
+                            GGML_SYCL_DEBUG("ggml_sycl: Using XMX KV-split flash attention (32)\n");
+                            if (is_f16) {
+                                ggml_sycl_op_flash_attn_coopmat_kvsplit<32, 32, 8, 16, 16, 32, 32, fattn_input_type::f16, false>(ctx, dst);
+                            } else {
+                                ggml_sycl_op_flash_attn_coopmat_kvsplit<32, 32, 8, 16, 16, 32, 32, fattn_input_type::f32, false>(ctx, dst);
+                            }
+                            return true;
+                        case 64:
+                            GGML_SYCL_DEBUG("ggml_sycl: Using XMX KV-split flash attention (64)\n");
+                            if (is_f16) {
+                                ggml_sycl_op_flash_attn_coopmat_kvsplit<64, 64, 8, 16, 16, 32, 32, fattn_input_type::f16, false>(ctx, dst);
+                            } else {
+                                ggml_sycl_op_flash_attn_coopmat_kvsplit<64, 64, 8, 16, 16, 32, 32, fattn_input_type::f32, false>(ctx, dst);
+                            }
+                            return true;
+                        case 96:
+                            GGML_SYCL_DEBUG("ggml_sycl: Using XMX KV-split flash attention (96)\n");
+                            if (is_f16) {
+                                ggml_sycl_op_flash_attn_coopmat_kvsplit<96, 96, 8, 16, 16, 32, 32, fattn_input_type::f16, false>(ctx, dst);
+                            } else {
+                                ggml_sycl_op_flash_attn_coopmat_kvsplit<96, 96, 8, 16, 16, 32, 32, fattn_input_type::f32, false>(ctx, dst);
+                            }
+                            return true;
+                        case 128:
+                            GGML_SYCL_DEBUG("ggml_sycl: Using XMX KV-split flash attention (128)\n");
+                            if (is_f16) {
+                                ggml_sycl_op_flash_attn_coopmat_kvsplit<128, 128, 8, 16, 16, 32, 32, fattn_input_type::f16, false>(ctx, dst);
+                            } else {
+                                ggml_sycl_op_flash_attn_coopmat_kvsplit<128, 128, 8, 16, 16, 32, 32, fattn_input_type::f32, false>(ctx, dst);
+                            }
+                            return true;
+                        case 256:
+                            GGML_SYCL_DEBUG("ggml_sycl: Using XMX KV-split flash attention (256)\n");
+                            if (is_f16) {
+                                ggml_sycl_op_flash_attn_coopmat_kvsplit<256, 256, 8, 16, 16, 32, 32, fattn_input_type::f16, false>(ctx, dst);
+                            } else {
+                                ggml_sycl_op_flash_attn_coopmat_kvsplit<256, 256, 8, 16, 16, 32, 32, fattn_input_type::f32, false>(ctx, dst);
+                            }
+                            return true;
+                        case 512:
+                            GGML_SYCL_DEBUG("ggml_sycl: Using XMX KV-split flash attention (512)\n");
+                            if (is_f16) {
+                                ggml_sycl_op_flash_attn_coopmat_kvsplit<512, 512, 8, 16, 16, 32, 32, fattn_input_type::f16, false>(ctx, dst);
+                            } else {
+                                ggml_sycl_op_flash_attn_coopmat_kvsplit<512, 512, 8, 16, 16, 32, 32, fattn_input_type::f32, false>(ctx, dst);
+                            }
+                            return true;
+                        default:
+                            // Unsupported head size for split, continue to fallback
+                            break;
+                    }
+                }
+            }
+            if (actual_d != actual_dv && padded_d > 0 && padded_dv > 0) {
+                // MLA case: DQK != DV (e.g., GLM-4.7-Flash with K=576, V=512)
+                // Use padded kernel with V_FROM_K optimization when V is a view of K
+
+                // Add more MLA combinations here as needed
+                GGML_SYCL_DEBUG("ggml_sycl: XMX MLA not supported for DQK=%ld DV=%ld, falling back\n", actual_d, actual_dv);
+            } else if (actual_d == padded_d && actual_dv == padded_dv) {
+                // Native head size - use direct loading kernel (replaces old coopmat)
+                if (direct_disabled_b60) {
+                    const size_t shmem_bytes = ggml_sycl_flash_attn_xmx_shmem_bytes(actual_d, actual_dv, 32, 32);
+                    if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, shmem_bytes)) {
+                        GGML_SYCL_DEBUG("ggml_sycl: XMX repack flash attention rejected (DQK=%ld DV=%ld) - shmem=%zu bytes exceeds device limit\n",
+                                actual_d, actual_dv, shmem_bytes);
+                        return false;
+                    }
+                    switch (actual_d) {
+                        case 64:
+                            GGML_SYCL_DEBUG("ggml_sycl: Using XMX repack flash attention (64)\n");
+                            ggml_sycl_op_flash_attn_coopmat_padded<64, 64, 64, 64>(ctx, dst);
+                            return true;
+                        case 96:
+                            GGML_SYCL_DEBUG("ggml_sycl: Using XMX repack flash attention (96)\n");
+                            ggml_sycl_op_flash_attn_coopmat_padded<96, 96, 96, 96>(ctx, dst);
+                            return true;
+                        case 128:
+                            GGML_SYCL_DEBUG("ggml_sycl: Using XMX repack flash attention (128)\n");
+                            ggml_sycl_op_flash_attn_coopmat_padded<128, 128, 128, 128>(ctx, dst);
+                            return true;
+                        case 256:
+                            GGML_SYCL_DEBUG("ggml_sycl: Using XMX repack flash attention (256)\n");
+                            ggml_sycl_op_flash_attn_coopmat_padded<256, 256, 256, 256>(ctx, dst);
+                            return true;
+                        default:
+                            break;
+                    }
+                }
+                const size_t shmem_bytes = ggml_sycl_flash_attn_xmx_shmem_bytes(actual_d, actual_dv, 32, 32);
+                if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, shmem_bytes)) {
+                    GGML_SYCL_DEBUG("ggml_sycl: XMX direct flash attention rejected (DQK=%ld DV=%ld) - shmem=%zu bytes exceeds device limit\n",
+                            actual_d, actual_dv, shmem_bytes);
+                    return false;
+                }
+                switch (actual_d) {
+                    case 32:
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (32)\n");
+                        ggml_sycl_op_flash_attn_coopmat_direct<32, 32>(ctx, dst);
+                        return true;
+                    case 64:
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (64)\n");
+                        ggml_sycl_op_flash_attn_coopmat_direct<64, 64>(ctx, dst);
+                        return true;
+                    case 96:
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (96)\n");
+                        ggml_sycl_op_flash_attn_coopmat_direct<96, 96>(ctx, dst);
+                        return true;
+                    case 128:
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (128)\n");
+                        ggml_sycl_op_flash_attn_coopmat_direct<128, 128>(ctx, dst);
+                        return true;
+                    case 256:
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (256)\n");
+                        ggml_sycl_op_flash_attn_coopmat_direct<256, 256>(ctx, dst);
+                        return true;
+                    case 512:
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (512)\n");
+                        ggml_sycl_op_flash_attn_coopmat_direct<512, 512>(ctx, dst);
+                        return true;
+                    default:
+                        break;
+                }
+            } else if (padded_d > 0 && padded_dv > 0) {
+                // Padded head size - use padded kernel (DQK == DV case)
+                const size_t shmem_bytes = ggml_sycl_flash_attn_xmx_shmem_bytes(padded_d, padded_dv, 32, 32);
+                if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, shmem_bytes)) {
+                    GGML_SYCL_DEBUG("ggml_sycl: XMX padded flash attention rejected (DQK=%ld DV=%ld) - shmem=%zu bytes exceeds device limit\n",
+                            actual_d, actual_dv, shmem_bytes);
+                    return false;
+                }
+                switch (actual_d) {
+                    case 40:
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX padded flash attention (40)\n");
+                        ggml_sycl_op_flash_attn_coopmat_padded<40, 40, 64, 64>(ctx, dst);
+                        return true;
+                    case 48:
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX padded flash attention (48)\n");
+                        ggml_sycl_op_flash_attn_coopmat_padded<48, 48, 64, 64>(ctx, dst);
+                        return true;
+                    case 56:
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX padded flash attention (56)\n");
+                        ggml_sycl_op_flash_attn_coopmat_padded<56, 56, 64, 64>(ctx, dst);
+                        return true;
+                    case 72:
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX padded flash attention (72)\n");
+                        ggml_sycl_op_flash_attn_coopmat_padded<72, 72, 80, 80>(ctx, dst);
+                        return true;
+                    case 88:
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX padded flash attention (88)\n");
+                        ggml_sycl_op_flash_attn_coopmat_padded<88, 88, 96, 96>(ctx, dst);
+                        return true;
+                    case 104:
+                        GGML_SYCL_DEBUG("ggml_sycl: Using XMX padded flash attention (104)\n");
+                        ggml_sycl_op_flash_attn_coopmat_padded<104, 104, 112, 112>(ctx, dst);
+                        return true;
+                    default:
+                        break;
+                }
+            }
+            GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention not supported for head size DQK=%ld DV=%ld, falling back\n", actual_d, actual_dv);
+        } catch (const std::exception& e) {
+            GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention failed: %s, falling back to non-XMX path\n", e.what());
+            if (DQK == 576 && DV == 512) {
+                ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    if (try_xmx()) {
+        return;
+    }
+#endif
+
     // ============================================================================
     // Fused Single-Kernel Flash Attention (Graph-Compatible)
     // ============================================================================
@@ -821,203 +1225,6 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         }
     }
 
-#ifdef SYCL_EXT_ONEAPI_MATRIX
-    // Try XMX path if device supports it
-    static bool sycl_use_xmx = false;
-    static bool xmx_checked = false;
-    static bool use_direct_loading = false;
-    static bool direct_checked = false;
-
-    if (!xmx_checked) {
-        sycl::device device = ctx.stream()->get_device();
-        sycl_use_xmx = ggml_sycl_flash_attn_has_xmx(device);
-        xmx_checked = true;
-        xmx_tile_kind tile_kind = ggml_sycl_flash_attn_get_tile_kind(device);
-        const char * tile_str = (tile_kind == xmx_tile_kind::tile_dg2) ? "DG2 (nsize=8)" : "PVC/B60 (nsize=16)";
-        GGML_SYCL_DEBUG("ggml_sycl: XMX detection: device=%s, has_xmx=%d, tile_kind=%s\n",
-                device.get_info<sycl::info::device::name>().c_str(), sycl_use_xmx, tile_str);
-        if (sycl_use_xmx) {
-            GGML_SYCL_DEBUG("ggml_sycl: Using XMX (cooperative matrix) for flash attention with %s tiles\n", tile_str);
-        }
-    }
-
-    // Check for direct loading mode (stride-aware kernel)
-    if (!direct_checked) {
-        use_direct_loading = ggml_sycl_flash_attn_use_direct();
-        direct_checked = true;
-    }
-
-    if (sycl_use_xmx) {
-        const int64_t actual_d = Q->ne[0];
-        const int64_t actual_dv = V->ne[0];
-        const int64_t padded_d = get_padded_head_size(actual_d);
-        const int64_t padded_dv = get_padded_head_size(actual_dv);
-
-        // Try direct loading path first if enabled and compatible
-        bool direct_supported_shape = (actual_d == actual_dv && actual_d == padded_d) || (actual_d == 576 && actual_dv == 512);
-
-        if (use_direct_loading && direct_supported_shape && can_use_direct_loading(Q, K, V, dst) && n_splits == 1) {
-            try {
-                if (actual_d == 576 && actual_dv == 512) {
-                     // Use smaller blocks (8x16) for GLM-4.7 to fit in SLM (DQK=576 needs large SLM)
-                     ggml_sycl_op_flash_attn_coopmat_direct<576, 512, 8, 16>(ctx, dst);
-                     return;
-                }
-                switch (actual_d) {
-                    case 32:
-                        ggml_sycl_op_flash_attn_coopmat_direct<32, 32>(ctx, dst);
-                        return;
-                    case 64:
-                        ggml_sycl_op_flash_attn_coopmat_direct<64, 64>(ctx, dst);
-                        return;
-                    case 96:
-                        ggml_sycl_op_flash_attn_coopmat_direct<96, 96>(ctx, dst);
-                        return;
-                    case 128:
-                        ggml_sycl_op_flash_attn_coopmat_direct<128, 128>(ctx, dst);
-                        return;
-                    case 256:
-                        ggml_sycl_op_flash_attn_coopmat_direct<256, 256>(ctx, dst);
-                        return;
-                    case 512:
-                        ggml_sycl_op_flash_attn_coopmat_direct<512, 512>(ctx, dst);
-                        return;
-                    default:
-                        break;
-                }
-            } catch (const std::exception& e) {
-                GGML_SYCL_DEBUG("ggml_sycl: Direct loading kernel failed: %s, falling back to repack kernel\n", e.what());
-            }
-        }
-
-        try {
-            // XMX KV-split path for large contexts (n_splits > 1)
-            if (n_splits > 1) {
-                bool shape_supported = (actual_d == actual_dv && actual_d == padded_d && actual_dv == padded_d);
-                if (shape_supported) {
-                    if (actual_d == 576 && actual_dv == 512) {
-                        if (is_f16) {
-                            ggml_sycl_op_flash_attn_coopmat_kvsplit<576, 512, 8, 16, 16, 8, 16, fattn_input_type::f16, true>(ctx, dst);
-                        } else {
-                            ggml_sycl_op_flash_attn_coopmat_kvsplit<576, 512, 8, 16, 16, 8, 16, fattn_input_type::f32, true>(ctx, dst);
-                        }
-                        return;
-                    }
-                    switch (actual_d) {
-                        case 32:
-                            if (is_f16) {
-                                ggml_sycl_op_flash_attn_coopmat_kvsplit<32, 32, 8, 16, 16, 32, 32, fattn_input_type::f16, false>(ctx, dst);
-                            } else {
-                                ggml_sycl_op_flash_attn_coopmat_kvsplit<32, 32, 8, 16, 16, 32, 32, fattn_input_type::f32, false>(ctx, dst);
-                            }
-                            return;
-                        case 64:
-                            if (is_f16) {
-                                ggml_sycl_op_flash_attn_coopmat_kvsplit<64, 64, 8, 16, 16, 32, 32, fattn_input_type::f16, false>(ctx, dst);
-                            } else {
-                                ggml_sycl_op_flash_attn_coopmat_kvsplit<64, 64, 8, 16, 16, 32, 32, fattn_input_type::f32, false>(ctx, dst);
-                            }
-                            return;
-                        case 96:
-                            if (is_f16) {
-                                ggml_sycl_op_flash_attn_coopmat_kvsplit<96, 96, 8, 16, 16, 32, 32, fattn_input_type::f16, false>(ctx, dst);
-                            } else {
-                                ggml_sycl_op_flash_attn_coopmat_kvsplit<96, 96, 8, 16, 16, 32, 32, fattn_input_type::f32, false>(ctx, dst);
-                            }
-                            return;
-                        case 128:
-                            if (is_f16) {
-                                ggml_sycl_op_flash_attn_coopmat_kvsplit<128, 128, 8, 16, 16, 32, 32, fattn_input_type::f16, false>(ctx, dst);
-                            } else {
-                                ggml_sycl_op_flash_attn_coopmat_kvsplit<128, 128, 8, 16, 16, 32, 32, fattn_input_type::f32, false>(ctx, dst);
-                            }
-                            return;
-                        case 256:
-                            if (is_f16) {
-                                ggml_sycl_op_flash_attn_coopmat_kvsplit<256, 256, 8, 16, 16, 32, 32, fattn_input_type::f16, false>(ctx, dst);
-                            } else {
-                                ggml_sycl_op_flash_attn_coopmat_kvsplit<256, 256, 8, 16, 16, 32, 32, fattn_input_type::f32, false>(ctx, dst);
-                            }
-                            return;
-                        case 512:
-                            if (is_f16) {
-                                ggml_sycl_op_flash_attn_coopmat_kvsplit<512, 512, 8, 16, 16, 32, 32, fattn_input_type::f16, false>(ctx, dst);
-                            } else {
-                                ggml_sycl_op_flash_attn_coopmat_kvsplit<512, 512, 8, 16, 16, 32, 32, fattn_input_type::f32, false>(ctx, dst);
-                            }
-                            return;
-                        default:
-                            // Unsupported head size for split, continue to fallback
-                            break;
-                    }
-                }
-            }
-            if (actual_d != actual_dv && padded_d > 0 && padded_dv > 0) {
-                // MLA case: DQK != DV (e.g., GLM-4.7-Flash with K=576, V=512)
-                // Use padded kernel with V_FROM_K optimization when V is a view of K
-                
-                // Add more MLA combinations here as needed
-                GGML_SYCL_DEBUG("ggml_sycl: XMX MLA not supported for DQK=%ld DV=%ld, falling back\n", actual_d, actual_dv);
-            } else if (actual_d == padded_d && actual_dv == padded_dv) {
-                // Native head size - use direct loading kernel (replaces old coopmat)
-                switch (actual_d) {
-                    case 32:
-                        ggml_sycl_op_flash_attn_coopmat_direct<32, 32>(ctx, dst);
-                        return;
-                    case 64:
-                        ggml_sycl_op_flash_attn_coopmat_direct<64, 64>(ctx, dst);
-                        return;
-                    case 96:
-                        ggml_sycl_op_flash_attn_coopmat_direct<96, 96>(ctx, dst);
-                        return;
-                    case 128:
-                        ggml_sycl_op_flash_attn_coopmat_direct<128, 128>(ctx, dst);
-                        return;
-                    case 256:
-                        ggml_sycl_op_flash_attn_coopmat_direct<256, 256>(ctx, dst);
-                        return;
-                    case 512:
-                        ggml_sycl_op_flash_attn_coopmat_direct<512, 512>(ctx, dst);
-                        return;
-                    default:
-                        break;
-                }
-            } else if (padded_d > 0 && padded_dv > 0) {
-                // Padded head size - use padded kernel (DQK == DV case)
-                switch (actual_d) {
-                    case 40:
-                        ggml_sycl_op_flash_attn_coopmat_padded<40, 40, 64, 64>(ctx, dst);
-                        return;
-                    case 48:
-                        ggml_sycl_op_flash_attn_coopmat_padded<48, 48, 64, 64>(ctx, dst);
-                        return;
-                    case 56:
-                        ggml_sycl_op_flash_attn_coopmat_padded<56, 56, 64, 64>(ctx, dst);
-                        return;
-                    case 72:
-                        ggml_sycl_op_flash_attn_coopmat_padded<72, 72, 80, 80>(ctx, dst);
-                        return;
-                    case 88:
-                        ggml_sycl_op_flash_attn_coopmat_padded<88, 88, 96, 96>(ctx, dst);
-                        return;
-                    case 104:
-                        ggml_sycl_op_flash_attn_coopmat_padded<104, 104, 112, 112>(ctx, dst);
-                        return;
-                    default:
-                        break;
-                }
-            }
-            // Fall back to non-XMX path for unsupported head sizes
-            GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention not supported for head size DQK=%ld DV=%ld, falling back\n", actual_d, actual_dv);
-        } catch (const std::exception& e) {
-            GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention failed: %s, falling back to non-XMX path\n", e.what());
-            if (DQK == 576 && DV == 512) {
-                ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
-                return;
-            }
-         }
-     }
- #endif
 
     // Fallback to basic flash attention implementation
     const int64_t fallback_dqk = Q->ne[0];
