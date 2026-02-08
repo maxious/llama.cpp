@@ -4,7 +4,7 @@
 #include "./fattn_fused.hpp"
 #include "./common.hpp"
 
-#ifdef SYCL_EXT_COOPERATIVE_MATRICES
+#ifdef SYCL_EXT_ONEAPI_MATRIX
 #include "fattn_xmx.hpp"
 #endif
 
@@ -50,7 +50,7 @@
 // XMX is enabled by default when the device supports it.
 // Set GGML_SYCL_FLASH_ATTN_XMX=0 to disable and fall back to oneMKL.
 inline bool ggml_sycl_flash_attn_has_xmx(sycl::device device) {
-#ifdef SYCL_EXT_COOPERATIVE_MATRICES
+#ifdef SYCL_EXT_ONEAPI_MATRIX
     // Check for basic cooperative matrix support
     if (!device.has(sycl::aspect::ext_intel_gpu_eu_simd_width) ||
         !device.has(sycl::aspect::ext_intel_matrix)) {
@@ -73,10 +73,10 @@ inline bool ggml_sycl_flash_attn_has_xmx(sycl::device device) {
 #endif
 }
 
-#ifdef SYCL_EXT_COOPERATIVE_MATRICES
+#ifdef SYCL_EXT_ONEAPI_MATRIX
 // Get the appropriate tile kind for flash attention XMX kernel
 // DG2/Arc uses 8x8 tiles, PVC uses 16x16 tiles
-inline xmx_tile_kind ggml_sycl_flash_attn_get_tile_kind(sycl::device device) {
+xmx_tile_kind ggml_sycl_flash_attn_get_tile_kind(sycl::device device) {
     static int override_kind = -2;
     if (override_kind == -2) {
         const char * env = getenv("GGML_SYCL_FLASH_ATTN_TILE");
@@ -147,7 +147,7 @@ inline bool ggml_sycl_flash_attn_use_direct() {
     return direct_enabled;
 }
 
-#ifdef SYCL_EXT_COOPERATIVE_MATRICES
+#ifdef SYCL_EXT_ONEAPI_MATRIX
 // Check if tensor layout is compatible with direct stride loading
 // Requirements:
 // - Inner dimension (dim=0) must be contiguous (nb[0] == element_size)
@@ -187,7 +187,7 @@ inline bool can_use_direct_loading(const ggml_tensor * Q, const ggml_tensor * K,
 }
 
 // Compute stride parameters for direct loading
-#endif // SYCL_EXT_COOPERATIVE_MATRICES
+#endif // SYCL_EXT_ONEAPI_MATRIX
 
 bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
@@ -603,7 +603,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * sinks = dst->src[4];
-    (void)K; // Used by direct loading path when SYCL_EXT_COOPERATIVE_MATRICES is defined
+    (void)K; // Used by direct loading path when SYCL_EXT_ONEAPI_MATRIX is defined
 
     GGML_SYCL_DEBUG("[SYCL][OP] call ggml_sycl_op_flash_attn: Q=[%ld,%ld,%ld] V=[%ld,%ld,%ld]\n",
             Q->ne[0], Q->ne[1], Q->ne[2], V->ne[0], V->ne[1], V->ne[2]);
@@ -821,7 +821,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         }
     }
 
-#ifdef SYCL_EXT_COOPERATIVE_MATRICES
+#ifdef SYCL_EXT_ONEAPI_MATRIX
     // Try XMX path if device supports it
     static bool sycl_use_xmx = false;
     static bool xmx_checked = false;

@@ -191,7 +191,7 @@ inline void flash_attn_combine_splits_kernel(
 // ============================================================================
 // XMX (Cooperative Matrix) Support Detection
 // ============================================================================
-#ifdef SYCL_EXT_COOPERATIVE_MATRICES
+#ifdef SYCL_EXT_ONEAPI_MATRIX
 #include <sycl/ext/oneapi/matrix/matrix-intel.hpp>
 #include <sycl/ext/oneapi/group_local_memory.hpp>
 #include <sycl/ext/oneapi/bfloat16.hpp>
@@ -202,6 +202,8 @@ inline bool ggml_sycl_has_coopmat_support(sycl::device device) {
     return device.has(sycl::aspect::ext_intel_gpu_eu_simd_width) &&
            device.has(sycl::aspect::ext_intel_matrix);
 }
-#endif // SYCL_EXT_COOPERATIVE_MATRICES
+
+xmx_tile_kind ggml_sycl_flash_attn_get_tile_kind(sycl::device device);
+#endif // SYCL_EXT_ONEAPI_MATRIX
 
 #endif // GGML_SYCL_FATTN_COMMON_HPP
