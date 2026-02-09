@@ -82,8 +82,13 @@ void ggml_sycl_op_flash_attn_tiled(ggml_backend_sycl_context & ctx, const ggml_t
 
     dpct::queue_ptr stream = ctx.stream();
 
+    // Initialize buffer pool if needed
+    if (!ctx.fattn_buffers) {
+        ctx.fattn_buffers = std::make_unique<flash_attn_buffers>();
+    }
+
     size_t  S_size = (size_t) n_heads * N * N_kv * sizeof(float);
-    float * S_ptr  = (float *) sycl::malloc_device(S_size, *stream);
+    float * S_ptr  = ctx.fattn_buffers->get_S(S_size, stream);
     float * P_ptr  = S_ptr;
 
     // Pointer arrays for GQA
@@ -95,11 +100,7 @@ void ggml_sycl_op_flash_attn_tiled(ggml_backend_sycl_context & ctx, const ggml_t
     float ** O_ptrs    = nullptr;
 
     if (n_heads != n_kv_heads) {
-        Q_ptrs = (float **) sycl::malloc_device(ptr_bytes, *stream);
-        K_ptrs = (float **) sycl::malloc_device(ptr_bytes, *stream);
-        S_ptrs = (float **) sycl::malloc_device(ptr_bytes, *stream);
-        V_ptrs = (float **) sycl::malloc_device(ptr_bytes, *stream);
-        O_ptrs = (float **) sycl::malloc_device(ptr_bytes, *stream);
+        ctx.fattn_buffers->get_ptrs(ptr_bytes, stream, &Q_ptrs, &K_ptrs, &S_ptrs, &V_ptrs, &O_ptrs);
     }
 
     if (n_heads == n_kv_heads) {
@@ -173,15 +174,9 @@ void ggml_sycl_op_flash_attn_tiled(ggml_backend_sycl_context & ctx, const ggml_t
 
         launch_gemm_tiled_batched_indirect<false>(stream, (const float **) S_ptrs, (const float **) V_ptrs, O_ptrs, N,
                                                   DV, N_kv, 1.0f, 0.0f, n_heads, N_kv, DV, stride_O_seq);
-
-        sycl::free(Q_ptrs, *stream);
-        sycl::free(K_ptrs, *stream);
-        sycl::free(S_ptrs, *stream);
-        sycl::free(V_ptrs, *stream);
-        sycl::free(O_ptrs, *stream);
     }
 
-    sycl::free(S_ptr, *stream);
+    // Buffers are pooled in ctx.fattn_buffers and will be reused on next call
 }
 
 #endif
