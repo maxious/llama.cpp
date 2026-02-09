@@ -10,65 +10,64 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 
-#include <algorithm>
 #include <assert.h>
+#include <float.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/time.h>
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <float.h>
-#include <limits>
-#include <stdint.h>
-#include <stdio.h>
-#include <vector>
-#include <cmath>
-#include <iostream>
 #include <fstream>
-#include <stdio.h>
-#include <stdlib.h>
+#include <iostream>
+#include <limits>
 #include <regex>
-#include <sys/time.h>
-
 #include <sycl/sycl.hpp>
+#include <vector>
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
 #    include <sycl/ext/oneapi/experimental/async_alloc/async_alloc.hpp>
 #endif
-#include <sycl/half_type.hpp>
-
-#include "ggml-sycl.h"
-#include "ggml-impl.h"
 #include "ggml-backend-impl.h"
-
+#include "ggml-impl.h"
+#include "ggml-sycl.h"
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/backend.hpp"
 #include "ggml-sycl/common.hpp"
-#include "ggml-sycl/sycl_buffer.hpp"
 #include "ggml-sycl/element_wise.hpp"
-#include "ggml-sycl/norm.hpp"
-#include "ggml-sycl/presets.hpp"
+#include "ggml-sycl/fattn.hpp"
 #include "ggml-sycl/gemm.hpp"
+#include "ggml-sycl/gemm_f16_f32_tiled.hpp"
 #include "ggml-sycl/gemm_tiled.hpp"
 #include "ggml-sycl/gemm_xmx.hpp"
-#include "ggml-sycl/gemm_f16_f32_tiled.hpp"
-#include "ggml-sycl/set_rows.hpp"
-#include "ggml-sycl/set.hpp"
-#include "ggml-sycl/sycl_hw.hpp"
 #include "ggml-sycl/getrows.hpp"
-#include "ggml-sycl/repeat_back.hpp"
+#include "ggml-sycl/itt_annotations.hpp"
+#include "ggml-sycl/norm.hpp"
+#include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/quantize.hpp"
+#include "ggml-sycl/repeat_back.hpp"
+#include "ggml-sycl/set.hpp"
+#include "ggml-sycl/set_rows.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
-#include "ggml-sycl/fattn.hpp"
+#include "ggml-sycl/sycl_buffer.hpp"
+#include "ggml-sycl/sycl_hw.hpp"
 #include "ggml.h"
-
 #include "sycl_backend.hpp"
 #include "sycl_buffer.hpp"
 #include "sycl_compute.hpp"
-#include "sycl_matmul.hpp"
 #include "sycl_defs.hpp"
+#include "sycl_matmul.hpp"
+
+#include <sycl/half_type.hpp>
+
 static void ggml_sycl_set_main_device(const int main_device) try {
-    if (dpct::get_current_device_id() == static_cast<unsigned int> (main_device)) {
+    if (dpct::get_current_device_id() == static_cast<unsigned int>(main_device)) {
         return;
     }
     check_allow_gpu_index(main_device);
@@ -76,20 +75,18 @@ static void ggml_sycl_set_main_device(const int main_device) try {
 
     if (g_ggml_sycl_debug) {
         dpct::device_info prop;
-        SYCL_CHECK(CHECK_TRY_ERROR(dpct::get_device_info(
-            prop, dpct::dev_mgr::instance().get_device(main_device))));
-        GGML_LOG_INFO("Using device %d (%s) as main device\n",
-                main_device, prop.get_name());
+        SYCL_CHECK(CHECK_TRY_ERROR(dpct::get_device_info(prop, dpct::dev_mgr::instance().get_device(main_device))));
+        GGML_LOG_INFO("Using device %d (%s) as main device\n", main_device, prop.get_name());
     }
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (const sycl::exception & exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {
-    if (!g_sycl_loaded) return false;
+    if (!g_sycl_loaded) {
+        return false;
+    }
 
     if (dst->src[0] != nullptr && ggml_backend_buffer_is_sycl_split(dst->src[0]->buffer)) {
         ggml_sycl_set_peer_access(dst->src[1]->ne[1], ctx.device);
@@ -121,7 +118,7 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             ggml_sycl_dup(ctx, dst);
             break;
         case GGML_OP_ADD:
-        case GGML_OP_ADD1: // TODO: more efficient implementation
+        case GGML_OP_ADD1:  // TODO: more efficient implementation
             ggml_sycl_add(ctx, dst);
             break;
         case GGML_OP_ADD_ID:
@@ -248,7 +245,7 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             ggml_sycl_op_concat(ctx, dst);
             break;
         case GGML_OP_PAD_REFLECT_1D:
-            ggml_sycl_op_pad_reflect_1d(ctx,dst);
+            ggml_sycl_op_pad_reflect_1d(ctx, dst);
             break;
         case GGML_OP_UPSCALE:
             ggml_sycl_upscale(ctx, dst);
@@ -383,36 +380,28 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
     return true;
 } catch (sycl::exception & e) {
     std::cerr << e.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::cerr << "Error OP "<<ggml_op_name(dst->op)<< std::endl;
+    std::cerr << "Error OP " << ggml_op_name(dst->op) << std::endl;
     std::exit(1);
 }
 
-GGML_API void ggml_backend_sycl_get_device_description(int device, char *description,
-                                      size_t description_size) try {
+GGML_API void ggml_backend_sycl_get_device_description(int device, char * description, size_t description_size) try {
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_get_device_description\n");
     dpct::device_info prop;
-    SYCL_CHECK(CHECK_TRY_ERROR(dpct::get_device_info(
-        prop, dpct::dev_mgr::instance().get_device(device))));
+    SYCL_CHECK(CHECK_TRY_ERROR(dpct::get_device_info(prop, dpct::dev_mgr::instance().get_device(device))));
     snprintf(description, description_size, "%s", prop.get_name());
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (const sycl::exception & exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
-void ggml_backend_sycl_get_device_memory(int device, size_t *free,
-                                                   size_t *total) try {
+void ggml_backend_sycl_get_device_memory(int device, size_t * free, size_t * total) try {
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_get_device_memory\n");
     ggml_sycl_set_device(device);
 
-    SYCL_CHECK(CHECK_TRY_ERROR(
-        dpct::dev_mgr::instance().get_device(device).get_memory_info(*free, *total)));
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(device).get_memory_info(*free, *total)));
+} catch (const sycl::exception & exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -420,65 +409,61 @@ catch (sycl::exception const &exc) {
 // backend
 
 static const char * ggml_backend_sycl_get_name(ggml_backend_t backend) {
-
-    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
+    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
 
     return sycl_ctx->name.c_str();
 }
 
 static void ggml_backend_sycl_free(ggml_backend_t backend) {
-    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
+    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
 
+    sycl_ctx->print_op_stats();
     delete sycl_ctx;
     delete backend;
 }
 
 static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
-                                               ggml_tensor *tensor,
-                                               const void *data, size_t offset,
-                                               size_t size) try {
+                                               ggml_tensor *  tensor,
+                                               const void *   data,
+                                               size_t         offset,
+                                               size_t         size) try {
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
-    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
-    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
+    ggml_backend_buffer_t       buf      = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-    SYCL_CHECK(CHECK_TRY_ERROR(
-        (stream)->memcpy((char *)tensor->data + offset, data, size)));
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy((char *) tensor->data + offset, data, size)));
+} catch (const sycl::exception & exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
-static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
-                                               const ggml_tensor *tensor,
-                                               void *data, size_t offset,
-                                               size_t size) try {
+static void ggml_backend_sycl_get_tensor_async(ggml_backend_t      backend,
+                                               const ggml_tensor * tensor,
+                                               void *              data,
+                                               size_t              offset,
+                                               size_t              size) try {
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
-    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
-    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
+    ggml_backend_buffer_t       buf      = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-    SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
-        data, (const char *)tensor->data + offset, size)));
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(data, (const char *) tensor->data + offset, size)));
+} catch (const sycl::exception & exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
-static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend_src,
-                                               ggml_backend_t backend_dst,
-                                               const ggml_tensor *src,
-                                               ggml_tensor *dst) try {
+static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t      backend_src,
+                                               ggml_backend_t      backend_dst,
+                                               const ggml_tensor * src,
+                                               ggml_tensor *       dst) try {
     GGML_UNUSED(backend_src);
     GGML_UNUSED(backend_dst);
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
@@ -487,56 +472,53 @@ static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend_src,
 
     // Check if both buffers are SYCL buffers (can be on different devices)
     if (ggml_backend_buffer_is_sycl(src->buffer) && ggml_backend_buffer_is_sycl(dst->buffer)) {
-        ggml_backend_sycl_buffer_context * src_ctx = (ggml_backend_sycl_buffer_context *)src->buffer->context;
-        ggml_backend_sycl_buffer_context * dst_ctx = (ggml_backend_sycl_buffer_context *)dst->buffer->context;
+        ggml_backend_sycl_buffer_context * src_ctx = (ggml_backend_sycl_buffer_context *) src->buffer->context;
+        ggml_backend_sycl_buffer_context * dst_ctx = (ggml_backend_sycl_buffer_context *) dst->buffer->context;
 
         int dev_src = src_ctx->device;
         int dev_dst = dst_ctx->device;
-        GGML_SYCL_DEBUG("[SYCL-P2P] cpy_tensor_async: dev %d -> dev %d, size=%zu\n", dev_src, dev_dst, ggml_nbytes(src));
+        GGML_SYCL_DEBUG("[SYCL-P2P] cpy_tensor_async: dev %d -> dev %d, size=%zu\n", dev_src, dev_dst,
+                        ggml_nbytes(src));
 
         // Get streams from either buffer's context
         ggml_sycl_set_device(dst_ctx->device);
         queue_ptr stream_dst = dst_ctx->stream;
         queue_ptr stream_src = src_ctx->stream;
-        size_t size = ggml_nbytes(src);
+        size_t    size       = ggml_nbytes(src);
 
         // Use P2P-enabled memcpy (handles cross-device automatically)
-        dev2dev_memcpy(*stream_dst, *stream_src, dst->data, src->data, size,
-                       src_ctx->device, dst_ctx->device);
+        dev2dev_memcpy(*stream_dst, *stream_src, dst->data, src->data, size, src_ctx->device, dst_ctx->device);
         return true;
     }
 
     GGML_SYCL_DEBUG("[SYCL-P2P] cpy_tensor_async: not both SYCL buffers, falling back\n");
     return false;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (const sycl::exception & exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
-    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
-    const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-    GGML_SYCL_DEBUG("[SYCL] %s: about to wait on stream %p for device %d\n", __func__, (void*)stream, sycl_ctx->device);
-    
+    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
+    const queue_ptr             stream   = sycl_ctx->stream(sycl_ctx->device, 0);
+    GGML_SYCL_DEBUG("[SYCL] %s: about to wait on stream %p for device %d\n", __func__, (void *) stream,
+                    sycl_ctx->device);
+
     // Add timeout detection for debugging hangs
     auto start = std::chrono::steady_clock::now();
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
-    auto end = std::chrono::steady_clock::now();
+    auto end        = std::chrono::steady_clock::now();
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     if (elapsed_ms > 5000) {
-        GGML_LOG_WARN("[SYCL] %s: wait took %ld ms (potential hang detected)\n", __func__, (long)elapsed_ms);
+        GGML_LOG_WARN("[SYCL] %s: wait took %ld ms (potential hang detected)\n", __func__, (long) elapsed_ms);
     }
-    GGML_SYCL_DEBUG("[SYCL] %s: wait completed successfully (took %ld ms)\n", __func__, (long)elapsed_ms);
+    GGML_SYCL_DEBUG("[SYCL] %s: wait completed successfully (took %ld ms)\n", __func__, (long) elapsed_ms);
 
     GGML_UNUSED(backend);
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+} catch (const sycl::exception & exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
@@ -544,7 +526,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+            node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
             continue;
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
@@ -570,15 +553,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
 // Graph compatibility result
 enum class graph_compat_t {
-    DISABLED,        // Graphs cannot be used
-    SINGLE_DEVICE,   // Use single-device graph (original path)
-    MULTI_DEVICE     // Use per-device graphs (new path)
+    DISABLED,       // Graphs cannot be used
+    SINGLE_DEVICE,  // Use single-device graph (original path)
+    MULTI_DEVICE    // Use per-device graphs (new path)
 };
 
 // Compute a hash of the cgraph topology for graph caching
 // This allows reusing compiled graphs when the same structure is encountered
 static uint64_t compute_cgraph_hash(const ggml_cgraph * cgraph) {
-    uint64_t hash = 0xcbf29ce484222325ULL;  // FNV-1a offset basis
+    uint64_t           hash      = 0xcbf29ce484222325ULL;  // FNV-1a offset basis
     constexpr uint64_t FNV_PRIME = 0x100000001b3ULL;
 
     // Hash number of nodes
@@ -628,13 +611,12 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
     bool has_split_buffers = false;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        ggml_tensor * node = cgraph->nodes[i];
+        ggml_tensor * node    = cgraph->nodes[i];
         const ggml_op node_op = node->op;
 
         // Check for split buffers (multi-device)
         for (int s = 0; s < GGML_MAX_SRC; s++) {
-            if (node->src[s] && node->src[s]->buffer &&
-                ggml_backend_buffer_is_sycl_split(node->src[s]->buffer)) {
+            if (node->src[s] && node->src[s]->buffer && ggml_backend_buffer_is_sycl_split(node->src[s]->buffer)) {
                 has_split_buffers = true;
             }
         }
@@ -644,58 +626,61 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                 break;
             case GGML_OP_CONCAT:
                 break;
-                case GGML_OP_MUL_MAT_ID:
-            {
-                // Graph-compatible tiled implementation is available for MoE expert dispatch.
-                // Runs entirely on device without host synchronization.
-                // Supported weight types: F32, F16, BF16, MXFP4
-                // src1 (input) and dst (output) must be F32.
-                ggml_tensor * src0 = node->src[0];
-                ggml_tensor * src1 = node->src[1];
-                ggml_tensor * dst = node;
-                
-                bool src0_supported = (src0->type == GGML_TYPE_F32 ||
-                                       src0->type == GGML_TYPE_F16 ||
-                                       src0->type == GGML_TYPE_BF16 ||
-                                       src0->type == GGML_TYPE_MXFP4);
-                
-                if (!src0_supported || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-                    GGML_LOG_INFO("%s: disabling SYCL graphs for MUL_MAT_ID with unsupported type combination (src0=%s, src1=%s, dst=%s)\n",
-                        __func__, ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type));
-                    return graph_compat_t::DISABLED;
-                }
-                break;
-            }
-        case GGML_OP_SET_ROWS:
-            // SET_ROWS uses USM memory and has implicit data dependencies.
-            // We insert an explicit barrier in ggml_sycl_op_set_rows to ensure ordering.
-            //
-            // However, when SET_ROWS operates on a VIEW of ROPE output (ROPE → VIEW → SET_ROWS pattern),
-            // with large tensors, the Level Zero driver crashes with GPU page faults on the BCS engine.
-            // This appears to be a driver bug with memory aliasing in SYCL graphs.
-            // See kernel log: "Faulted Address... EngineClass: 3 bcs... Engine memory CAT error"
-            //
-            // Workaround: disable graphs when SET_ROWS source is a VIEW with large tensors.
-            {
-                ggml_tensor * src = node->src[0];
-                if (src && src->op == GGML_OP_VIEW) {
-                    int64_t view_size = ggml_nbytes(src);
-                    // Threshold: 1MB - large VIEW operations trigger driver bug
-                    if (view_size > 1024 * 1024) {
-                        GGML_LOG_INFO("%s: disabling SYCL graphs - SET_ROWS with large VIEW source (%ld bytes) "
-                                      "triggers Level Zero driver page fault bug\n", __func__, (long)view_size);
+            case GGML_OP_MUL_MAT_ID:
+                {
+                    // Graph-compatible tiled implementation is available for MoE expert dispatch.
+                    // Runs entirely on device without host synchronization.
+                    // Supported weight types: F32, F16, BF16, MXFP4
+                    // src1 (input) and dst (output) must be F32.
+                    ggml_tensor * src0 = node->src[0];
+                    ggml_tensor * src1 = node->src[1];
+                    ggml_tensor * dst  = node;
+
+                    bool src0_supported = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
+                                           src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_MXFP4);
+
+                    if (!src0_supported || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+                        GGML_LOG_INFO(
+                            "%s: disabling SYCL graphs for MUL_MAT_ID with unsupported type combination (src0=%s, "
+                            "src1=%s, dst=%s)\n",
+                            __func__, ggml_type_name(src0->type), ggml_type_name(src1->type),
+                            ggml_type_name(dst->type));
                         return graph_compat_t::DISABLED;
                     }
+                    break;
                 }
-            }
-            break;
-        case GGML_OP_OUT_PROD:
-            // OUT_PROD uses custom kernel which is graph-compatible.
-            break;
-        case GGML_OP_MUL_MAT:
-            // MUL_MAT can use SYCL graphs for supported type combinations (F32 x F32).
-            // Other types (quantized, F16, BF16) are disabled due to driver/kernel limitations.
-            // The detailed logic below determines compatibility.
+            case GGML_OP_SET_ROWS:
+                // SET_ROWS uses USM memory and has implicit data dependencies.
+                // We insert an explicit barrier in ggml_sycl_op_set_rows to ensure ordering.
+                //
+                // However, when SET_ROWS operates on a VIEW of ROPE output (ROPE → VIEW → SET_ROWS pattern),
+                // with large tensors, the Level Zero driver crashes with GPU page faults on the BCS engine.
+                // This appears to be a driver bug with memory aliasing in SYCL graphs.
+                // See kernel log: "Faulted Address... EngineClass: 3 bcs... Engine memory CAT error"
+                //
+                // Workaround: disable graphs when SET_ROWS source is a VIEW with large tensors.
+                {
+                    ggml_tensor * src = node->src[0];
+                    if (src && src->op == GGML_OP_VIEW) {
+                        int64_t view_size = ggml_nbytes(src);
+                        // Threshold: 1MB - large VIEW operations trigger driver bug
+                        if (view_size > 1024 * 1024) {
+                            GGML_LOG_INFO(
+                                "%s: disabling SYCL graphs - SET_ROWS with large VIEW source (%ld bytes) "
+                                "triggers Level Zero driver page fault bug\n",
+                                __func__, (long) view_size);
+                            return graph_compat_t::DISABLED;
+                        }
+                    }
+                }
+                break;
+            case GGML_OP_OUT_PROD:
+                // OUT_PROD uses custom kernel which is graph-compatible.
+                break;
+            case GGML_OP_MUL_MAT:
+                // MUL_MAT can use SYCL graphs for supported type combinations (F32 x F32).
+                // Other types (quantized, F16, BF16) are disabled due to driver/kernel limitations.
+                // The detailed logic below determines compatibility.
                 {
                     ggml_tensor * src0 = node->src[0];
                     ggml_tensor * src1 = node->src[1];
@@ -704,32 +689,33 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                     // Optional debugging threshold
                     static int max_ne = get_sycl_env("GGML_SYCL_GRAPH_MUL_MAT_MAX_NE", -1);
                     if (max_ne != -1 && ggml_nelements(dst) > max_ne) {
-                        GGML_LOG_INFO("%s: disabling SYCL graphs due to MUL_MAT size %ld > %d\n", __func__, (long)ggml_nelements(dst), max_ne);
+                        GGML_LOG_INFO("%s: disabling SYCL graphs due to MUL_MAT size %ld > %d\n", __func__,
+                                      (long) ggml_nelements(dst), max_ne);
                         return graph_compat_t::DISABLED;
                     }
 
                     bool use_dequantize_mul_mat_vec = can_use_dequantize_mul_mat_vec(src0, src1, dst);
-                    bool use_mul_mat_vec_q = can_use_mul_mat_vec_q(src0, src1, dst);
-                    bool use_mul_mat_q = ggml_sycl_supports_mmq(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+                    bool use_mul_mat_vec_q          = can_use_mul_mat_vec_q(src0, src1, dst);
+                    bool use_mul_mat_q =
+                        ggml_sycl_supports_mmq(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
                     use_mul_mat_q = use_mul_mat_q && (src0->type != GGML_TYPE_IQ2_XXS);
-#ifdef SYCL_USE_XMX
+#    ifdef SYCL_USE_XMX
                     use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
-#endif
+#    endif
                     // Must match matmul.cpp: MMQ needs minimum row count to avoid shared memory issues
                     constexpr int64_t MMQ_MIN_NROWS = 128;
-                    use_mul_mat_q = use_mul_mat_q && (src0->ne[1] >= MMQ_MIN_NROWS);
-                    use_mul_mat_q = use_mul_mat_q && (src1->ne[1] >= MMQ_MIN_NROWS);
+                    use_mul_mat_q                   = use_mul_mat_q && (src0->ne[1] >= MMQ_MIN_NROWS);
+                    use_mul_mat_q                   = use_mul_mat_q && (src1->ne[1] >= MMQ_MIN_NROWS);
 
                     // Exclude known problematic MMQ types that cause GPU faults under SYCL graphs
                     // q5_0 and q8_0 with certain shapes have been observed to cause device loss
-                    if (src0->type == GGML_TYPE_Q5_0 || 
-                        src0->type == GGML_TYPE_Q8_0) {
-                        GGML_LOG_INFO("%s: disabling SYCL graphs for problematic MMQ type %s\n",
-                            __func__, ggml_type_name(src0->type));
+                    if (src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q8_0) {
+                        GGML_LOG_INFO("%s: disabling SYCL graphs for problematic MMQ type %s\n", __func__,
+                                      ggml_type_name(src0->type));
                         return graph_compat_t::DISABLED;
                     }
-                    
+
                     // MXFP4 is now supported with the graph-compatible tiled kernel
                     // The kernel aligns tile boundaries with MXFP4 block boundaries (BK=32=QK_MXFP4)
                     // to maintain numerical accuracy with per-block E8M0 scaling
@@ -747,10 +733,12 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
 
                     const bool split = src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer);
 
-                    if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1 && src0->ne[3] == 1 && src1->ne[3] == 1) {
-                         break;
+                    if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) &&
+                        src1->ne[1] == 1 && src0->ne[3] == 1 && src1->ne[3] == 1) {
+                        break;
                     }
-                    if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && src1->ne[1] == 1 && src1->ne[3] == 1) {
+                    if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) &&
+                        !ggml_is_transposed(src1) && src1->ne[1] == 1 && src1->ne[3] == 1) {
                         break;
                     }
 
@@ -758,21 +746,22 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                         break;
                     }
 
-#ifdef SYCL_EXT_ONEAPI_MATRIX
+#    ifdef SYCL_EXT_ONEAPI_MATRIX
                     // Check if XMX is available and types are supported
                     if (xmx_gemm_available(ctx.stream())) {
                         bool xmx_supported = false;
                         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
                             xmx_supported = true;
-                        } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16)) {
+                        } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 &&
+                                   (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16)) {
                             xmx_supported = true;
                         }
-                        
+
                         if (xmx_supported) {
-                            break; // Compatible
+                            break;  // Compatible
                         }
                     }
-#endif
+#    endif
 
                     // Note: oneDNN Graph API (DnnlGraphWrapper) is NOT compatible with SYCL command graphs
                     // because oneDNN Graph's cp.execute() creates internal SYCL events that break graph recording.
@@ -789,7 +778,7 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                     // 4. Enable oneDNN with Graph API for F16/F32 -> uses DnnlGraphWrapper
                     //
                     // Current tensor: src0=%s [%ldx%ld], src1=F32 [%ldx%ld], batch=%ld
-                    
+
                     // Fallback to graph-compatible Tiled GEMM if allowed
                     // ggml_sycl_mul_mat() will pick the tiled kernel if force_graph_compatible is set.
                     // Check if the tiled GEMM supports this type combination:
@@ -815,12 +804,13 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                     }
 
                     if (tiled_gemm_supported) {
-                        break; // Proceed with graph
+                        break;  // Proceed with graph
                     } else {
-                        GGML_LOG_DEBUG("%s: disabling SYCL graphs for unsupported tiled GEMM type combo (src0=%s, src1=%s)\n",
+                        GGML_LOG_DEBUG(
+                            "%s: disabling SYCL graphs for unsupported tiled GEMM type combo (src0=%s, src1=%s)\n",
                             __func__, ggml_type_name(src0->type), ggml_type_name(src1->type));
                         return graph_compat_t::DISABLED;
-                    } 
+                    }
                 }
         }
     }
@@ -828,8 +818,7 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
     // Determine single vs multi-device mode
     if (ggml_sycl_info().device_count > 1 && has_split_buffers) {
         // Multi-device with split buffers: use per-device graphs
-        GGML_LOG_INFO("%s: using multi-device SYCL graphs (%d devices)\n",
-                      __func__, ggml_sycl_info().device_count);
+        GGML_LOG_INFO("%s: using multi-device SYCL graphs (%d devices)\n", __func__, ggml_sycl_info().device_count);
         return graph_compat_t::MULTI_DEVICE;
     } else if (ggml_sycl_info().device_count > 1) {
         // Multi-device without split buffers: can still use single graph on primary device
@@ -855,12 +844,10 @@ static bool node_uses_split_buffer_mdg(const ggml_tensor * node) {
 
 // Partition cgraph nodes by device
 // Returns map of device_id -> vector of node indices
-static std::map<int, std::vector<int>> partition_nodes_by_device(
-    ggml_backend_sycl_context & ctx,
-    ggml_cgraph * cgraph
-) {
+static std::map<int, std::vector<int>> partition_nodes_by_device(ggml_backend_sycl_context & ctx,
+                                                                 ggml_cgraph *               cgraph) {
     std::map<int, std::vector<int>> partitions;
-    int device_count = ggml_sycl_info().device_count;
+    int                             device_count = ggml_sycl_info().device_count;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -881,14 +868,11 @@ static std::map<int, std::vector<int>> partition_nodes_by_device(
 }
 
 // Record and execute per-device graphs for multi-GPU setups
-static ggml_status ggml_backend_sycl_multi_device_graph_compute(
-    ggml_backend_sycl_context & ctx,
-    ggml_cgraph * cgraph
-) {
+static ggml_status ggml_backend_sycl_multi_device_graph_compute(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
     int device_count = ggml_sycl_info().device_count;
 
-    GGML_LOG_INFO("[SYCL-MULTI-GRAPH] Starting multi-device graph compute (%d devices, %d nodes)\n",
-                  device_count, cgraph->n_nodes);
+    GGML_LOG_INFO("[SYCL-MULTI-GRAPH] Starting multi-device graph compute (%d devices, %d nodes)\n", device_count,
+                  cgraph->n_nodes);
 
     // Partition nodes by device
     auto partitions = partition_nodes_by_device(ctx, cgraph);
@@ -909,7 +893,9 @@ static ggml_status ggml_backend_sycl_multi_device_graph_compute(
     std::map<int, sycl_ex::command_graph<sycl_ex::graph_state::modifiable>> modifiable_graphs;
 
     for (auto & [device_id, node_indices] : partitions) {
-        if (node_indices.empty()) continue;
+        if (node_indices.empty()) {
+            continue;
+        }
 
         ggml_sycl_set_device(device_id);
         queue_ptr stream = ctx.stream(device_id, 0);
@@ -920,25 +906,24 @@ static ggml_status ggml_backend_sycl_multi_device_graph_compute(
             // Fall back to non-graph execution for this device's nodes
             for (int node_idx : node_indices) {
                 ggml_tensor * node = cgraph->nodes[node_idx];
-                bool ok = ggml_sycl_compute_forward(ctx, node);
+                bool          ok   = ggml_sycl_compute_forward(ctx, node);
                 GGML_ASSERT(ok);
             }
             continue;
         }
 
-        GGML_LOG_DEBUG("[SYCL-MULTI-GRAPH] Recording graph for device %d (%zu nodes)\n",
-                       device_id, node_indices.size());
+        GGML_LOG_DEBUG("[SYCL-MULTI-GRAPH] Recording graph for device %d (%zu nodes)\n", device_id,
+                       node_indices.size());
 
         // Create modifiable graph for this device
-        sycl_ex::command_graph device_graph(*stream,
-            {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
+        sycl_ex::command_graph device_graph(*stream, { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
 
         device_graph.begin_recording(*stream);
 
         // Record nodes for this device
         for (int node_idx : node_indices) {
             ggml_tensor * node = cgraph->nodes[node_idx];
-            bool ok = ggml_sycl_compute_forward(ctx, node);
+            bool          ok   = ggml_sycl_compute_forward(ctx, node);
             if (!ok) {
                 GGML_LOG_ERROR("[SYCL-MULTI-GRAPH] Failed to compute node %s\n", node->name);
             }
@@ -958,22 +943,20 @@ static ggml_status ggml_backend_sycl_multi_device_graph_compute(
         auto & cached_graph = ctx.per_device_exec_graphs[device_id];
 
         if (!cached_graph || !supports_update) {
-            auto exec = supports_update ?
-                mod_graph.finalize(sycl_ex::property::graph::updatable{}) :
-                mod_graph.finalize();
-            cached_graph = std::make_unique<
-                sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec));
+            auto exec =
+                supports_update ? mod_graph.finalize(sycl_ex::property::graph::updatable{}) : mod_graph.finalize();
+            cached_graph = std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec));
             GGML_LOG_DEBUG("[SYCL-MULTI-GRAPH] Finalized new graph for device %d\n", device_id);
         } else {
             try {
                 cached_graph->update(mod_graph);
                 GGML_LOG_DEBUG("[SYCL-MULTI-GRAPH] Updated existing graph for device %d\n", device_id);
-            } catch (sycl::exception const & e) {
-                GGML_LOG_DEBUG("[SYCL-MULTI-GRAPH] Graph update failed on device %d: %s, re-finalizing\n",
-                               device_id, e.what());
-                auto exec = mod_graph.finalize({sycl_ex::property::graph::updatable{}});
-                cached_graph = std::make_unique<
-                    sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec));
+            } catch (const sycl::exception & e) {
+                GGML_LOG_DEBUG("[SYCL-MULTI-GRAPH] Graph update failed on device %d: %s, re-finalizing\n", device_id,
+                               e.what());
+                auto exec = mod_graph.finalize({ sycl_ex::property::graph::updatable{} });
+                cached_graph =
+                    std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec));
             }
         }
     }
@@ -982,7 +965,9 @@ static ggml_status ggml_backend_sycl_multi_device_graph_compute(
     // Execute concurrenty. Dependencies are handled by internal events (e.g. in MUL_MAT).
 
     for (auto & [device_id, cached_graph] : ctx.per_device_exec_graphs) {
-        if (!cached_graph) continue;
+        if (!cached_graph) {
+            continue;
+        }
 
         ggml_sycl_set_device(device_id);
         queue_ptr stream = ctx.stream(device_id, 0);
@@ -1000,14 +985,14 @@ static ggml_status ggml_backend_sycl_multi_device_graph_compute(
     return GGML_STATUS_SUCCESS;
 }
 
-#endif // GGML_SYCL_GRAPH
+#endif  // GGML_SYCL_GRAPH
 
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
 
- #ifdef GGML_SYCL_GRAPH
-    graph_compat_t graph_mode = g_ggml_sycl_disable_graph ?
-        graph_compat_t::DISABLED : check_graph_compatibility(*sycl_ctx, cgraph);
+#ifdef GGML_SYCL_GRAPH
+    graph_compat_t graph_mode =
+        g_ggml_sycl_disable_graph ? graph_compat_t::DISABLED : check_graph_compatibility(*sycl_ctx, cgraph);
 
     if (graph_mode == graph_compat_t::MULTI_DEVICE) {
         // ===== MULTI-DEVICE GRAPH PATH =====
@@ -1015,7 +1000,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         GGML_SYCL_DEBUG("[SYCL-MULTI-GRAPH] Starting multi-device graph compute (n_nodes=%d)\n", cgraph->n_nodes);
 
         sycl_ctx->force_graph_compatible = true;
-        ggml_status status = ggml_backend_sycl_multi_device_graph_compute(*sycl_ctx, cgraph);
+        ggml_status status               = ggml_backend_sycl_multi_device_graph_compute(*sycl_ctx, cgraph);
         sycl_ctx->force_graph_compatible = false;
         return status;
 
@@ -1029,7 +1014,8 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         // This is a workaround for SYCL graph implicit dependencies on in-order queues.
         sycl_ctx->stream()->wait();
         gettimeofday(&tv_end, NULL);
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] Queue wait took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] Queue wait took %ld us\n",
+                        (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec));
         gettimeofday(&tv_start, NULL);
 
         const bool graph_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_limited_graph);
@@ -1039,27 +1025,30 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             return GGML_STATUS_SUCCESS;
         }
         gettimeofday(&tv_end, NULL);
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] Graph support check took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] Graph support check took %ld us\n",
+                        (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec));
         gettimeofday(&tv_start, NULL);
 
         // Compute hash of graph topology for cache lookup
         const uint64_t graph_hash = compute_cgraph_hash(cgraph);
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] Graph hash: 0x%016llx\n", (unsigned long long)graph_hash);
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] Graph hash: 0x%016llx\n", (unsigned long long) graph_hash);
 
         // Check if we have a cached graph with matching topology
-        auto cache_it = sycl_ctx->graph_cache.find(graph_hash);
+        auto cache_it   = sycl_ctx->graph_cache.find(graph_hash);
         bool use_cached = (cache_it != sycl_ctx->graph_cache.end());
 
         if (use_cached) {
             // Use cached graph - just execute it directly
             GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache hit, reusing existing graph\n");
             gettimeofday(&tv_end, NULL);
-            GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache lookup took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache lookup took %ld us\n",
+                            (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec));
             gettimeofday(&tv_start, NULL);
 
             // Still need to execute the compute to update tensor data pointers
             // For now, we re-record and update the cached graph
-            sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()), {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
+            sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()),
+                                                    { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
             model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
 
             sycl_ctx->force_graph_compatible = true;
@@ -1071,15 +1060,16 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             try {
                 cache_it->second->update(model_sycl_graph);
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache update success\n");
-            } catch (sycl::exception const & e) {
+            } catch (const sycl::exception & e) {
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache update failed: %s, re-finalizing\n", e.what());
-                auto exec_graph = model_sycl_graph.finalize({sycl_ex::property::graph::updatable{}});
-                cache_it->second = std::make_unique<
-                    sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec_graph));
+                auto exec_graph = model_sycl_graph.finalize({ sycl_ex::property::graph::updatable{} });
+                cache_it->second =
+                    std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec_graph));
             }
 
             gettimeofday(&tv_end, NULL);
-            GGML_SYCL_DEBUG("[SYCL-GRAPH] finalize/update took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] finalize/update took %ld us\n",
+                            (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec));
             gettimeofday(&tv_start, NULL);
 
             sycl_ctx->stream()->ext_oneapi_graph(*(cache_it->second));
@@ -1093,14 +1083,17 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                 sycl_ctx->graph_cache.erase(sycl_ctx->graph_cache.begin());
             }
 
-            sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()), {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
+            sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()),
+                                                    { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
             gettimeofday(&tv_end, NULL);
-            GGML_SYCL_DEBUG("[SYCL-GRAPH] Graph construction took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] Graph construction took %ld us\n",
+                            (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec));
             gettimeofday(&tv_start, NULL);
 
             model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
             gettimeofday(&tv_end, NULL);
-            GGML_SYCL_DEBUG("[SYCL-GRAPH] begin_recording took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] begin_recording took %ld us\n",
+                            (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec));
             gettimeofday(&tv_start, NULL);
 
             sycl_ctx->force_graph_compatible = true;
@@ -1108,34 +1101,36 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             sycl_ctx->force_graph_compatible = false;
 
             gettimeofday(&tv_end, NULL);
-            GGML_SYCL_DEBUG("[SYCL-GRAPH] compute_impl took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] compute_impl took %ld us\n",
+                            (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec));
             gettimeofday(&tv_start, NULL);
 
             model_sycl_graph.end_recording();
             gettimeofday(&tv_end, NULL);
-            GGML_SYCL_DEBUG("[SYCL-GRAPH] end_recording took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] end_recording took %ld us\n",
+                            (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec));
             gettimeofday(&tv_start, NULL);
 
             const bool graph_update_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_graph);
 
-            auto exec_graph = graph_update_support ?
-                model_sycl_graph.finalize(sycl_ex::property::graph::updatable{}) :
-                model_sycl_graph.finalize();
+            auto exec_graph = graph_update_support ? model_sycl_graph.finalize(sycl_ex::property::graph::updatable{}) :
+                                                     model_sycl_graph.finalize();
 
             // Store in cache
-            sycl_ctx->graph_cache[graph_hash] = std::make_unique<
-                sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec_graph));
+            sycl_ctx->graph_cache[graph_hash] =
+                std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec_graph));
 
             gettimeofday(&tv_end, NULL);
             GGML_SYCL_DEBUG("[SYCL-GRAPH] finalize took %ld us (cache size: %zu)\n",
-                (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec),
-                sycl_ctx->graph_cache.size());
+                            (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec),
+                            sycl_ctx->graph_cache.size());
             gettimeofday(&tv_start, NULL);
 
             sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->graph_cache[graph_hash]));
         }
         gettimeofday(&tv_end, NULL);
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] ext_oneapi_graph took %ld us\n", (tv_end.tv_sec - tv_start.tv_sec)*1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] ext_oneapi_graph took %ld us\n",
+                        (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec));
         gettimeofday(&tv_start, NULL);
 
         return GGML_STATUS_SUCCESS;
@@ -1146,38 +1141,32 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
     }
     return GGML_STATUS_SUCCESS;
- }
+}
 
-static void ggml_backend_sycl_event_record(ggml_backend_t backend, ggml_backend_event_t event)
-try
-{
-    ggml_backend_sycl_context *sycl_ctx =
-        (ggml_backend_sycl_context *)backend->context;
+static void ggml_backend_sycl_event_record(ggml_backend_t backend, ggml_backend_event_t event) try {
+    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
 
-    sycl::event *sycl_event = static_cast<sycl::event *>(event->context);
+    sycl::event * sycl_event = static_cast<sycl::event *>(event->context);
 
-    const queue_ptr &stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    const queue_ptr & stream = sycl_ctx->stream(sycl_ctx->device, 0);
     // Record the current state of the queue
     SYCL_CHECK(CHECK_TRY_ERROR(*sycl_event = stream->ext_oneapi_submit_barrier()));
-}
-catch (sycl::exception const &exc)
-{
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-              << ", line:" << __LINE__ << std::endl;
+} catch (const sycl::exception & exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::exit(1);
 }
 
 static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_event_t event) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
-    sycl::event* sycl_event = static_cast<sycl::event*>(event->context);
+    sycl::event * sycl_event = static_cast<sycl::event *>(event->context);
 
     if (ggml_backend_is_sycl(backend)) {
         SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
-    } else
+    } else {
         GGML_ABORT("fatal error");
-} catch (sycl::exception const& exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-              << ", line:" << __LINE__ << std::endl;
+    }
+} catch (const sycl::exception & exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::exit(1);
 }
 
@@ -1199,7 +1188,8 @@ static ggml_backend_i ggml_backend_sycl_interface = {
 };
 
 static ggml_guid_t ggml_backend_sycl_guid() {
-    static ggml_guid guid = { 0x58, 0x05, 0x13, 0x8f, 0xcd, 0x3a, 0x61, 0x9d, 0xe7, 0xcd, 0x98, 0xa9, 0x03, 0xfd, 0x7c, 0x53 };
+    static ggml_guid guid = { 0x58, 0x05, 0x13, 0x8f, 0xcd, 0x3a, 0x61, 0x9d,
+                              0xe7, 0xcd, 0x98, 0xa9, 0x03, 0xfd, 0x7c, 0x53 };
     return &guid;
 }
 
@@ -1211,31 +1201,29 @@ int ggml_backend_sycl_get_device_count() {
     return ggml_sycl_info().device_count;
 }
 
-
 // backend device
 
 struct ggml_backend_sycl_device_context {
-    int device;
+    int         device;
     std::string name;
     std::string description;
-    int op_offload_min_batch_size;
+    int         op_offload_min_batch_size;
 };
 
 static const char * ggml_backend_sycl_device_get_name(ggml_backend_dev_t dev) {
-    ggml_backend_sycl_device_context * ctx = (ggml_backend_sycl_device_context *)dev->context;
+    ggml_backend_sycl_device_context * ctx = (ggml_backend_sycl_device_context *) dev->context;
     return ctx->name.c_str();
 }
 
 static const char * ggml_backend_sycl_device_get_description(ggml_backend_dev_t dev) {
-    ggml_backend_sycl_device_context * ctx = (ggml_backend_sycl_device_context *)dev->context;
+    ggml_backend_sycl_device_context * ctx = (ggml_backend_sycl_device_context *) dev->context;
     return ctx->description.c_str();
 }
 
 static void ggml_backend_sycl_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    ggml_backend_sycl_device_context * ctx = (ggml_backend_sycl_device_context *)dev->context;
+    ggml_backend_sycl_device_context * ctx = (ggml_backend_sycl_device_context *) dev->context;
     ggml_sycl_set_device(ctx->device);
-    SYCL_CHECK(CHECK_TRY_ERROR(
-    dpct::dev_mgr::instance().get_device(ctx->device).get_memory_info(*free, *total)));
+    SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).get_memory_info(*free, *total)));
 }
 
 static enum ggml_backend_dev_type ggml_backend_sycl_device_get_type(ggml_backend_dev_t dev) {
@@ -1266,12 +1254,12 @@ static void ggml_backend_sycl_device_get_props(ggml_backend_dev_t dev, ggml_back
 
 static ggml_backend_t ggml_backend_sycl_device_init(ggml_backend_dev_t dev, const char * params) {
     GGML_UNUSED(params);
-    ggml_backend_sycl_device_context * ctx = (ggml_backend_sycl_device_context *)dev->context;
+    ggml_backend_sycl_device_context * ctx = (ggml_backend_sycl_device_context *) dev->context;
     return ggml_backend_sycl_init(ctx->device);
 }
 
 static ggml_backend_buffer_type_t ggml_backend_sycl_device_get_buffer_type(ggml_backend_dev_t dev) {
-    ggml_backend_sycl_device_context * ctx = (ggml_backend_sycl_device_context *)dev->context;
+    ggml_backend_sycl_device_context * ctx = (ggml_backend_sycl_device_context *) dev->context;
     return ggml_backend_sycl_buffer_type(ctx->device);
 }
 
@@ -1280,7 +1268,10 @@ static ggml_backend_buffer_type_t ggml_backend_sycl_device_get_host_buffer_type(
     return ggml_backend_sycl_host_buffer_type();
 }
 
-static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
+static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_backend_dev_t dev,
+                                                                           void *             ptr,
+                                                                           size_t             size,
+                                                                           size_t             max_tensor_size) {
     GGML_UNUSED(dev);
     GGML_UNUSED(ptr);
     GGML_UNUSED(size);
@@ -1289,9 +1280,8 @@ static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_
 }
 
 static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    ggml_backend_sycl_device_context *sycl_ctx =
-        (ggml_backend_sycl_device_context *)dev->context;
-    int device = sycl_ctx->device;
+    ggml_backend_sycl_device_context * sycl_ctx = (ggml_backend_sycl_device_context *) dev->context;
+    int                                device   = sycl_ctx->device;
     switch (op->op) {
         case GGML_OP_CONV_TRANSPOSE_1D:
             {
@@ -1352,11 +1342,9 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
                 }
                 ggml_type a_type = a->type;
-                if (a_type == GGML_TYPE_IQ4_NL  || a_type == GGML_TYPE_IQ4_XS ||
-                    a_type == GGML_TYPE_IQ3_XXS || a_type == GGML_TYPE_IQ3_S  ||
-                    a_type == GGML_TYPE_IQ2_XXS || a_type == GGML_TYPE_IQ2_XS || a_type == GGML_TYPE_IQ2_S ||
-                    a_type == GGML_TYPE_IQ1_S || a_type == GGML_TYPE_IQ1_M
-                    ) {
+                if (a_type == GGML_TYPE_IQ4_NL || a_type == GGML_TYPE_IQ4_XS || a_type == GGML_TYPE_IQ3_XXS ||
+                    a_type == GGML_TYPE_IQ3_S || a_type == GGML_TYPE_IQ2_XXS || a_type == GGML_TYPE_IQ2_XS ||
+                    a_type == GGML_TYPE_IQ2_S || a_type == GGML_TYPE_IQ1_S || a_type == GGML_TYPE_IQ1_M) {
                     if (b->ne[1] == 1 && ggml_nrows(b) > 1) {
                         return false;
                     }
@@ -1371,20 +1359,21 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                 */
 
                 // TODO: The configuration below needs more work to be supported with oneDNN
-                if (ggml_is_permuted(a) && !ggml_is_contiguous(a) &&
-                    a->ne[2] > 1 && a->ne[3] > 1 && src0_type == GGML_TYPE_F16) {
-                  return false;
+                if (ggml_is_permuted(a) && !ggml_is_contiguous(a) && a->ne[2] > 1 && a->ne[3] > 1 &&
+                    src0_type == GGML_TYPE_F16) {
+                    return false;
                 }
 
                 // TODO: This specific configuration can fail with oneDNN and needs more debugging
-                if (!ggml_is_permuted(a) && ggml_is_permuted(b) && b->ne[2] > 1 && b->ne[3] > 1 &&
-                    a->ne[0] > 128 && a->ne[2] == 1 && src0_type == GGML_TYPE_F16) {
+                if (!ggml_is_permuted(a) && ggml_is_permuted(b) && b->ne[2] > 1 && b->ne[3] > 1 && a->ne[0] > 128 &&
+                    a->ne[2] == 1 && src0_type == GGML_TYPE_F16) {
                     return false;
                 }
                 return true;
             }
         case GGML_OP_OUT_PROD:
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->ne[2] == 1 && op->ne[3] == 1;
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->ne[2] == 1 && op->ne[3] == 1;
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
@@ -1402,11 +1391,9 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                         return false;
                 }
             }
-         case GGML_OP_SET:
-               return (op->type == GGML_TYPE_F32) &&
-                      (op->src[0] && op->src[1]) &&
-                      (op->src[0]->type == GGML_TYPE_F32) &&
-                      (op->src[1]->type == GGML_TYPE_F32);
+        case GGML_OP_SET:
+            return (op->type == GGML_TYPE_F32) && (op->src[0] && op->src[1]) && (op->src[0]->type == GGML_TYPE_F32) &&
+                   (op->src[1]->type == GGML_TYPE_F32);
 
         case GGML_OP_SET_ROWS:
             {
@@ -1421,7 +1408,8 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
-                if (src0_type == src1_type && (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) && src0_type != GGML_TYPE_BF16) {
+                if (src0_type == src1_type && (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) &&
+                    src0_type != GGML_TYPE_BF16) {
                     return true;
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
@@ -1469,19 +1457,19 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_IQ4_NL) {
                     return true;
                 }
-                if(src0_type == GGML_TYPE_Q8_0 && src1_type == GGML_TYPE_Q8_0) {
+                if (src0_type == GGML_TYPE_Q8_0 && src1_type == GGML_TYPE_Q8_0) {
                     return true;
                 }
-                if(src0_type == GGML_TYPE_Q5_0 && src1_type == GGML_TYPE_Q5_0) {
+                if (src0_type == GGML_TYPE_Q5_0 && src1_type == GGML_TYPE_Q5_0) {
                     return true;
                 }
-                if(src0_type == GGML_TYPE_Q5_1 && src1_type == GGML_TYPE_Q5_1) {
+                if (src0_type == GGML_TYPE_Q5_1 && src1_type == GGML_TYPE_Q5_1) {
                     return true;
                 }
-                if(src0_type == GGML_TYPE_Q4_0 && src1_type == GGML_TYPE_Q4_0) {
+                if (src0_type == GGML_TYPE_Q4_0 && src1_type == GGML_TYPE_Q4_0) {
                     return true;
                 }
-                if(src0_type == GGML_TYPE_Q4_1 && src1_type == GGML_TYPE_Q4_1) {
+                if (src0_type == GGML_TYPE_Q4_1 && src1_type == GGML_TYPE_Q4_1) {
                     return true;
                 }
                 return false;
@@ -1509,15 +1497,17 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_REPEAT:
             return true;
         case GGML_OP_PAD_REFLECT_1D:
-            return ggml_is_contiguous(op->src[0]) && op-> type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
+            return ggml_is_contiguous(op->src[0]) && op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
         case GGML_OP_SIN:
         case GGML_OP_COS:
         case GGML_OP_CLAMP:
         case GGML_OP_LOG:
-#if defined (GGML_SYCL_F16)
-            return ((op->type == GGML_TYPE_F32 || op->type == GGML_SYCL_F16) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_SYCL_F16) && (op->type == op->src[0]->type));
+#if defined(GGML_SYCL_F16)
+            return ((op->type == GGML_TYPE_F32 || op->type == GGML_SYCL_F16) &&
+                    (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_SYCL_F16) &&
+                    (op->type == op->src[0]->type));
 #else
             return (op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32) && (op->type == op->src[0]->type);
 #endif
@@ -1535,41 +1525,38 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TRI:
             {
                 const ggml_tensor * src0 = op->src[0];
-                return src0 &&
-                       op->type == GGML_TYPE_F32 &&
-                       ggml_is_contiguous(src0);
+                return src0 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(src0);
             }
         case GGML_OP_DIAG_MASK_INF:
             return true;
         case GGML_OP_SOFT_MAX:
             return true;
-        case GGML_OP_SOFT_MAX_BACK: {
-            float max_bias = 0.0f;
-            memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
-            return max_bias == 0.0f;
-        }
+        case GGML_OP_SOFT_MAX_BACK:
+            {
+                float max_bias = 0.0f;
+                memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+                return max_bias == 0.0f;
+            }
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
         case GGML_OP_IM2COL:
             return true;
         case GGML_OP_UPSCALE:
-            return op->src[0]->type == GGML_TYPE_F32 && op->op_params[0] == GGML_SCALE_MODE_NEAREST && !(op->op_params[0] & GGML_SCALE_FLAG_ANTIALIAS);
+            return op->src[0]->type == GGML_TYPE_F32 && op->op_params[0] == GGML_SCALE_MODE_NEAREST &&
+                   !(op->op_params[0] & GGML_SCALE_FLAG_ANTIALIAS);
         case GGML_OP_SUM:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_ARGSORT:
-            return op->src[0]->ne[0] * sizeof(int) <=
-                   ggml_sycl_info().devices[device].smpbo;
-        case GGML_OP_TOP_K: {
-            const ggml_tensor * src0 = op->src[0];
-            const int k = op->ne[0];
-            return src0 &&
-                op->type == GGML_TYPE_I32 &&
-                src0->type == GGML_TYPE_F32 &&
-                ggml_is_contiguous(src0) &&
-                k > 0 && k <= 32;
-        }
+            return op->src[0]->ne[0] * sizeof(int) <= ggml_sycl_info().devices[device].smpbo;
+        case GGML_OP_TOP_K:
+            {
+                const ggml_tensor * src0 = op->src[0];
+                const int           k    = op->ne[0];
+                return src0 && op->type == GGML_TYPE_I32 && src0->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) &&
+                       k > 0 && k <= 32;
+            }
         case GGML_OP_POOL_2D:
         case GGML_OP_ACC:
             return true;
@@ -1586,9 +1573,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_GATED_LINEAR_ATTN:
             return true;
         case GGML_OP_SSM_CONV:
-            return op->type == GGML_TYPE_F32 &&
-                   op->src[0]->type == GGML_TYPE_F32 &&
-                   op->src[1]->type == GGML_TYPE_F32;
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_ROLL:
             return op->type == GGML_TYPE_F32;
         case GGML_OP_ARANGE:
@@ -1606,8 +1591,8 @@ static bool ggml_backend_sycl_device_supports_buft(ggml_backend_dev_t dev, ggml_
     if (buft->iface.get_name != ggml_backend_sycl_buffer_type_get_name) {
         return false;
     }
-    ggml_backend_sycl_buffer_type_context * buft_ctx = (ggml_backend_sycl_buffer_type_context *)buft->context;
-    ggml_backend_sycl_device_context * sycl_ctx = (ggml_backend_sycl_device_context *)dev->context;
+    ggml_backend_sycl_buffer_type_context * buft_ctx = (ggml_backend_sycl_buffer_type_context *) buft->context;
+    ggml_backend_sycl_device_context *      sycl_ctx = (ggml_backend_sycl_device_context *) dev->context;
     return buft_ctx->device == sycl_ctx->device;
 }
 
@@ -1626,55 +1611,50 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 }
 
 static bool ggml_backend_sycl_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    ggml_backend_sycl_device_context * sycl_ctx = (ggml_backend_sycl_device_context *)dev->context;
+    ggml_backend_sycl_device_context * sycl_ctx = (ggml_backend_sycl_device_context *) dev->context;
     return get_op_batch_size(op) >= sycl_ctx->op_offload_min_batch_size;
 }
 
-static ggml_backend_event_t
-ggml_backend_sycl_device_event_new(ggml_backend_dev_t dev) {
-
+static ggml_backend_event_t ggml_backend_sycl_device_event_new(ggml_backend_dev_t dev) {
 #ifdef GGML_SYCL_NO_PEER_COPY
     return nullptr;
 #else
-  sycl::event *event_ptr = new sycl::event();
+    sycl::event * event_ptr = new sycl::event();
 
-  return new ggml_backend_event{
-      /* .device = */ dev,
-      /* .context = */ event_ptr,
-  };
+    return new ggml_backend_event{
+        /* .device = */ dev,
+        /* .context = */ event_ptr,
+    };
 #endif
 }
 
 static void ggml_backend_sycl_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) try {
-  GGML_UNUSED(dev);
-  if (event == nullptr) {
-    return;
-  }
+    GGML_UNUSED(dev);
+    if (event == nullptr) {
+        return;
+    }
 
-  if (event->context != nullptr) {
-    sycl::event *sycl_event = static_cast<sycl::event *>(event->context);
-    delete sycl_event;
-    event->context = nullptr;
-  }
+    if (event->context != nullptr) {
+        sycl::event * sycl_event = static_cast<sycl::event *>(event->context);
+        delete sycl_event;
+        event->context = nullptr;
+    }
 
-  delete event;
-} catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    delete event;
+} catch (const sycl::exception & exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
-
 static void ggml_backend_sycl_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) try {
-  GGML_UNUSED(dev);
-  GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
+    GGML_UNUSED(dev);
+    GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
 
-  sycl::event *sycl_event = static_cast<sycl::event *>(event->context);
-  SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
-} catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    sycl::event * sycl_event = static_cast<sycl::event *>(event->context);
+    SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
+} catch (const sycl::exception & exc) {
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
 }
 
 static const ggml_backend_device_i ggml_backend_sycl_device_interface = {
@@ -1707,21 +1687,21 @@ static const char * ggml_backend_sycl_reg_get_name(ggml_backend_reg_t reg) {
 }
 
 static size_t ggml_backend_sycl_reg_get_device_count(ggml_backend_reg_t reg) {
-    ggml_backend_sycl_reg_context * ctx = (ggml_backend_sycl_reg_context *)reg->context;
+    ggml_backend_sycl_reg_context * ctx = (ggml_backend_sycl_reg_context *) reg->context;
     return ctx->devices.size();
 }
 
 static ggml_backend_dev_t ggml_backend_sycl_reg_get_device(ggml_backend_reg_t reg, size_t index) {
-    ggml_backend_sycl_reg_context * ctx = (ggml_backend_sycl_reg_context *)reg->context;
+    ggml_backend_sycl_reg_context * ctx = (ggml_backend_sycl_reg_context *) reg->context;
     GGML_ASSERT(index < ctx->devices.size());
     return ctx->devices[index];
 }
 
-static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, const char *name) {
+static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
 
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
-        return (void *)ggml_backend_sycl_split_buffer_type;
+        return (void *) ggml_backend_sycl_split_buffer_type;
     }
 
     // SYCL doesn't support registering host memory, left here for reference
@@ -1738,47 +1718,43 @@ static const ggml_backend_reg_i ggml_backend_sycl_reg_interface = {
     /* .get_proc_address  = */ ggml_backend_sycl_reg_get_proc_address,
 };
 
-
 // backend registry
 
 ggml_backend_reg_t ggml_backend_sycl_reg() {
     static ggml_backend_reg reg;
-    static bool initialized = false;
+    static bool             initialized = false;
 
     {
-        static std::mutex mutex;
+        static std::mutex           mutex;
         std::lock_guard<std::mutex> lock(mutex);
         if (!initialized) {
             ggml_backend_sycl_reg_context * ctx = new ggml_backend_sycl_reg_context;
-            const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+            const int                       min_batch_size =
+                getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
 
             for (int i = 0; i < ggml_sycl_info().device_count; i++) {
                 ggml_backend_sycl_device_context * dev_ctx = new ggml_backend_sycl_device_context;
-                dev_ctx->device = i;
-                dev_ctx->name = GGML_SYCL_NAME + std::to_string(i);
+                dev_ctx->device                            = i;
+                dev_ctx->name                              = GGML_SYCL_NAME + std::to_string(i);
 
                 ggml_sycl_set_device(i);
 
                 dpct::device_info prop;
-                SYCL_CHECK(CHECK_TRY_ERROR(dpct::get_device_info(
-                    prop, dpct::dev_mgr::instance().get_device(i))));
+                SYCL_CHECK(CHECK_TRY_ERROR(dpct::get_device_info(prop, dpct::dev_mgr::instance().get_device(i))));
 
-                dev_ctx->description = prop.get_name();
+                dev_ctx->description               = prop.get_name();
                 dev_ctx->op_offload_min_batch_size = min_batch_size;
 
-                ggml_backend_dev_t dev = new ggml_backend_device {
-                    /* .iface       = */ ggml_backend_sycl_device_interface,
-                    /* .reg         = */ &reg,
-                    /* .context     = */ dev_ctx
-                };
+                ggml_backend_dev_t dev =
+                    new ggml_backend_device{ /* .iface       = */ ggml_backend_sycl_device_interface,
+                                             /* .reg         = */ &reg,
+                                             /* .context     = */ dev_ctx };
                 ctx->devices.push_back(dev);
             }
 
-            reg = ggml_backend_reg {
-                /* .api_version = */ GGML_BACKEND_API_VERSION,
-                /* .iface       = */ ggml_backend_sycl_reg_interface,
-                /* .context     = */ ctx
-            };
+            reg = ggml_backend_reg{ /* .api_version = */ GGML_BACKEND_API_VERSION,
+                                    /* .iface       = */ ggml_backend_sycl_reg_interface,
+                                    /* .context     = */ ctx };
         }
 
         initialized = true;
@@ -1799,12 +1775,11 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
         return nullptr;
     };
 
-    ggml_backend_t sycl_backend = new ggml_backend {
-        /* .guid    = */ ggml_backend_sycl_guid(),
-        /* .iface   = */ ggml_backend_sycl_interface,
-        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_sycl_reg(), device),
-        /* .context = */ ctx
-    };
+    ggml_backend_t sycl_backend =
+        new ggml_backend{ /* .guid    = */ ggml_backend_sycl_guid(),
+                          /* .iface   = */ ggml_backend_sycl_interface,
+                          /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_sycl_reg(), device),
+                          /* .context = */ ctx };
 
     return sycl_backend;
 }

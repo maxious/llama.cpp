@@ -5,19 +5,68 @@
 #include "./fattn_fused.hpp"
 #include "./fattn_kernel.hpp"
 #include "./fattn_tiled.hpp"
+#include "./itt_annotations.hpp"
 
 #ifdef SYCL_EXT_ONEAPI_MATRIX
 #    include "fattn_xmx.hpp"
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <sstream>
 #include <sycl/sycl.hpp>
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
 #    include <sycl/ext/oneapi/experimental/async_alloc/async_alloc.hpp>
 #endif
+
+namespace {
+std::string ggml_sycl_flash_attn_stats_key(const ggml_tensor * dst,
+                                           const char *        implementation,
+                                           bool                recording_graph,
+                                           bool                small_batch,
+                                           bool                has_mask,
+                                           bool                has_sinks,
+                                           int64_t             n_splits) {
+    const ggml_tensor * Q          = dst->src[0];
+    const ggml_tensor * K          = dst->src[1];
+    const ggml_tensor * V          = dst->src[2];
+    const int64_t       DQK        = Q->ne[0];
+    const int64_t       DV         = V->ne[0];
+    const int64_t       N          = Q->ne[1];
+    const int64_t       N_kv       = K->ne[1];
+    const int64_t       n_heads    = Q->ne[2];
+    const int64_t       n_kv_heads = K->ne[2];
+
+    std::ostringstream oss;
+    oss << "flash_attn:" << implementation << " dqk=" << DQK << " dv=" << DV << " n=" << N << " n_kv=" << N_kv
+        << " h=" << n_heads << " kvh=" << n_kv_heads << " q=" << ggml_type_name(Q->type)
+        << " kv=" << ggml_type_name(K->type) << " out=" << ggml_type_name(dst->type)
+        << " mask=" << (has_mask ? ggml_type_name(dst->src[3]->type) : "none")
+        << " sinks=" << (has_sinks ? "yes" : "no") << " splits=" << n_splits
+        << " graph=" << (recording_graph ? "yes" : "no") << " small_batch=" << (small_batch ? "yes" : "no");
+    return oss.str();
+}
+}  // namespace
+
+void ggml_sycl_op_flash_attn_record(ggml_backend_sycl_context & ctx,
+                                    const ggml_tensor *         dst,
+                                    const char *                implementation,
+                                    bool                        recording_graph,
+                                    bool                        small_batch,
+                                    bool                        has_mask,
+                                    bool                        has_sinks,
+                                    int64_t                     n_splits,
+                                    double                      duration_ms) {
+    if (!ctx.enable_op_stats) {
+        return;
+    }
+    ctx.record_op_stat(ggml_sycl_flash_attn_stats_key(dst, implementation, recording_graph, small_batch, has_mask,
+                                                      has_sinks, n_splits),
+                       duration_ms);
+}
 
 // ============================================================================
 // Flash Attention with KV-Split (Flash Decoding)
@@ -747,8 +796,12 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     }
 #endif
 
+    const bool want_timing = ctx.enable_op_timing && !recording_graph;
+    auto       start_time  = std::chrono::high_resolution_clock::time_point{};
+
 #ifdef SYCL_EXT_ONEAPI_MATRIX
-    auto try_xmx = [&]() -> bool {
+    const char * xmx_impl = "xmx";
+    auto         try_xmx  = [&]() -> bool {
         static bool sycl_use_xmx       = false;
         static bool xmx_checked        = false;
         static bool use_direct_loading = false;
@@ -761,12 +814,12 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
             sycl_use_xmx            = ggml_sycl_flash_attn_has_xmx(device);
             xmx_checked             = true;
             xmx_tile_kind tile_kind = ggml_sycl_flash_attn_get_tile_kind(device);
-            const char *  tile_str  = (tile_kind == xmx_tile_kind::tile_dg2) ? "DG2 (nsize=8)" : "PVC/B60 (nsize=16)";
+            const char *  tile_str = (tile_kind == xmx_tile_kind::tile_dg2) ? "DG2 (nsize=8)" : "PVC/B60 (nsize=16)";
             GGML_SYCL_DEBUG("ggml_sycl: XMX detection: device=%s, has_xmx=%d, tile_kind=%s\n",
-                            device.get_info<sycl::info::device::name>().c_str(), sycl_use_xmx, tile_str);
+                                     device.get_info<sycl::info::device::name>().c_str(), sycl_use_xmx, tile_str);
             if (sycl_use_xmx) {
                 GGML_SYCL_DEBUG("ggml_sycl: Using XMX (cooperative matrix) for flash attention with %s tiles\n",
-                                tile_str);
+                                         tile_str);
             }
         }
 
@@ -777,7 +830,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                 if (direct_disabled_b60) {
                     use_direct_loading = false;
                     GGML_SYCL_DEBUG("ggml_sycl: Disabling direct XMX flash attention on %s (B60)\n",
-                                    device_name.c_str());
+                                             device_name.c_str());
                 }
             }
         }
@@ -808,11 +861,12 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                     if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, shmem_bytes)) {
                         GGML_SYCL_DEBUG(
                             "ggml_sycl: XMX direct flash attention rejected (576/512) - shmem=%zu bytes exceeds device "
-                            "limit\n",
+                                     "limit\n",
                             shmem_bytes);
                         return false;
                     }
                     GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (576/512)\n");
+                    GGML_SYCL_ITT_FATTN_XMX(576);
                     ggml_sycl_op_flash_attn_coopmat_direct<576, 512, 8, 16>(ctx, dst);
                     return true;
                 }
@@ -825,6 +879,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                             return false;
                         }
                         GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (32)\n");
+                        GGML_SYCL_ITT_FATTN_XMX(32);
                         ggml_sycl_op_flash_attn_coopmat_direct<32, 32>(ctx, dst);
                         return true;
                     case 64:
@@ -835,6 +890,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                             return false;
                         }
                         GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (64)\n");
+                        GGML_SYCL_ITT_FATTN_XMX(64);
                         ggml_sycl_op_flash_attn_coopmat_direct<64, 64>(ctx, dst);
                         return true;
                     case 96:
@@ -845,6 +901,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                             return false;
                         }
                         GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (96)\n");
+                        GGML_SYCL_ITT_FATTN_XMX(96);
                         ggml_sycl_op_flash_attn_coopmat_direct<96, 96>(ctx, dst);
                         return true;
                     case 128:
@@ -855,6 +912,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                             return false;
                         }
                         GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (128)\n");
+                        GGML_SYCL_ITT_FATTN_XMX(128);
                         ggml_sycl_op_flash_attn_coopmat_direct<128, 128>(ctx, dst);
                         return true;
                     case 256:
@@ -865,6 +923,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                             return false;
                         }
                         GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (256)\n");
+                        GGML_SYCL_ITT_FATTN_XMX(256);
                         ggml_sycl_op_flash_attn_coopmat_direct<256, 256>(ctx, dst);
                         return true;
                     case 512:
@@ -875,6 +934,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                             return false;
                         }
                         GGML_SYCL_DEBUG("ggml_sycl: Using XMX direct flash attention (512)\n");
+                        GGML_SYCL_ITT_FATTN_XMX(512);
                         ggml_sycl_op_flash_attn_coopmat_direct<512, 512>(ctx, dst);
                         return true;
                     default:
@@ -882,7 +942,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                 }
             } catch (const std::exception & e) {
                 GGML_SYCL_DEBUG("ggml_sycl: Direct loading kernel failed: %s, falling back to repack kernel\n",
-                                e.what());
+                                         e.what());
             }
         }
 
@@ -896,17 +956,17 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                         if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, shmem_bytes)) {
                             GGML_SYCL_DEBUG(
                                 "ggml_sycl: XMX KV-split flash attention rejected (576/512) - shmem=%zu bytes exceeds "
-                                "device limit\n",
+                                         "device limit\n",
                                 shmem_bytes);
                             return false;
                         }
                         GGML_SYCL_DEBUG("ggml_sycl: Using XMX KV-split flash attention (576/512)\n");
                         if (is_f16) {
                             ggml_sycl_op_flash_attn_coopmat_kvsplit<576, 512, 8, 16, 16, 8, 16, fattn_input_type::f16,
-                                                                    true>(ctx, dst);
+                                                                             true>(ctx, dst);
                         } else {
                             ggml_sycl_op_flash_attn_coopmat_kvsplit<576, 512, 8, 16, 16, 8, 16, fattn_input_type::f32,
-                                                                    true>(ctx, dst);
+                                                                             true>(ctx, dst);
                         }
                         return true;
                     }
@@ -914,7 +974,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                     if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, shmem_bytes)) {
                         GGML_SYCL_DEBUG(
                             "ggml_sycl: XMX KV-split flash attention rejected (DQK=%ld DV=%ld) - shmem=%zu bytes "
-                            "exceeds device limit\n",
+                                     "exceeds device limit\n",
                             actual_d, actual_dv, shmem_bytes);
                         return false;
                     }
@@ -923,60 +983,60 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                             GGML_SYCL_DEBUG("ggml_sycl: Using XMX KV-split flash attention (32)\n");
                             if (is_f16) {
                                 ggml_sycl_op_flash_attn_coopmat_kvsplit<32, 32, 8, 16, 16, 32, 32,
-                                                                        fattn_input_type::f16, false>(ctx, dst);
+                                                                                 fattn_input_type::f16, false>(ctx, dst);
                             } else {
                                 ggml_sycl_op_flash_attn_coopmat_kvsplit<32, 32, 8, 16, 16, 32, 32,
-                                                                        fattn_input_type::f32, false>(ctx, dst);
+                                                                                 fattn_input_type::f32, false>(ctx, dst);
                             }
                             return true;
                         case 64:
                             GGML_SYCL_DEBUG("ggml_sycl: Using XMX KV-split flash attention (64)\n");
                             if (is_f16) {
                                 ggml_sycl_op_flash_attn_coopmat_kvsplit<64, 64, 8, 16, 16, 32, 32,
-                                                                        fattn_input_type::f16, false>(ctx, dst);
+                                                                                 fattn_input_type::f16, false>(ctx, dst);
                             } else {
                                 ggml_sycl_op_flash_attn_coopmat_kvsplit<64, 64, 8, 16, 16, 32, 32,
-                                                                        fattn_input_type::f32, false>(ctx, dst);
+                                                                                 fattn_input_type::f32, false>(ctx, dst);
                             }
                             return true;
                         case 96:
                             GGML_SYCL_DEBUG("ggml_sycl: Using XMX KV-split flash attention (96)\n");
                             if (is_f16) {
                                 ggml_sycl_op_flash_attn_coopmat_kvsplit<96, 96, 8, 16, 16, 32, 32,
-                                                                        fattn_input_type::f16, false>(ctx, dst);
+                                                                                 fattn_input_type::f16, false>(ctx, dst);
                             } else {
                                 ggml_sycl_op_flash_attn_coopmat_kvsplit<96, 96, 8, 16, 16, 32, 32,
-                                                                        fattn_input_type::f32, false>(ctx, dst);
+                                                                                 fattn_input_type::f32, false>(ctx, dst);
                             }
                             return true;
                         case 128:
                             GGML_SYCL_DEBUG("ggml_sycl: Using XMX KV-split flash attention (128)\n");
                             if (is_f16) {
                                 ggml_sycl_op_flash_attn_coopmat_kvsplit<128, 128, 8, 16, 16, 32, 32,
-                                                                        fattn_input_type::f16, false>(ctx, dst);
+                                                                                 fattn_input_type::f16, false>(ctx, dst);
                             } else {
                                 ggml_sycl_op_flash_attn_coopmat_kvsplit<128, 128, 8, 16, 16, 32, 32,
-                                                                        fattn_input_type::f32, false>(ctx, dst);
+                                                                                 fattn_input_type::f32, false>(ctx, dst);
                             }
                             return true;
                         case 256:
                             GGML_SYCL_DEBUG("ggml_sycl: Using XMX KV-split flash attention (256)\n");
                             if (is_f16) {
                                 ggml_sycl_op_flash_attn_coopmat_kvsplit<256, 256, 8, 16, 16, 32, 32,
-                                                                        fattn_input_type::f16, false>(ctx, dst);
+                                                                                 fattn_input_type::f16, false>(ctx, dst);
                             } else {
                                 ggml_sycl_op_flash_attn_coopmat_kvsplit<256, 256, 8, 16, 16, 32, 32,
-                                                                        fattn_input_type::f32, false>(ctx, dst);
+                                                                                 fattn_input_type::f32, false>(ctx, dst);
                             }
                             return true;
                         case 512:
                             GGML_SYCL_DEBUG("ggml_sycl: Using XMX KV-split flash attention (512)\n");
                             if (is_f16) {
                                 ggml_sycl_op_flash_attn_coopmat_kvsplit<512, 512, 8, 16, 16, 32, 32,
-                                                                        fattn_input_type::f16, false>(ctx, dst);
+                                                                                 fattn_input_type::f16, false>(ctx, dst);
                             } else {
                                 ggml_sycl_op_flash_attn_coopmat_kvsplit<512, 512, 8, 16, 16, 32, 32,
-                                                                        fattn_input_type::f32, false>(ctx, dst);
+                                                                                 fattn_input_type::f32, false>(ctx, dst);
                             }
                             return true;
                         default:
@@ -991,7 +1051,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
 
                 // Add more MLA combinations here as needed
                 GGML_SYCL_DEBUG("ggml_sycl: XMX MLA not supported for DQK=%ld DV=%ld, falling back\n", actual_d,
-                                actual_dv);
+                                         actual_dv);
             } else if (actual_d == padded_d && actual_dv == padded_dv) {
                 // Native head size - use direct loading kernel (replaces old coopmat)
                 if (direct_disabled_b60) {
@@ -999,25 +1059,29 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                     if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, shmem_bytes)) {
                         GGML_SYCL_DEBUG(
                             "ggml_sycl: XMX repack flash attention rejected (DQK=%ld DV=%ld) - shmem=%zu bytes exceeds "
-                            "device limit\n",
+                                     "device limit\n",
                             actual_d, actual_dv, shmem_bytes);
                         return false;
                     }
                     switch (actual_d) {
                         case 64:
                             GGML_SYCL_DEBUG("ggml_sycl: Using XMX repack flash attention (64)\n");
+                            GGML_SYCL_ITT_FATTN_XMX(64);
                             ggml_sycl_op_flash_attn_coopmat_padded<64, 64, 64, 64>(ctx, dst);
                             return true;
                         case 96:
                             GGML_SYCL_DEBUG("ggml_sycl: Using XMX repack flash attention (96)\n");
+                            GGML_SYCL_ITT_FATTN_XMX(96);
                             ggml_sycl_op_flash_attn_coopmat_padded<96, 96, 96, 96>(ctx, dst);
                             return true;
                         case 128:
                             GGML_SYCL_DEBUG("ggml_sycl: Using XMX repack flash attention (128)\n");
+                            GGML_SYCL_ITT_FATTN_XMX(128);
                             ggml_sycl_op_flash_attn_coopmat_padded<128, 128, 128, 128>(ctx, dst);
                             return true;
                         case 256:
                             GGML_SYCL_DEBUG("ggml_sycl: Using XMX repack flash attention (256)\n");
+                            GGML_SYCL_ITT_FATTN_XMX(256);
                             ggml_sycl_op_flash_attn_coopmat_padded<256, 256, 256, 256>(ctx, dst);
                             return true;
                         default:
@@ -1028,7 +1092,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                 if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, shmem_bytes)) {
                     GGML_SYCL_DEBUG(
                         "ggml_sycl: XMX direct flash attention rejected (DQK=%ld DV=%ld) - shmem=%zu bytes exceeds "
-                        "device limit\n",
+                                 "device limit\n",
                         actual_d, actual_dv, shmem_bytes);
                     return false;
                 }
@@ -1066,33 +1130,39 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                 if (!ggml_sycl_flash_attn_xmx_shmem_ok(device, shmem_bytes)) {
                     GGML_SYCL_DEBUG(
                         "ggml_sycl: XMX padded flash attention rejected (DQK=%ld DV=%ld) - shmem=%zu bytes exceeds "
-                        "device limit\n",
+                                 "device limit\n",
                         actual_d, actual_dv, shmem_bytes);
                     return false;
                 }
                 switch (actual_d) {
                     case 40:
                         GGML_SYCL_DEBUG("ggml_sycl: Using XMX padded flash attention (40)\n");
+                        GGML_SYCL_ITT_FATTN_XMX(40);
                         ggml_sycl_op_flash_attn_coopmat_padded<40, 40, 64, 64>(ctx, dst);
                         return true;
                     case 48:
                         GGML_SYCL_DEBUG("ggml_sycl: Using XMX padded flash attention (48)\n");
+                        GGML_SYCL_ITT_FATTN_XMX(48);
                         ggml_sycl_op_flash_attn_coopmat_padded<48, 48, 64, 64>(ctx, dst);
                         return true;
                     case 56:
                         GGML_SYCL_DEBUG("ggml_sycl: Using XMX padded flash attention (56)\n");
+                        GGML_SYCL_ITT_FATTN_XMX(56);
                         ggml_sycl_op_flash_attn_coopmat_padded<56, 56, 64, 64>(ctx, dst);
                         return true;
                     case 72:
                         GGML_SYCL_DEBUG("ggml_sycl: Using XMX padded flash attention (72)\n");
+                        GGML_SYCL_ITT_FATTN_XMX(72);
                         ggml_sycl_op_flash_attn_coopmat_padded<72, 72, 80, 80>(ctx, dst);
                         return true;
                     case 88:
                         GGML_SYCL_DEBUG("ggml_sycl: Using XMX padded flash attention (88)\n");
+                        GGML_SYCL_ITT_FATTN_XMX(88);
                         ggml_sycl_op_flash_attn_coopmat_padded<88, 88, 96, 96>(ctx, dst);
                         return true;
                     case 104:
                         GGML_SYCL_DEBUG("ggml_sycl: Using XMX padded flash attention (104)\n");
+                        GGML_SYCL_ITT_FATTN_XMX(104);
                         ggml_sycl_op_flash_attn_coopmat_padded<104, 104, 112, 112>(ctx, dst);
                         return true;
                     default:
@@ -1100,11 +1170,12 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                 }
             }
             GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention not supported for head size DQK=%ld DV=%ld, falling back\n",
-                            actual_d, actual_dv);
+                                     actual_d, actual_dv);
         } catch (const std::exception & e) {
             GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention failed: %s, falling back to non-XMX path\n", e.what());
             if (DQK == 576 && DV == 512) {
                 ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
+                xmx_impl = "mkl";
                 return true;
             }
         }
@@ -1112,7 +1183,20 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         return false;
     };
 
+    if (want_timing) {
+        start_time = std::chrono::high_resolution_clock::now();
+    }
     if (try_xmx()) {
+        if (want_timing && !recording_graph) {
+            ctx.stream()->wait();
+        }
+        const double duration_ms =
+            want_timing ?
+                std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - start_time)
+                    .count() :
+                -1.0;
+        ggml_sycl_op_flash_attn_record(ctx, dst, xmx_impl, recording_graph, small_batch, mask != nullptr,
+                                       sinks != nullptr, n_splits, duration_ms);
         return;
     }
 #endif
@@ -1137,19 +1221,45 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                 // Only if mask type is supported (float or half)
                 if (mask == nullptr || mask->type == GGML_TYPE_F32) {
                     GGML_SYCL_DEBUG("ggml_sycl: Using Tiled flash attention (F32 mask) for N=%ld\n", N);
+                    GGML_SYCL_ITT_FATTN_TILED_DYNAMIC();
+                    if (want_timing) {
+                        start_time = std::chrono::high_resolution_clock::now();
+                    }
                     if (is_f16) {
                         ggml_sycl_op_flash_attn_tiled<sycl::half, sycl::half, sycl::half, float>(ctx, dst);
                     } else {
                         ggml_sycl_op_flash_attn_tiled<float, float, float, float>(ctx, dst);
                     }
+                    if (want_timing && !recording_graph) {
+                        ctx.stream()->wait();
+                    }
+                    const double duration_ms = want_timing ? std::chrono::duration<double, std::milli>(
+                                                                 std::chrono::high_resolution_clock::now() - start_time)
+                                                                 .count() :
+                                                             -1.0;
+                    ggml_sycl_op_flash_attn_record(ctx, dst, "tiled", recording_graph, small_batch, mask != nullptr,
+                                                   sinks != nullptr, n_splits, duration_ms);
                     return;
                 } else if (mask->type == GGML_TYPE_F16) {
                     GGML_SYCL_DEBUG("ggml_sycl: Using Tiled flash attention (F16 mask) for N=%ld\n", N);
+                    GGML_SYCL_ITT_FATTN_TILED_DYNAMIC();
+                    if (want_timing) {
+                        start_time = std::chrono::high_resolution_clock::now();
+                    }
                     if (is_f16) {
                         ggml_sycl_op_flash_attn_tiled<sycl::half, sycl::half, sycl::half, sycl::half>(ctx, dst);
                     } else {
                         ggml_sycl_op_flash_attn_tiled<float, float, float, sycl::half>(ctx, dst);
                     }
+                    if (want_timing && !recording_graph) {
+                        ctx.stream()->wait();
+                    }
+                    const double duration_ms = want_timing ? std::chrono::duration<double, std::milli>(
+                                                                 std::chrono::high_resolution_clock::now() - start_time)
+                                                                 .count() :
+                                                             -1.0;
+                    ggml_sycl_op_flash_attn_record(ctx, dst, "tiled", recording_graph, small_batch, mask != nullptr,
+                                                   sinks != nullptr, n_splits, duration_ms);
                     return;
                 }
             }
@@ -1206,17 +1316,56 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
             // Dispatch based on Q data type
             if (Q->type == GGML_TYPE_F16) {
                 GGML_SYCL_DEBUG("ggml_sycl: Using fused flash attention (F16) DQK=%ld DV=%ld\n", DQK, DV);
+                GGML_SYCL_ITT_FATTN_FUSED_DYNAMIC();
+                if (want_timing) {
+                    start_time = std::chrono::high_resolution_clock::now();
+                }
                 dispatch_kv(sycl::half{});
+                if (want_timing && !recording_graph) {
+                    ctx.stream()->wait();
+                }
+                const double duration_ms = want_timing ? std::chrono::duration<double, std::milli>(
+                                                             std::chrono::high_resolution_clock::now() - start_time)
+                                                             .count() :
+                                                         -1.0;
+                ggml_sycl_op_flash_attn_record(ctx, dst, "fused", recording_graph, small_batch, mask != nullptr,
+                                               sinks != nullptr, n_splits, duration_ms);
                 return;
             } else if (Q->type == GGML_TYPE_BF16) {
 #ifdef SYCL_EXT_ONEAPI_BFLOAT16_MATH_FUNCTIONS
                 GGML_SYCL_DEBUG("ggml_sycl: Using fused flash attention (BF16) DQK=%ld DV=%ld\n", DQK, DV);
+                GGML_SYCL_ITT_FATTN_FUSED_DYNAMIC();
+                if (want_timing) {
+                    start_time = std::chrono::high_resolution_clock::now();
+                }
                 dispatch_kv(sycl::ext::oneapi::bfloat16{});
+                if (want_timing && !recording_graph) {
+                    ctx.stream()->wait();
+                }
+                const double duration_ms = want_timing ? std::chrono::duration<double, std::milli>(
+                                                             std::chrono::high_resolution_clock::now() - start_time)
+                                                             .count() :
+                                                         -1.0;
+                ggml_sycl_op_flash_attn_record(ctx, dst, "fused", recording_graph, small_batch, mask != nullptr,
+                                               sinks != nullptr, n_splits, duration_ms);
                 return;
 #endif
             } else if (Q->type == GGML_TYPE_F32) {
                 GGML_SYCL_DEBUG("ggml_sycl: Using fused flash attention (F32) DQK=%ld DV=%ld\n", DQK, DV);
+                GGML_SYCL_ITT_FATTN_FUSED_DYNAMIC();
+                if (want_timing) {
+                    start_time = std::chrono::high_resolution_clock::now();
+                }
                 dispatch_kv(float{});
+                if (want_timing && !recording_graph) {
+                    ctx.stream()->wait();
+                }
+                const double duration_ms = want_timing ? std::chrono::duration<double, std::milli>(
+                                                             std::chrono::high_resolution_clock::now() - start_time)
+                                                             .count() :
+                                                         -1.0;
+                ggml_sycl_op_flash_attn_record(ctx, dst, "fused", recording_graph, small_batch, mask != nullptr,
+                                               sinks != nullptr, n_splits, duration_ms);
                 return;
             }
         }
@@ -1226,62 +1375,315 @@ mkl_fallback:
     // Use oneMKL KV-split path when MKL is available and needed
     // KV-split handles both short and long contexts efficiently (n_splits=1 for short contexts)
     if (sycl_use_mkl || use_mkl_for_sinks || small_batch || mask != nullptr) {
+        GGML_SYCL_ITT_FATTN_MKL_DYNAMIC();
         if (!recording_graph) {
             if (DQK == 576 && DV == 512) {
+                if (want_timing) {
+                    start_time = std::chrono::high_resolution_clock::now();
+                }
                 ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
+                if (want_timing && !recording_graph) {
+                    ctx.stream()->wait();
+                }
+                const double duration_ms = want_timing ? std::chrono::duration<double, std::milli>(
+                                                             std::chrono::high_resolution_clock::now() - start_time)
+                                                             .count() :
+                                                         -1.0;
+                ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch, mask != nullptr,
+                                               sinks != nullptr, n_splits, duration_ms);
                 return;
             }
 
             if (DQK == DV) {
                 switch (DQK) {
                     case 32:
-                        ggml_sycl_op_flash_attn_mkl<32, 32>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<32, 32>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     case 40:
-                        ggml_sycl_op_flash_attn_mkl<40, 40>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<40, 40>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     case 48:
-                        ggml_sycl_op_flash_attn_mkl<48, 48>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<48, 48>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     case 56:
-                        ggml_sycl_op_flash_attn_mkl<56, 56>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<56, 56>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     case 64:
-                        ggml_sycl_op_flash_attn_mkl<64, 64>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<64, 64>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     case 72:
-                        ggml_sycl_op_flash_attn_mkl<72, 72>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<72, 72>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     case 80:
-                        ggml_sycl_op_flash_attn_mkl<80, 80>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<80, 80>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     case 88:
-                        ggml_sycl_op_flash_attn_mkl<88, 88>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<88, 88>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     case 96:
-                        ggml_sycl_op_flash_attn_mkl<96, 96>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<96, 96>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     case 104:
-                        ggml_sycl_op_flash_attn_mkl<104, 104>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<104, 104>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     case 112:
-                        ggml_sycl_op_flash_attn_mkl<112, 112>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<112, 112>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     case 128:
-                        ggml_sycl_op_flash_attn_mkl<128, 128>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<128, 128>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     case 192:
-                        ggml_sycl_op_flash_attn_mkl<192, 192>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<192, 192>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     case 256:
-                        ggml_sycl_op_flash_attn_mkl<256, 256>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<256, 256>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     case 512:
-                        ggml_sycl_op_flash_attn_mkl<512, 512>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<512, 512>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     case 576:
-                        ggml_sycl_op_flash_attn_mkl<576, 576>(ctx, dst);
-                        return;
+                        {
+                            if (want_timing) {
+                                start_time = std::chrono::high_resolution_clock::now();
+                            }
+                            ggml_sycl_op_flash_attn_mkl<576, 576>(ctx, dst);
+                            if (want_timing && !recording_graph) {
+                                ctx.stream()->wait();
+                            }
+                            const double duration_ms = want_timing ?
+                                                           std::chrono::duration<double, std::milli>(
+                                                               std::chrono::high_resolution_clock::now() - start_time)
+                                                               .count() :
+                                                           -1.0;
+                            ggml_sycl_op_flash_attn_record(ctx, dst, "mkl", recording_graph, small_batch,
+                                                           mask != nullptr, sinks != nullptr, n_splits, duration_ms);
+                            return;
+                        }
                     default:
                         GGML_SYCL_DEBUG("ggml_sycl: oneMKL not implemented for head size DQK=%ld DV=%ld\n", DQK, DV);
                         break;
@@ -1292,12 +1694,17 @@ mkl_fallback:
         } else {
             // Recording graph - use Tiled fallback
             GGML_SYCL_DEBUG("ggml_sycl: Using Tiled flash attention (graph fallback) for N=%ld\n", N);
+            if (want_timing) {
+                start_time = std::chrono::high_resolution_clock::now();
+            }
             if (mask == nullptr || mask->type == GGML_TYPE_F32) {
                 if (is_f16) {
                     ggml_sycl_op_flash_attn_tiled<sycl::half, sycl::half, sycl::half, float>(ctx, dst);
                 } else {
                     ggml_sycl_op_flash_attn_tiled<float, float, float, float>(ctx, dst);
                 }
+                ggml_sycl_op_flash_attn_record(ctx, dst, "tiled", recording_graph, small_batch, mask != nullptr,
+                                               sinks != nullptr, n_splits, -1.0);
                 return;
             } else if (mask->type == GGML_TYPE_F16) {
                 if (is_f16) {
@@ -1305,7 +1712,17 @@ mkl_fallback:
                 } else {
                     ggml_sycl_op_flash_attn_tiled<float, float, float, sycl::half>(ctx, dst);
                 }
+                ggml_sycl_op_flash_attn_record(ctx, dst, "tiled", recording_graph, small_batch, mask != nullptr,
+                                               sinks != nullptr, n_splits, -1.0);
                 return;
+            }
+            if (want_timing && !recording_graph) {
+                ctx.stream()->wait();
+                const double duration_ms =
+                    std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - start_time)
+                        .count();
+                ggml_sycl_op_flash_attn_record(ctx, dst, "tiled", recording_graph, small_batch, mask != nullptr,
+                                               sinks != nullptr, n_splits, duration_ms);
             }
         }
 

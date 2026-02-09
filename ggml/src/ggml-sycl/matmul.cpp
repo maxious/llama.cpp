@@ -47,6 +47,7 @@
 #include "ggml-sycl/gemm_tiled.hpp"
 #include "ggml-sycl/gemm_xmx.hpp"
 #include "ggml-sycl/getrows.hpp"
+#include "ggml-sycl/itt_annotations.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/quantize.hpp"
@@ -1219,10 +1220,12 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             }
 
             if (xmx_types) {
+                GGML_SYCL_ITT_MUL_MAT_XMX(f32);
                 ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_xmx);
                 return;
             }
         }
+        GGML_SYCL_ITT_MUL_MAT_TILED(f32);
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_tiled);
         return;
     }
@@ -1311,21 +1314,27 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         // For now, F32 MUL_MAT falls through to oneMKL (graph-incompatible but correct).
     } else if (use_dequantize_mul_mat_vec) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::DMMV);
+        GGML_SYCL_ITT_OP(dmmv);
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);
     } else if (use_mul_mat_vec_q) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
         ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
         if (extra && extra->optimized_feature.reorder) {
+            GGML_SYCL_ITT_OP(mmvq_reorder);
             ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         } else {
+            GGML_SYCL_ITT_OP(mmvq);
             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         }
     } else if (use_mul_mat_q) {
+        GGML_SYCL_ITT_MUL_MAT_MMQ(quantized);
         ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
     } else {
         if (xmx_gemm_available(ctx.stream())) {
+            GGML_SYCL_ITT_MUL_MAT_XMX(f32);
             ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_xmx);
         } else {
+            GGML_SYCL_ITT_MUL_MAT_MKL(f32);
             ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);
         }
     }
@@ -1811,9 +1820,11 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
 
 void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     if (ctx.force_graph_compatible) {
+        GGML_SYCL_ITT_MUL_MAT_ID_TILED(moe);
         ggml_sycl_mul_mat_id_tiled(ctx, dst);
         return;
     }
+    GGML_SYCL_ITT_MUL_MAT_ID_MMQ(moe);
 
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
     const ggml_tensor *  src0 = dst->src[0];
