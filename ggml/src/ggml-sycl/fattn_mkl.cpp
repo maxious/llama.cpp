@@ -281,6 +281,12 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
         partials = ctx.fattn_buffers->get_partials(partials_total * sizeof(float), stream);
     }
 
+    // Ensure partials buffer is valid
+    if (!partials) {
+        fprintf(stderr, "ERROR: partials buffer is null! (size=%ld bytes)\n", partials_total * sizeof(float));
+        std::exit(1);
+    }
+
     // Zero partials buffer to prevent NaN from uninitialized memory
     stream->memset(partials, 0, partials_total * sizeof(float));
 
@@ -292,6 +298,12 @@ void ggml_sycl_op_flash_attn_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * 
 #endif
     {
         S_d = ctx.fattn_buffers->get_S(n_heads * N * N_kv * sizeof(float), stream);
+    }
+
+    // Debug check
+    if (!S_d) {
+        fprintf(stderr, "ERROR: S_d is null! (size=%ld bytes)\n", n_heads * N * N_kv * sizeof(float));
+        std::exit(1);
     }
 
     // Zero S_d buffer to prevent NaN from uninitialized memory
