@@ -40,6 +40,11 @@
   - Same block alignment constraint (BK=32=QK_MXFP4) and dequantization logic as MUL_MAT.
   - Supported weight types in MUL_MAT_ID: F32, F16, BF16, MXFP4.
   - Test: `GGML_SYCL_DISABLE_GRAPH=0 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p "type_a=mxfp4"`
+- SYCL XE2 Q8_0 MMQ Workaround (Feb 2026):
+  - Q8_0 MMQ kernels on Intel XE2 GPUs (Arc Battlemage) cause compiler/driver crashes (segfault in libigc.so) for batch sizes >= 128.
+  - This affects prompt processing in `llama-bench` with `-b 128`.
+  - Fix: Added a specific check in `matmul.cpp` to disable MMQ for Q8_0 on XE2, forcing fallback to oneMKL (or XMX if compatible types) which is stable.
+  - Test: `GGML_SYCL_DEBUG=1 ./build-sycl/bin/llama-bench -m models/koboldcpp/Qwen3-Coder-30B-A3B-Instruct-MXFP4_MOE.gguf -p 128 -n 64 -b 128 -ub 128`
 
 ## SYCL Runtime Architecture Detection
 
@@ -188,7 +193,29 @@ GGML_SYCL_FLASH_ATTN_DEBUG=1 ./build-sycl/bin/llama-completion ...
 
 # General llama.cpp debug
 LLAMA_LOG_LEVEL=debug ./build-sycl/bin/llama-completion ...
+
+### SYCL/IGC Kernel Dump Debugging (Crash Isolation)
+
+When debugging kernel compile crashes (e.g., IGC/Level Zero segfaults), use SYCL + IGC dump variables to capture device images and kernel names.
+
+```bash
+export SYCL_DUMP_IMAGES=1
+export SYCL_CACHE_DIR=/tmp/sycl-dump
+export SYCL_CACHE_TRACE=0x07
+export SYCL_UR_TRACE=-1
+
+export IGC_ShaderDumpEnable=1
+export IGC_DumpToCustomDir=/tmp/igc-dumps
+# Optional: print kernel names during compilation (debug only; invalid binaries)
+# export IGC_CompileOneAtTime=1
+
+# Example repro (adjust model/params):
+./build-sycl/bin/llama-bench ...
 ```
+
+Notes:
+- IGC dumps include `*_cmd.txt`, `*.spv`, `*_codegen.ll`, `*_beforeUnification.ll`, `*_optimized.ll`, `*.asm`, and `*.zeinfo`.
+- `SYCL_DUMP_IMAGES` + `IGC_ShaderDumpEnable` helps narrow which kernel crashes by inspecting the last dumped module.
 
 ### Key Metrics to Watch
 
@@ -483,4 +510,29 @@ The sink represents a virtual token with attention value 0.0 at the end of the K
 - If `sink <= current_max`: simply add `exp(sink - current_max)` to the normalization sum
 
 The implementation matches the CPU reference's logic exactly, just relocated to the split-combination phase (SYCL MKL path) rather than the per-chunk phase (CPU).
+
+## SYCL Flash Attention Performance Fix (Feb 2026)
+
+### Problem
+
+The Fused Flash Attention kernel (`fattn_fused.hpp`) was extremely slow for small batch sizes (N=1) on Intel XE2 GPUs, achieving only ~3.7 t/s compared to ~17.5 t/s with Flash Attention disabled (standard attention). This was due to inefficient workgroup utilization (1/64 thread occupancy) for N=1.
+
+### Solution
+
+Implemented a hybrid dispatch strategy in `ggml/src/ggml-sycl/fattn.cpp`:
+
+1. **Eager Execution (No Graph)**: When `N < 32` (generation phase), fall back to the optimized `oneMKL` Flash Attention implementation (Split-KV). This restores performance to ~14.5 t/s.
+2. **Graph Execution**: When recording a SYCL Graph (where oneMKL is forbidden), fall back to a new **Tiled Flash Attention** implementation (`fattn_tiled.hpp`).
+   - This implementation decomposes Flash Attention into `GEMM` + `Softmax` + `GEMM`.
+   - Uses `gemm_tiled` kernels which are graph-compatible and efficient enough (~15-20 t/s) for N=1.
+3. **Large Batch**: For `N >= 32` (prompt processing), continue to use the Fused Kernel (or XMX), which achieves high throughput (~60 t/s).
+
+### Results (Arc B60)
+
+| Metric | Before Fix | After Fix | vs FA Off |
+|--------|------------|-----------|-----------|
+| Prompt (N=128) | ~59 t/s | ~59 t/s | 3.3x Faster |
+| Gen (N=1) | 3.7 t/s | 14.5 t/s | ~0.85x |
+
+Users now get the best of both worlds: massive speedup for prompt processing and competitive speed for generation.
 

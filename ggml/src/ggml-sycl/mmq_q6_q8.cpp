@@ -1,8 +1,41 @@
 // mmq_q6_q8.cpp - Q6_K and Q8_0 Quantization Launch Functions
 // Split from mmq.cpp refactoring
 
+#include <cstdlib>
+#include <cstring>
+
 #include "mmq_internal.hpp"
 #include "vecdotq.hpp"
+
+enum class q8_0_tile_override : uint8_t {
+    none,
+    rdna1,
+    rdna2,
+    ampere,
+};
+
+static q8_0_tile_override get_q8_0_tile_override() {
+    static q8_0_tile_override override = []() {
+        const char *env = std::getenv("GGML_SYCL_FORCE_MMQ_Q8_0_TILE");
+        if (!env || *env == '\0') {
+            return q8_0_tile_override::none;
+        }
+
+        if (std::strcmp(env, "RDNA1") == 0 || std::strcmp(env, "64x64x8") == 0) {
+            return q8_0_tile_override::rdna1;
+        }
+        if (std::strcmp(env, "RDNA2") == 0 || std::strcmp(env, "64x128x8") == 0) {
+            return q8_0_tile_override::rdna2;
+        }
+        if (std::strcmp(env, "AMPERE") == 0 || std::strcmp(env, "128x64x4") == 0) {
+            return q8_0_tile_override::ampere;
+        }
+
+        return q8_0_tile_override::none;
+    }();
+
+    return override;
+}
 
 // Template for Q8_0
 template<int mmq_x_v, int mmq_y_v, int nwarps_v>
@@ -79,6 +112,29 @@ void ggml_mul_mat_q8_0_q8_1_sycl(const void *vx, const void *vy,
     SYCL_CHECK(CHECK_TRY_ERROR(id = get_current_device_id()));
     const auto& dev_info = ggml_sycl_info().devices[id];
     const auto arch = dev_info.arch;
+
+    const auto tile_override = get_q8_0_tile_override();
+    if (tile_override != q8_0_tile_override::none) {
+        switch (tile_override) {
+            case q8_0_tile_override::rdna1:
+                GGML_SYCL_DEBUG("[SYCL][MMQ] Forcing Q8_0 tile RDNA1 (64x64x8)\n");
+                launch_q8_0<MMQ_X_Q8_0_RDNA1, MMQ_Y_Q8_0_RDNA1, NWARPS_Q8_0_RDNA1>(
+                    vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, stream);
+                return;
+            case q8_0_tile_override::rdna2:
+                GGML_SYCL_DEBUG("[SYCL][MMQ] Forcing Q8_0 tile RDNA2 (64x128x8)\n");
+                launch_q8_0<MMQ_X_Q8_0_RDNA2, MMQ_Y_Q8_0_RDNA2, NWARPS_Q8_0_RDNA2>(
+                    vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, stream);
+                return;
+            case q8_0_tile_override::ampere:
+                GGML_SYCL_DEBUG("[SYCL][MMQ] Forcing Q8_0 tile AMPERE (128x64x4)\n");
+                launch_q8_0<MMQ_X_Q8_0_AMPERE, MMQ_Y_Q8_0_AMPERE, NWARPS_Q8_0_AMPERE>(
+                    vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, stream);
+                return;
+            case q8_0_tile_override::none:
+                break;
+        }
+    }
 
     switch (arch) {
         case SYCL_ARCH_INTEL_XE2:
