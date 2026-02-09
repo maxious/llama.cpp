@@ -128,6 +128,10 @@ if(GGML_SYCL_DNN)
 else()
     message(STATUS "oneDNN support disabled by the user")
 endif()
+# Ensure oneDNN headers are found if DNNL is enabled
+if(GGML_SYCL_DNNL)
+    target_include_directories(ggml-sycl PRIVATE /opt/intel/oneapi/dnnl/2025.3/include)
+endif()
 target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_DNNL=${GGML_SYCL_DNNL})
 
 if (GGML_SYCL_F16)
