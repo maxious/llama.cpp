@@ -189,6 +189,51 @@ GGML_SYCL_FLASH_ATTN_DEBUG=1 ./build-sycl/bin/llama-completion ...
 LLAMA_LOG_LEVEL=debug ./build-sycl/bin/llama-completion ...
 ```
 
+### ITT Annotations (VTune Semantic Markers)
+
+The SYCL backend includes ITT (Instrumentation and Tracing Technology) annotations for detailed profiling in Intel VTune and similar tools. These annotations mark semantic regions like "which Flash Attention variant is running" directly in the timeline.
+
+**Enable ITT annotations:**
+
+```bash
+# Runtime enable (no rebuild needed)
+export INTEL_ENABLE_OFFLOAD_ANNOTATIONS=1
+
+# Or build with explicit enable
+cmake -DGGML_SYCL_ITT_ANNOTATIONS=1 ...
+```
+
+**Profile with VTune:**
+
+```bash
+source /opt/intel/oneapi/setvars.sh intel64
+
+# Basic GPU hotspots with ITT regions
+vtune -collect gpu-hotspots ./build-sycl/bin/llama-bench -m model.gguf -p 128 -n 64
+
+# Or use the Advisor for roofline analysis
+advisor --collect=roofline -- ./build-sycl/bin/llama-bench -m model.gguf
+```
+
+**What you'll see in VTune:**
+
+| ITT Region | Description |
+|------------|-------------|
+| `fattn:xmx:h64` | XMX Flash Attention (head size 64) |
+| `fattn:xmx:h128` | XMX Flash Attention (head size 128) |
+| `fattn:fused` | Fused single-kernel Flash Attention |
+| `fattn:tiled` | Tiled Flash Attention (graph-compatible) |
+| `fattn:mkl` | oneMKL Flash Attention fallback |
+| `mul_mat:mmq:quantized` | MMQ quantized matrix multiplication |
+| `mul_mat:xmx:f32` | XMX GEMM (F32) |
+| `mul_mat:mkl:f32` | oneMKL BLAS GEMM |
+| `mul_mat_id:tiled:moe` | MoE MUL_MAT_ID with tiled kernels |
+| `mul_mat_id:mmq:moe` | MoE MUL_MAT_ID with MMQ |
+| `op:dmmv` | Dequantize + mul_mat_vec |
+| `op:mmvq` | Vector quantized matmul |
+
+**Implementation location:** `ggml/src/ggml-sycl/itt_annotations.hpp`
+
 ### SYCL/IGC Kernel Dump Debugging (Crash Isolation)
 
 When debugging kernel compile crashes (e.g., IGC/Level Zero segfaults), use SYCL + IGC dump variables to capture device images and kernel names.
