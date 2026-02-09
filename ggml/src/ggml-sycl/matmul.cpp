@@ -1420,7 +1420,7 @@ static void k_scan_experts(
 
 static void k_pack_experts(
     const char * __restrict__ src1_original,
-    char * __restrict__ src1_packed,
+    float * __restrict__ src1_packed,
     mmid_row_mapping * __restrict__ dst_mapping,
     const char * __restrict__ ids,
     const int * __restrict__ expert_offsets,
@@ -1429,35 +1429,78 @@ static void k_pack_experts(
     size_t ids_nb0, size_t ids_nb1,
     int64_t ne10, int64_t ne11,
     size_t nb11, size_t nb12,
-    sycl::nd_item<1> item) {
+    sycl::nd_item<2> item) {
 
-    int global_id = item.get_global_id(0);
-    int total_rows = n_ids * n_batches;
-    if (global_id >= total_rows) return;
+    const int global_row = item.get_global_id(0);
+    const int global_col = item.get_global_id(1);
+    const int total_rows = n_ids * n_batches;
+    if (global_row >= total_rows || global_col >= ne10) return;
 
-    int id = global_id % n_ids;
-    int iid1 = global_id / n_ids;
+    const int id = global_row % n_ids;
+    const int iid1 = global_row / n_ids;
 
     const int32_t expert_id = *(const int32_t *) (ids + iid1*ids_nb1 + id*ids_nb0);
-    
+
     // Bounds check
     if (expert_id < 0 || expert_id >= n_experts) return;
-    
-    const int row_idx_in_expert = row_dst_index[global_id];
+
+    const int row_idx_in_expert = row_dst_index[global_row];
     if (row_idx_in_expert < 0) return; // Was marked invalid
 
     const int dst_idx = expert_offsets[expert_id] + row_idx_in_expert;
 
-    dst_mapping[dst_idx] = {id, iid1};
+    if (global_col == 0) {
+        dst_mapping[dst_idx] = {id, iid1};
+    }
 
     const int64_t i11 = id % ne11;
     const int64_t i12 = iid1;
     const float * src_ptr = (const float *)(src1_original + i11*nb11 + i12*nb12);
-    float * dst_ptr = (float *)(src1_packed) + dst_idx * ne10;
+    float * dst_ptr = src1_packed + dst_idx * ne10;
 
-    for (int i = 0; i < ne10; ++i) {
-        dst_ptr[i] = src_ptr[i];
+    dst_ptr[global_col] = src_ptr[global_col];
+}
+
+static void k_pack_experts_f16(
+    const char * __restrict__ src1_original,
+    sycl::half * __restrict__ src1_packed,
+    mmid_row_mapping * __restrict__ dst_mapping,
+    const char * __restrict__ ids,
+    const int * __restrict__ expert_offsets,
+    const int * __restrict__ row_dst_index,
+    int n_ids, int n_batches, int n_experts,
+    size_t ids_nb0, size_t ids_nb1,
+    int64_t ne10, int64_t ne11,
+    size_t nb11, size_t nb12,
+    sycl::nd_item<2> item) {
+
+    const int global_row = item.get_global_id(0);
+    const int global_col = item.get_global_id(1);
+    const int total_rows = n_ids * n_batches;
+    if (global_row >= total_rows || global_col >= ne10) return;
+
+    const int id = global_row % n_ids;
+    const int iid1 = global_row / n_ids;
+
+    const int32_t expert_id = *(const int32_t *) (ids + iid1*ids_nb1 + id*ids_nb0);
+
+    if (expert_id < 0 || expert_id >= n_experts) return;
+
+    const int row_idx_in_expert = row_dst_index[global_row];
+    if (row_idx_in_expert < 0) return;
+
+    const int dst_idx = expert_offsets[expert_id] + row_idx_in_expert;
+
+    if (global_col == 0) {
+        dst_mapping[dst_idx] = {id, iid1};
     }
+
+    const int64_t i11 = id % ne11;
+    const int64_t i12 = iid1;
+    const float * src_ptr = (const float *)(src1_original + i11*nb11 + i12*nb12);
+    sycl::half * dst_ptr = src1_packed + dst_idx * ne10;
+
+    dst_ptr[global_col] = static_cast<sycl::half>(src_ptr[global_col]);
 }
 
 static void k_unpack_experts(
@@ -1468,25 +1511,24 @@ static void k_unpack_experts(
     size_t nb1, size_t nb2,
     int64_t row_low, int64_t row_high, // device row range [row_low, row_high)
     int total_rows,
-    sycl::nd_item<1> item) {
+    sycl::nd_item<2> item) {
 
-    int i = item.get_global_id(0);
-    if (i >= total_rows) return;
+    const int row = item.get_global_id(0);
+    const int col = item.get_global_id(1);
+    if (row >= total_rows || col >= ne0) return;
 
-    const int32_t i1 = row_mapping[i].i1;
-    const int32_t i2 = row_mapping[i].i2;
+    const int32_t i1 = row_mapping[row].i1;
+    const int32_t i2 = row_mapping[row].i2;
 
     // Skip rows not belonging to this device's split
     if (i1 < row_low || i1 >= row_high) {
         return;
     }
 
-    const float * src_ptr = (const float *)(dst_packed) + i * ne0;
+    const float * src_ptr = (const float *)(dst_packed) + row * ne0;
     float * dst_ptr = (float *)(dst_original + i1*nb1 + i2*nb2);
 
-    for (int j = 0; j < ne0; ++j) {
-        dst_ptr[j] = src_ptr[j];
-    }
+    dst_ptr[col] = src_ptr[col];
 }
 
 static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
@@ -1553,8 +1595,15 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
     ggml_sycl_pool_alloc<int> dev_row_dst_index(ctx.pool(), total_rows);
     
     // 2. Packed buffers
-    // src1 is broadcast/shared, so it's full size
-    ggml_sycl_pool_alloc<char> dev_src1_packed(ctx.pool(), sizeof(float) * total_rows * ne10);
+    // src1 is broadcast/shared, so it's full size. Use F16 pack only for MXFP4 path.
+    const bool use_f16_pack = (src0->type == GGML_TYPE_MXFP4);
+    ggml_sycl_pool_alloc<float> dev_src1_packed_f32(ctx.pool());
+    ggml_sycl_pool_alloc<sycl::half> dev_src1_packed_f16(ctx.pool());
+    if (use_f16_pack) {
+        dev_src1_packed_f16.alloc(total_rows * ne10);
+    } else {
+        dev_src1_packed_f32.alloc(total_rows * ne10);
+    }
     // dst is split if N is split. We compute [N_local, total_rows].
     // dev_dst_packed stores the partial result for this device.
     ggml_sycl_pool_alloc<char> dev_dst_packed(ctx.pool(), sizeof(float) * total_rows * N_local);
@@ -1593,7 +1642,8 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
     // Launch Pack
     stream->submit([&](sycl::handler &cgh) {
         const char * src1_data = (const char *)src1->data;
-        char * packed_data = dev_src1_packed.get();
+        float * packed_data_f32 = dev_src1_packed_f32.get();
+        sycl::half * packed_data_f16 = dev_src1_packed_f16.get();
         mmid_row_mapping * map_data = dev_dst_mapping.get();
         const char * ids_data = (const char *)ids->data;
         int * offsets_ptr = dev_expert_offsets.get();
@@ -1604,11 +1654,21 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
         size_t src_nb11 = src1->nb[1];
         size_t src_nb12 = src1->nb[2];
 
-        size_t global_range = ((total_rows + 255) / 256) * 256;
-        cgh.parallel_for(sycl::nd_range<1>(global_range, 256), [=](sycl::nd_item<1> item) {
-             k_pack_experts(src1_data, packed_data, map_data, ids_data, offsets_ptr, row_index_ptr,
-                            n_ids, n_batches, n_experts, nb0, nb1, ne10, ne11, src_nb11, src_nb12, item);
-        });
+        constexpr int wg_cols = 128;
+        const size_t global_rows = total_rows;
+        const size_t global_cols = ((ne10 + wg_cols - 1) / wg_cols) * wg_cols;
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(global_rows, global_cols), sycl::range<2>(1, wg_cols)),
+            [=](sycl::nd_item<2> item) {
+                if (use_f16_pack) {
+                    k_pack_experts_f16(src1_data, packed_data_f16, map_data, ids_data, offsets_ptr, row_index_ptr,
+                                       n_ids, n_batches, n_experts, nb0, nb1, ne10, ne11, src_nb11, src_nb12, item);
+                } else {
+                    k_pack_experts(src1_data, packed_data_f32, map_data, ids_data, offsets_ptr, row_index_ptr,
+                                   n_ids, n_batches, n_experts, nb0, nb1, ne10, ne11, src_nb11, src_nb12, item);
+                }
+            }
+        );
     });
 
     // Adjust stride for weights: if split, each expert is smaller [K, N_local]
@@ -1641,14 +1701,15 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
     }
 
     const float * src0_base = (const float *)src0->data;
-    const float * src1_packed = (const float *)dev_src1_packed.get();
+    const float * src1_packed_f32 = dev_src1_packed_f32.get();
+    const sycl::half * src1_packed_f16 = dev_src1_packed_f16.get();
     float * dst_packed = (float *)dev_dst_packed.get();
     
     for (int i = 0; i < n_experts; ++i) {
         if (src0->type == GGML_TYPE_F16) {
              const sycl::half * weights = (const sycl::half *)((const char *)src0_base + i * expert_stride);
              launch_gemm_tiled_indirect_f32_f16(stream,
-                src1_packed,
+                src1_packed_f32,
                 weights,
                 dst_packed,
                 dev_expert_counts.get() + i,
@@ -1661,7 +1722,7 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
         } else if (src0->type == GGML_TYPE_BF16) {
              const sycl::ext::oneapi::bfloat16 * weights = (const sycl::ext::oneapi::bfloat16 *)((const char *)src0_base + i * expert_stride);
              launch_gemm_tiled_indirect_f32_bf16(stream,
-                src1_packed,
+                src1_packed_f32,
                 weights,
                 dst_packed,
                 dev_expert_counts.get() + i,
@@ -1672,11 +1733,11 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
                 K, K, N_local
             );
         } else if (src0->type == GGML_TYPE_MXFP4) {
-             // MXFP4 weights with fused dequantization
+             // MXFP4 weights with fused dequantization + F16 activations
              // ldb = K (the full K dimension, used for block indexing: K/32 blocks per row)
              const block_mxfp4 * weights = (const block_mxfp4 *)((const char *)src0_base + i * expert_stride);
-             launch_gemm_tiled_indirect_mxfp4(stream,
-                src1_packed,
+             launch_gemm_tiled_indirect_mxfp4_f16(stream,
+                src1_packed_f16,
                 weights,
                 dst_packed,
                 dev_expert_counts.get() + i,
@@ -1689,7 +1750,7 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
         } else {
              const float * weights = (const float *)((const char *)src0_base + i * expert_stride);
              launch_gemm_tiled_indirect(stream,
-                src1_packed,
+                src1_packed_f32,
                 weights,
                 dst_packed,
                 dev_expert_counts.get() + i,
@@ -1709,14 +1770,19 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
         // int64_t dst_ne0 = dst->ne[0]; // unused
         size_t dst_nb1 = dst->nb[1];
         size_t dst_nb2 = dst->nb[2];
-        
+
         int64_t low = row_low;
         int64_t high = row_high;
 
-        size_t global_range = ((total_rows + 255) / 256) * 256;
-        cgh.parallel_for(sycl::nd_range<1>(global_range, 256), [=](sycl::nd_item<1> item) {
-             k_unpack_experts(dst_data, packed_data, map_data, N_local, dst_nb1, dst_nb2, low, high, total_rows, item);
-        });
+        constexpr int wg_cols = 128;
+        const size_t global_rows = total_rows;
+        const size_t global_cols = ((N_local + wg_cols - 1) / wg_cols) * wg_cols;
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(global_rows, global_cols), sycl::range<2>(1, wg_cols)),
+            [=](sycl::nd_item<2> item) {
+                k_unpack_experts(dst_data, packed_data, map_data, N_local, dst_nb1, dst_nb2, low, high, total_rows, item);
+            }
+        );
     });
 }
 
