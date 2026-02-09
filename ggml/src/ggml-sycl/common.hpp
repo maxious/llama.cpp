@@ -29,6 +29,8 @@
 #    include "dnnl_sycl.hpp"
 #endif
 
+#include "flash_attn_buffers.hpp"
+
 #define GGML_COMMON_DECL_SYCL
 #define GGML_COMMON_IMPL_SYCL
 /* suppress warning spam */
@@ -383,6 +385,9 @@ struct ggml_backend_sycl_context {
     // pool
     std::unique_ptr<ggml_sycl_pool>                                                   pools[GGML_SYCL_MAX_DEVICES];
     std::unordered_map<sycl::queue *, std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>>> scratchpad_map;
+
+    // Flash Attention buffer pool - preallocated to avoid malloc/free overhead per call
+    std::unique_ptr<flash_attn_buffers> fattn_buffers;
 
     std::unique_ptr<ggml_sycl_pool> host_pools[GGML_SYCL_MAX_DEVICES];
 
