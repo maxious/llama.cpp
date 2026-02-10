@@ -123,7 +123,7 @@ CMAKE_OPTS=(
     -DCMAKE_C_COMPILER=/opt/intel/oneapi/compiler/2025.3/bin/icx
     -DCMAKE_CXX_COMPILER=/opt/intel/oneapi/compiler/2025.3/bin/icpx
     -DLLAMA_CURL=OFF
-    -DGGML_SYCL_DNN=OFF
+    -DGGML_SYCL_DNN=ON
     -DMKL_SYCL_THREADING=intel_thread
     -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
 )
