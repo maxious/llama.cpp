@@ -20,13 +20,14 @@ If you see these lines, then the GPU is being used.
 llama accepts a `-t N` (or `--threads N`) parameter. It's extremely important that this parameter is not too large. If your token generation is extremely slow, try setting this number to 1. If this significantly improves your token generation speed, then your CPU is being oversaturated and you need to explicitly set this parameter to the number of the physical CPU cores on your machine (even if you utilize a GPU). If in doubt, start with 1 and double the amount until you hit a performance bottleneck, then scale the number down.
 
 ## Optional: backend sampling (experimental)
-Backend sampling can reduce device-to-host traffic by sampling tokens on the device instead of reading back full logits. Enable it with `--backend-sampling` (or `LLAMA_ARG_BACKEND_SAMPLING=1`). This is still experimental and may fall back to CPU samplers when a backend lacks required ops.
+Backend sampling can reduce device-to-host traffic by sampling tokens on the device instead of reading back full logits. Enable it with `--backend-sampling` (or `LLAMA_ARG_BACKEND_SAMPLING=1`). This is still experimental: if the backend lacks support for any sampler in your chain, the entire chain falls back to CPU sampling. Sampling is never silently downgraded to greedy (argmax) selection.
 
 Notes:
 - Not compatible with grammar sampling (it is disabled automatically when a grammar is provided).
 - Only supports a single output token per sequence.
 - Backend support varies by op. Commonly used ops include `argmax`, `top_k`, `argsort`, `soft_max`, `cumsum`, `step`, and `log`.
 - SYCL currently lacks `cumsum`, so samplers that rely on it (for example `dist` and `top_p`) fall back to CPU sampling.
+- If your sampling chain contains unsupported ops, the entire chain falls back to CPU sampling. The backend will not silently ignore samplers and fall back to greedy (argmax) sampling.
 
 # Example of runtime flags effect on inference speed benchmark
 These runs were tested on the following machine:
