@@ -733,7 +733,7 @@ static void llama_sampler_chain_backend_accept(
 
     for (auto & smpl : chain->samplers) {
         if (!smpl.is_backend) {
-            break;
+            continue;
         }
 
         if (smpl.ptr->iface->backend_accept) {
@@ -751,14 +751,25 @@ static void llama_sampler_chain_backend_apply(
 
     GGML_ASSERT(chain->is_init && "llama_sampler_chain_backend_init() not called");
 
+    ggml_tensor * input_logits = data->logits;
+
     for (auto & smpl : chain->samplers) {
         if (!smpl.is_backend) {
-            break;
+            continue;
         }
 
         if (smpl.ptr->iface->backend_apply) {
             smpl.ptr->iface->backend_apply(smpl.ptr, ctx, gf, data);
         }
+    }
+
+    if (data->sampled == nullptr && data->logits != nullptr) {
+        data->sampled = ggml_argmax(ctx, data->logits);
+        ggml_set_name(data->sampled, "backend_sampled_argmax");
+    }
+
+    if (data->sampled != nullptr && data->logits == input_logits) {
+        data->logits = nullptr;
     }
 }
 
@@ -767,7 +778,7 @@ static void llama_sampler_chain_backend_set_input(struct llama_sampler * smpl) {
 
     for (auto & smpl : chain->samplers) {
         if (!smpl.is_backend) {
-            break;
+            continue;
         }
 
         if (smpl.ptr->iface->backend_set_input) {

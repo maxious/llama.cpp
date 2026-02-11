@@ -449,6 +449,18 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t      backend,
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
+    static bool tensor_trace_checked = false;
+    static bool tensor_trace_enabled = false;
+    if (!tensor_trace_checked) {
+        const char * env = getenv("GGML_SYCL_TENSOR_TRACE");
+        tensor_trace_enabled = env != nullptr && strcmp(env, "1") == 0;
+        tensor_trace_checked = true;
+    }
+    if (tensor_trace_enabled) {
+        GGML_LOG_INFO("[SYCL][tensor-get] name=%s type=%s size=%zu offset=%zu nbytes=%zu ne=[%ld,%ld,%ld,%ld]\n",
+                      tensor->name, ggml_type_name(tensor->type), size, offset, ggml_nbytes(tensor), tensor->ne[0],
+                      tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+    }
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
     ggml_backend_buffer_t       buf      = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 

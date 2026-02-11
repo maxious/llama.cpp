@@ -162,6 +162,13 @@ source /opt/intel/oneapi/setvars.sh intel64
 cat profile.log
 ```
 
+### Notes from Recent Profiling
+
+- `onetrace` worked reliably for `test-backend-ops` and produced a useful kernel timing summary.
+- `unitrace` timed out on `test-backend-ops` (no output after ~5 minutes).
+- `oneprof` reported `No metrics found`, so it could not generate reports on this system.
+- VTune `gpu-hotspots` failed with "analysis type is not applicable" on this machine.
+
 ### Profiling with unitrace (Chrome Timeline)
 
 ```bash
@@ -256,3 +263,15 @@ export IGC_DumpToCustomDir=/tmp/igc-dumps
 Notes:
 - IGC dumps include `*_cmd.txt`, `*.spv`, `*_codegen.ll`, `*_beforeUnification.ll`, `*_optimized.ll`, `*.asm`, and `*.zeinfo`.
 - `SYCL_DUMP_IMAGES` + `IGC_ShaderDumpEnable` helps narrow which kernel crashes by inspecting the last dumped module.
+
+How To Use
+
+Set GGML_SYCL_OP_STATS=1 to get counts per implementation/shape/type.
+Set GGML_SYCL_OP_STATS_TIMING=1 to also include rough wall-clock timing (adds stream synchronization, so it can slow down execution).
+The summary prints when the SYCL backend is destroyed (process exit or backend teardown).
+
+What The Summary Includes
+
+Implementation label: xmx, fused, tiled, mkl.
+Parameters: dqk, dv, n, n_kv, heads, kv_heads, q/kv/out types, mask type, sinks, n_splits, graph vs eager, small batch.
+Counters and (optionally) timing totals/avg/min/max.
