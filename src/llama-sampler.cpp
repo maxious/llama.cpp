@@ -753,6 +753,14 @@ static void llama_sampler_chain_backend_apply(
 
     ggml_tensor * input_logits = data->logits;
 
+    size_t n_samplers = chain->samplers.size();
+    size_t n_backend  = 0;
+    for (auto & smpl : chain->samplers) {
+        if (smpl.is_backend) {
+            n_backend++;
+        }
+    }
+
     for (auto & smpl : chain->samplers) {
         if (!smpl.is_backend) {
             continue;
@@ -763,7 +771,12 @@ static void llama_sampler_chain_backend_apply(
         }
     }
 
-    if (data->sampled == nullptr && data->logits != nullptr) {
+    // Only fall back to argmax if ALL samplers in the chain were processed on the backend.
+    // If there's a mix (some backend, some CPU), let the CPU handle sampling to avoid
+    // silently ignoring configured samplers like penalties/temperature/top-p.
+    bool all_backend = (n_samplers > 0 && n_backend == n_samplers);
+
+    if (all_backend && data->sampled == nullptr && data->logits != nullptr) {
         data->sampled = ggml_argmax(ctx, data->logits);
         ggml_set_name(data->sampled, "backend_sampled_argmax");
     }
