@@ -34,7 +34,7 @@ static void launch_q5_0(const void *vx, const void *vy, float *dst,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1) {
-                    mul_mat_q5_0<need_check>(
+                    mul_mat_q5_0<mmq_x_v, mmq_y_v, nwarps_v, need_check>(
                         vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
                         nrows_dst, item_ct1,
                         get_pointer(tile_x_ql_q5_0_acc_ct1),
@@ -58,7 +58,7 @@ static void launch_q5_0(const void *vx, const void *vy, float *dst,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1) {
-                    mul_mat_q5_0<need_check>(
+                    mul_mat_q5_0<mmq_x_v, mmq_y_v, nwarps_v, need_check>(
                         vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
                         nrows_dst, item_ct1,
                         get_pointer(tile_x_ql_q5_0_acc_ct1),
@@ -144,7 +144,7 @@ static void launch_q5_1(const void *vx, const void *vy, float *dst,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1) {
-                    mul_mat_q5_1<need_check>(
+                    mul_mat_q5_1<mmq_x_v, mmq_y_v, nwarps_v, need_check>(
                         vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
                         nrows_dst, item_ct1,
                         get_pointer(tile_x_ql_q5_1_acc_ct1),
@@ -168,7 +168,7 @@ static void launch_q5_1(const void *vx, const void *vy, float *dst,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1) {
-                    mul_mat_q5_1<need_check>(
+                    mul_mat_q5_1<mmq_x_v, mmq_y_v, nwarps_v, need_check>(
                         vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
                         nrows_dst, item_ct1,
                         get_pointer(tile_x_ql_q5_1_acc_ct1),
@@ -256,7 +256,7 @@ static void launch_q5_K(const void *vx, const void *vy, float *dst,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1) {
-                    mul_mat_q5_K<need_check>(
+                    mul_mat_q5_K<mmq_x_v, mmq_y_v, nwarps_v, need_check>(
                         vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
                         nrows_dst, item_ct1,
                         get_pointer(tile_x_ql_q5_K_acc_ct1),
@@ -283,7 +283,7 @@ static void launch_q5_K(const void *vx, const void *vy, float *dst,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1) {
-                    mul_mat_q5_K<need_check>(
+                    mul_mat_q5_K<mmq_x_v, mmq_y_v, nwarps_v, need_check>(
                         vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
                         nrows_dst, item_ct1,
                         get_pointer(tile_x_ql_q5_K_acc_ct1),

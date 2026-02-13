@@ -36,7 +36,7 @@ static void launch_q2_K(const void *vx, const void *vy, float *dst,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1) {
-                    mul_mat_q2_K<need_check>(
+                    mul_mat_q2_K<mmq_x_v, mmq_y_v, nwarps_v, need_check>(
                         vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
                         nrows_dst, item_ct1,
                         get_pointer(tile_x_ql_q2_K_acc_ct1),
@@ -63,7 +63,7 @@ static void launch_q2_K(const void *vx, const void *vy, float *dst,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1) {
-                    mul_mat_q2_K<need_check>(
+                    mul_mat_q2_K<mmq_x_v, mmq_y_v, nwarps_v, need_check>(
                         vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
                         nrows_dst, item_ct1,
                         get_pointer(tile_x_ql_q2_K_acc_ct1),
@@ -154,7 +154,7 @@ static void launch_q3_K(const void *vx, const void *vy, float *dst,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1) {
-                    mul_mat_q3_K<need_check>(
+                    mul_mat_q3_K<mmq_x_v, mmq_y_v, nwarps_v, need_check>(
                         vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
                         nrows_dst, item_ct1,
                         get_pointer(tile_x_ql_q3_K_acc_ct1),
@@ -184,7 +184,7 @@ static void launch_q3_K(const void *vx, const void *vy, float *dst,
             cgh.parallel_for(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1) {
-                    mul_mat_q3_K<need_check>(
+                    mul_mat_q3_K<mmq_x_v, mmq_y_v, nwarps_v, need_check>(
                         vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
                         nrows_dst, item_ct1,
                         get_pointer(tile_x_ql_q3_K_acc_ct1),

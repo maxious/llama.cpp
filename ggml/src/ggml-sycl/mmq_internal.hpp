@@ -1466,7 +1466,7 @@ static __dpct_inline__ void mul_mat_q(const void * __restrict__ vx,
 #define MMQ_Y_Q4_0_PASCAL  64
 #define NWARPS_Q4_0_PASCAL 8
 
-template <bool need_check>
+template <int mmq_x_v, int mmq_y_v, int nwarps_v, bool need_check>
 static void mul_mat_q4_0(const void * __restrict__ vx,
                          const void * __restrict__ vy,
                          float * __restrict__ dst,
@@ -1485,11 +1485,9 @@ static void mul_mat_q4_0(const void * __restrict__ vx,
     int *         tile_x_qh = nullptr;
     int *         tile_x_sc = nullptr;
 
-    //sycl_todo: change according to hardware
-
-    const int mmq_x  = MMQ_X_Q4_0_AMPERE;
-    const int mmq_y  = MMQ_Y_Q4_0_AMPERE;
-    const int nwarps = NWARPS_Q4_0_AMPERE;
+    constexpr int mmq_x  = mmq_x_v;
+    constexpr int mmq_y  = mmq_y_v;
+    constexpr int nwarps = nwarps_v;
     allocate_tiles_q4_0<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc, tile_x_qs_q4_0, tile_x_d_q4_0);
     mul_mat_q<QK4_0, QR4_0, QI4_0, true, block_q4_0, mmq_x, mmq_y, nwarps, load_tiles_q4_0<mmq_y, nwarps, need_check>,
               VDR_Q4_0_Q8_1_MMQ, vec_dot_q4_0_q8_1_mul_mat>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
@@ -1514,7 +1512,7 @@ static void mul_mat_q4_0(const void * __restrict__ vx,
 #define MMQ_Y_Q4_1_PASCAL  64
 #define NWARPS_Q4_1_PASCAL 8
 
-template <bool need_check>
+template <int mmq_x_v, int mmq_y_v, int nwarps_v, bool need_check>
 static void mul_mat_q4_1(const void * __restrict__ vx,
                          const void * __restrict__ vy,
                          float * __restrict__ dst,
@@ -1533,10 +1531,9 @@ static void mul_mat_q4_1(const void * __restrict__ vx,
     int *         tile_x_qh = nullptr;
     int *         tile_x_sc = nullptr;
 
-    //sycl_todo: change according to hardware
-    const int mmq_x  = MMQ_X_Q4_1_AMPERE;
-    const int mmq_y  = MMQ_Y_Q4_1_AMPERE;
-    const int nwarps = NWARPS_Q4_1_AMPERE;
+    constexpr int mmq_x  = mmq_x_v;
+    constexpr int mmq_y  = mmq_y_v;
+    constexpr int nwarps = nwarps_v;
     allocate_tiles_q4_1<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc, tile_x_qs_q4_1, tile_x_dm_q4_1);
     mul_mat_q<QK4_1, QR4_1, QI4_1, true, block_q4_1, mmq_x, mmq_y, nwarps, load_tiles_q4_1<mmq_y, nwarps, need_check>,
               VDR_Q4_1_Q8_1_MMQ, vec_dot_q4_1_q8_1_mul_mat>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
@@ -1561,7 +1558,7 @@ static void mul_mat_q4_1(const void * __restrict__ vx,
 #define MMQ_Y_Q5_0_PASCAL  64
 #define NWARPS_Q5_0_PASCAL 8
 
-template <bool need_check>
+template <int mmq_x_v, int mmq_y_v, int nwarps_v, bool need_check>
 static void mul_mat_q5_0(const void * __restrict__ vx,
                          const void * __restrict__ vy,
                          float * __restrict__ dst,
@@ -1580,10 +1577,9 @@ static void mul_mat_q5_0(const void * __restrict__ vx,
     int *         tile_x_qh = nullptr;
     int *         tile_x_sc = nullptr;
 
-    //sycl_todo: change according to hardware
-    const int mmq_x  = MMQ_X_Q5_0_AMPERE;
-    const int mmq_y  = MMQ_Y_Q5_0_AMPERE;
-    const int nwarps = NWARPS_Q5_0_AMPERE;
+    constexpr int mmq_x  = mmq_x_v;
+    constexpr int mmq_y  = mmq_y_v;
+    constexpr int nwarps = nwarps_v;
     allocate_tiles_q5_0<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc, tile_x_ql_q5_0, tile_x_d_q5_0);
     mul_mat_q<QK5_0, QR5_0, QI5_0, false, block_q5_0, mmq_x, mmq_y, nwarps, load_tiles_q5_0<mmq_y, nwarps, need_check>,
               VDR_Q5_0_Q8_1_MMQ, vec_dot_q5_0_q8_1_mul_mat>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
@@ -1608,7 +1604,7 @@ static void mul_mat_q5_0(const void * __restrict__ vx,
 #define MMQ_Y_Q5_1_PASCAL  64
 #define NWARPS_Q5_1_PASCAL 8
 
-template <bool need_check>
+template <int mmq_x_v, int mmq_y_v, int nwarps_v, bool need_check>
 static void mul_mat_q5_1(const void * __restrict__ vx,
                          const void * __restrict__ vy,
                          float * __restrict__ dst,
@@ -1627,10 +1623,9 @@ static void mul_mat_q5_1(const void * __restrict__ vx,
     int *         tile_x_qh = nullptr;
     int *         tile_x_sc = nullptr;
 
-    //sycl_todo: change according to hardware
-    const int mmq_x  = MMQ_X_Q5_1_AMPERE;
-    const int mmq_y  = MMQ_Y_Q5_1_AMPERE;
-    const int nwarps = NWARPS_Q5_1_AMPERE;
+    constexpr int mmq_x  = mmq_x_v;
+    constexpr int mmq_y  = mmq_y_v;
+    constexpr int nwarps = nwarps_v;
     allocate_tiles_q5_1<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc, tile_x_ql_q5_1, tile_x_dm_q5_1);
     mul_mat_q<QK5_1, QR5_1, QI5_1, true, block_q5_1, mmq_x, mmq_y, nwarps, load_tiles_q5_1<mmq_y, nwarps, need_check>,
               VDR_Q5_1_Q8_1_MMQ, vec_dot_q5_1_q8_1_mul_mat>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
@@ -1655,7 +1650,7 @@ static void mul_mat_q5_1(const void * __restrict__ vx,
 #define MMQ_Y_Q8_0_PASCAL  64
 #define NWARPS_Q8_0_PASCAL 8
 
-template <bool need_check>
+template <int mmq_x_v, int mmq_y_v, int nwarps_v, bool need_check>
 static void mul_mat_q8_0(const void * __restrict__ vx,
                          const void * __restrict__ vy,
                          float * __restrict__ dst,
@@ -1674,10 +1669,9 @@ static void mul_mat_q8_0(const void * __restrict__ vx,
     int *         tile_x_qh = nullptr;
     int *         tile_x_sc = nullptr;
 
-    //sycl_todo: change according to hardware
-    const int mmq_x  = MMQ_X_Q8_0_AMPERE;
-    const int mmq_y  = MMQ_Y_Q8_0_AMPERE;
-    const int nwarps = NWARPS_Q8_0_AMPERE;
+    constexpr int mmq_x  = mmq_x_v;
+    constexpr int mmq_y  = mmq_y_v;
+    constexpr int nwarps = nwarps_v;
     allocate_tiles_q8_0<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc, tile_x_qs_q8_0, tile_x_d_q8_0);
     mul_mat_q<QK8_0, QR8_0, QI8_0, false, block_q8_0, mmq_x, mmq_y, nwarps, load_tiles_q8_0<mmq_y, nwarps, need_check>,
               VDR_Q8_0_Q8_1_MMQ, vec_dot_q8_0_q8_1_mul_mat>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
@@ -1702,7 +1696,7 @@ static void mul_mat_q8_0(const void * __restrict__ vx,
 #define MMQ_Y_Q2_K_PASCAL  64
 #define NWARPS_Q2_K_PASCAL 8
 
-template <bool need_check>
+template <int mmq_x_v, int mmq_y_v, int nwarps_v, bool need_check>
 static void mul_mat_q2_K(const void * __restrict__ vx,
                          const void * __restrict__ vy,
                          float * __restrict__ dst,
@@ -1722,10 +1716,9 @@ static void mul_mat_q2_K(const void * __restrict__ vx,
     int *         tile_x_qh = nullptr;
     int *         tile_x_sc = nullptr;
 
-    //sycl_todo: change according to hardware
-    const int mmq_x  = MMQ_X_Q2_K_AMPERE;
-    const int mmq_y  = MMQ_Y_Q2_K_AMPERE;
-    const int nwarps = NWARPS_Q2_K_AMPERE;
+    constexpr int mmq_x  = mmq_x_v;
+    constexpr int mmq_y  = mmq_y_v;
+    constexpr int nwarps = nwarps_v;
     allocate_tiles_q2_K<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc, tile_x_ql_q2_K, tile_x_dm_q2_K,
                                tile_x_sc_q2_K);
     mul_mat_q<QK_K, QR2_K, QI2_K, false, block_q2_K, mmq_x, mmq_y, nwarps, load_tiles_q2_K<mmq_y, nwarps, need_check>,
@@ -1751,7 +1744,7 @@ static void mul_mat_q2_K(const void * __restrict__ vx,
 #define MMQ_Y_Q3_K_PASCAL  64
 #define NWARPS_Q3_K_PASCAL 8
 
-template <bool need_check>
+template <int mmq_x_v, int mmq_y_v, int nwarps_v, bool need_check>
 static void mul_mat_q3_K(const void * __restrict__ vx,
                          const void * __restrict__ vy,
                          float * __restrict__ dst,
@@ -1772,10 +1765,9 @@ static void mul_mat_q3_K(const void * __restrict__ vx,
     int *         tile_x_qh = nullptr;
     int *         tile_x_sc = nullptr;
 
-    //sycl_todo: change according to hardware
-    const int mmq_x  = MMQ_X_Q3_K_AMPERE;
-    const int mmq_y  = MMQ_Y_Q3_K_AMPERE;
-    const int nwarps = NWARPS_Q3_K_AMPERE;
+    constexpr int mmq_x  = mmq_x_v;
+    constexpr int mmq_y  = mmq_y_v;
+    constexpr int nwarps = nwarps_v;
     allocate_tiles_q3_K<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc, tile_x_ql_q3_K, tile_x_dm_q3_K,
                                tile_x_qh_q3_K, tile_x_sc_q3_K);
     mul_mat_q<QK_K, QR3_K, QI3_K, false, block_q3_K, mmq_x, mmq_y, nwarps, load_tiles_q3_K<mmq_y, nwarps, need_check>,
@@ -1801,7 +1793,7 @@ static void mul_mat_q3_K(const void * __restrict__ vx,
 #define MMQ_Y_Q4_K_PASCAL  64
 #define NWARPS_Q4_K_PASCAL 8
 
-template <bool need_check>
+template <int mmq_x_v, int mmq_y_v, int nwarps_v, bool need_check>
 static void mul_mat_q4_K(const void * __restrict__ vx,
                          const void * __restrict__ vy,
                          float * __restrict__ dst,
@@ -1821,10 +1813,9 @@ static void mul_mat_q4_K(const void * __restrict__ vx,
     int *         tile_x_qh = nullptr;
     int *         tile_x_sc = nullptr;
 
-    //sycl_todo: change according to hardware
-    const int mmq_x  = MMQ_X_Q4_K_AMPERE;
-    const int mmq_y  = MMQ_Y_Q4_K_AMPERE;
-    const int nwarps = NWARPS_Q4_K_AMPERE;
+    constexpr int mmq_x  = mmq_x_v;
+    constexpr int mmq_y  = mmq_y_v;
+    constexpr int nwarps = nwarps_v;
     allocate_tiles_q4_K<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc, tile_x_ql_q4_K, tile_x_dm_q4_K,
                                tile_x_sc_q4_K);
     mul_mat_q<QK_K, QR4_K, QI4_K, true, block_q4_K, mmq_x, mmq_y, nwarps, load_tiles_q4_K<mmq_y, nwarps, need_check>,
@@ -1853,7 +1844,7 @@ static void mul_mat_q4_K(const void * __restrict__ vx,
 #define MMQ_Y_Q5_K_PASCAL  64
 #define NWARPS_Q5_K_PASCAL 8
 
-template <bool need_check>
+template <int mmq_x_v, int mmq_y_v, int nwarps_v, bool need_check>
 static void mul_mat_q5_K(const void * __restrict__ vx,
                          const void * __restrict__ vy,
                          float * __restrict__ dst,
@@ -1873,10 +1864,9 @@ static void mul_mat_q5_K(const void * __restrict__ vx,
     int *         tile_x_qh = nullptr;
     int *         tile_x_sc = nullptr;
 
-    //sycl_todo: change according to hardware
-    const int mmq_x  = MMQ_X_Q5_K_AMPERE;
-    const int mmq_y  = MMQ_Y_Q5_K_AMPERE;
-    const int nwarps = NWARPS_Q5_K_AMPERE;
+    constexpr int mmq_x  = mmq_x_v;
+    constexpr int mmq_y  = mmq_y_v;
+    constexpr int nwarps = nwarps_v;
     allocate_tiles_q5_K<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc, tile_x_ql_q5_K, tile_x_dm_q5_K,
                                tile_x_sc_q5_K);
     mul_mat_q<QK_K, QR5_K, QI5_K, true, block_q5_K, mmq_x, mmq_y, nwarps, load_tiles_q5_K<mmq_y, nwarps, need_check>,
@@ -1902,7 +1892,7 @@ static void mul_mat_q5_K(const void * __restrict__ vx,
 #define MMQ_Y_Q6_K_PASCAL  64
 #define NWARPS_Q6_K_PASCAL 8
 
-template <bool need_check>
+template <int mmq_x_v, int mmq_y_v, int nwarps_v, bool need_check>
 static void mul_mat_q6_K(const void * __restrict__ vx,
                          const void * __restrict__ vy,
                          float * __restrict__ dst,
@@ -1922,10 +1912,9 @@ static void mul_mat_q6_K(const void * __restrict__ vx,
     int * tile_x_qh = nullptr;
     // int   * tile_x_sc = nullptr;
 
-    //sycl_todo: change according to hardware
-    const int mmq_x  = MMQ_X_Q6_K_AMPERE;
-    const int mmq_y  = MMQ_Y_Q6_K_AMPERE;
-    const int nwarps = NWARPS_Q6_K_AMPERE;
+    constexpr int mmq_x  = mmq_x_v;
+    constexpr int mmq_y  = mmq_y_v;
+    constexpr int nwarps = nwarps_v;
     allocate_tiles_q6_K<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc, tile_x_ql, tile_x_dm, tile_x_sc);
     mul_mat_q<QK_K, QR6_K, QI6_K, false, block_q6_K, mmq_x, mmq_y, nwarps, load_tiles_q6_K<mmq_y, nwarps, need_check>,
               VDR_Q6_K_Q8_1_MMQ, vec_dot_q6_K_q8_1_mul_mat>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst,
