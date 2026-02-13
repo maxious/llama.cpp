@@ -306,378 +306,215 @@ inline void launch_gemm_mxfp4_f32_tiled(sycl::queue * stream,
 }
 
 // =============================================================================
-// Indirect GEMM for MUL_MAT_ID (MoE expert dispatch)
+// Subgroup-Optimized Indirect GEMM for MUL_MAT_ID (MoE expert dispatch)
 // =============================================================================
-// For MUL_MAT_ID, we compute C = A * B^T for a subset of rows determined by
-// expert routing. M_ptr contains the count of rows for this expert, and
-// offset_ptr contains the starting offset in the packed buffers.
+// Uses sub_group_reduce to finalize dot products instead of dequantizing into SLM.
+// Each subgroup computes N_DST output columns for one A row, with lanes splitting
+// the K/32 quant blocks and using reduce_over_group for the final sum.
 //
 // Convention for MUL_MAT_ID:
-//   A = src1_packed (activations, F32), [total_rows x K] but we process [M x K]
+//   A = src1_packed (activations), [total_rows x K] but we process [M x K]
 //   B = expert weights (MXFP4), [N x K] where N is output dim
 //   C = dst_packed (output, F32), [total_rows x N] but we write [M x N]
 //
-// Note: In MUL_MAT_ID context, the dimensions are:
-//   M = number of rows assigned to this expert (dynamic, read from M_ptr)
-//   N = output dimension (weight matrix rows)
-//   K = input dimension (weight matrix cols)
+// MXFP4 dequantization:
+//   val = e8m0_scale * kvalues_mxfp4[q4] * 0.5
+//   qs[j] low nibble = element j, high nibble = element j+16
 
-template <int BM, int BN, int BK, int TM, int TN>
-inline void gemm_mxfp4_f32_tiled_kernel_indirect(
-    sycl::nd_item<2>               it,
-    sycl::local_accessor<float, 1> tile_A,
-    sycl::local_accessor<float, 1> tile_B,
-    const float * __restrict__ A,         // src1_packed (activations, F32), M x K
-    const block_mxfp4 * __restrict__ B,   // weights (MXFP4), N x K
-    float * __restrict__ C,               // dst_packed (output, F32), M x N
-    const int * __restrict__ M_ptr,       // pointer to row count for this expert
-    const int * __restrict__ offset_ptr,  // pointer to row offset in packed buffers
-    const int   N,
-    const int   K,                        // N = output dim, K = input dim
-    const float alpha,
-    const float beta,
-    const int   lda,
-    const int   ldb,
-    const int   ldc) {
-    // BK must match QK_MXFP4 for correct block alignment
-    static_assert(BK == QK_MXFP4, "BK must equal QK_MXFP4 for MXFP4 block alignment");
+constexpr int MXFP4_N_DST   = 4;
+constexpr int MXFP4_N_SG    = 2;
+constexpr int MXFP4_SG_SIZE = WARP_SIZE;
+
+// MXFP4 has 32 elements per block, each lane handles NB elements.
+// For SG_SIZE=16: 2 lanes per block (each handles 16 elements), stride SG_SIZE/2.
+constexpr int MXFP4_NB = QK_MXFP4 / 2;  // 16 elements per lane per block
+
+// Kernel: F32 activations x MXFP4 weights
+template <int SG_SIZE, int N_DST, int N_SG, int NB>
+inline void gemm_mxfp4_f32_sg_kernel_indirect(
+    sycl::nd_item<2>                 it,
+    const float * __restrict__       A,          // src1_packed (activations, F32), M x K
+    const block_mxfp4 * __restrict__ B,          // weights (MXFP4), N x K
+    float * __restrict__             C,          // dst_packed (output, F32), M x N
+    const int * __restrict__         M_ptr,      // pointer to row count for this expert
+    const int * __restrict__         offset_ptr, // pointer to row offset in packed buffers
+    const int                        N,
+    const int                        K,
+    const float                      alpha,
+    const float                      beta,
+    const int                        lda,
+    const int                        ldb,
+    const int                        ldc) {
 
     const int M = *M_ptr;
-    if (M <= 0) {
-        return;
-    }
+    if (M <= 0) return;
 
     const int offset = (offset_ptr) ? *offset_ptr : 0;
-
-    // Apply offset to A and C (packed buffers)
-    // B (weights) doesn't need offset - it's passed as base + expert_idx * stride
     const float * A_ptr = A + offset * lda;
     float *       C_ptr = C + offset * ldc;
 
-    constexpr int WG_M = BM / TM;
-    constexpr int WG_N = BN / TN;
+    const int m = it.get_group(0);
+    if (m >= M) return;
 
-    const int block_row = it.get_group(0);  // M dimension (rows)
-    const int block_col = it.get_group(1);  // N dimension (cols/output)
+    sycl::sub_group sg      = it.get_sub_group();
+    const int       sg_id   = sg.get_group_id()[0];
+    const int       lane_id = sg.get_local_id()[0];
 
-    // Early exit if this workgroup is beyond the actual rows
-    if (block_row * BM >= M) {
-        return;
-    }
+    const int first_col = (it.get_group(1) * N_SG + sg_id) * N_DST;
+    if (first_col >= N) return;
 
-    const int thread_row = it.get_local_id(0);
-    const int thread_col = it.get_local_id(1);
-    const int thread_id  = thread_row * WG_N + thread_col;
+    const int nb = ldb / QK_MXFP4;
 
-    const int row_start = block_row * BM + thread_row * TM;
-    const int col_start = block_col * BN + thread_col * TN;
+    const float * y = A_ptr + m * lda;
 
-    float acc[TM][TN];
-#pragma unroll
-    for (int tm = 0; tm < TM; ++tm) {
-#pragma unroll
-        for (int tn = 0; tn < TN; ++tn) {
-            acc[tm][tn] = 0.0f;
-        }
-    }
+    // Each lane handles NB=16 elements (half a block).
+    // lane/2 = block offset, lane%2 = first or second half (0..15 or 16..31).
+    constexpr int LANES_PER_BLOCK = SG_SIZE / (QK_MXFP4 / NB);
+    const int     ix = lane_id / (QK_MXFP4 / NB);
+    const int     il = lane_id % (QK_MXFP4 / NB);
+    const int     elem_offset = il * NB;  // 0 or 16
 
-    constexpr int WG_SIZE            = WG_M * WG_N;
-    constexpr int A_TILE_SIZE        = BM * BK;
-    constexpr int B_TILE_SIZE        = BN * BK;
-    constexpr int A_LOADS_PER_THREAD = (A_TILE_SIZE + WG_SIZE - 1) / WG_SIZE;
-    constexpr int B_LOADS_PER_THREAD = (B_TILE_SIZE + WG_SIZE - 1) / WG_SIZE;
+    const float * yb = y + ix * QK_MXFP4 + elem_offset;
 
-    // Number of MXFP4 blocks per row of B
-    const int num_blocks_per_row = ldb / QK_MXFP4;
-    const int num_k_tiles        = (K + BK - 1) / BK;
+    float sumf[N_DST] = { 0.0f };
 
-    for (int k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
-        const int k_start = k_tile * BK;
-        const int k_block = k_tile;  // Since BK == QK_MXFP4
-
-// Load A tile [BM x BK] from F32
-#pragma unroll
-        for (int load = 0; load < A_LOADS_PER_THREAD; ++load) {
-            const int flat_idx = thread_id + load * WG_SIZE;
-            if (flat_idx < A_TILE_SIZE) {
-                const int tile_m     = flat_idx / BK;
-                const int tile_k     = flat_idx % BK;
-                const int global_row = block_row * BM + tile_m;
-                const int global_k   = k_start + tile_k;
-
-                float val = 0.0f;
-                if (global_row < M && global_k < K) {
-                    // A is row-major: A[m][k] at offset m*lda + k
-                    val = A_ptr[global_row * lda + global_k];
-                }
-                tile_A[tile_m * BK + tile_k] = val;
-            }
+    for (int ib = ix; ib < nb; ib += LANES_PER_BLOCK) {
+        // Load activation slice
+        float yl[NB];
+        for (int i = 0; i < NB; ++i) {
+            yl[i] = yb[i];
         }
 
-// Load B tile [BN x BK] from MXFP4 and dequantize to float
-// Since BK == QK_MXFP4, each k-tile corresponds exactly to one MXFP4 block
-#pragma unroll
-        for (int load = 0; load < B_LOADS_PER_THREAD; ++load) {
-            const int flat_idx = thread_id + load * WG_SIZE;
-            if (flat_idx < B_TILE_SIZE) {
-                const int tile_n     = flat_idx / BK;
-                const int tile_k     = flat_idx % BK;
-                const int global_col = block_col * BN + tile_n;
-                const int global_k   = k_start + tile_k;
+        for (int col = 0; col < N_DST; ++col) {
+            const int global_col = first_col + col;
+            if (global_col < N) {
+                const block_mxfp4 & blk = B[global_col * nb + ib];
+                const float d = ggml_sycl_e8m0_to_fp32(blk.e);
 
-                float val = 0.0f;
-                if (global_col < N && global_k < K) {
-                    // Block index: B[global_col] has (K/32) blocks
-                    // For this k_tile, we're loading exactly one block per row
-                    const int           block_idx = global_col * num_blocks_per_row + k_block;
-                    const block_mxfp4 & blk       = B[block_idx];
-
-                    // Get the E8M0 scale for this block
-                    const float d = ggml_sycl_e8m0_to_fp32(blk.e);
-
-                    // Extract the 4-bit quantized value
-                    // MXFP4 layout: qs[j] contains elements j (low nibble) and j+16 (high nibble)
+                float partial = 0.0f;
+                for (int i = 0; i < NB; ++i) {
+                    const int idx = elem_offset + i;
                     uint8_t q4;
-                    if (tile_k < 16) {
-                        q4 = blk.qs[tile_k] & 0x0F;
+                    if (idx < 16) {
+                        q4 = blk.qs[idx] & 0x0F;
                     } else {
-                        q4 = blk.qs[tile_k - 16] >> 4;
+                        q4 = blk.qs[idx - 16] >> 4;
                     }
-
-                    // Dequantize: scale * lookup * 0.5 (because kvalues_mxfp4 is doubled)
-                    val = d * static_cast<float>(kvalues_mxfp4[q4]) * 0.5f;
+                    partial += yl[i] * (d * static_cast<float>(kvalues_mxfp4[q4]) * 0.5f);
                 }
-                tile_B[tile_n * BK + tile_k] = val;
+                sumf[col] += partial;
             }
         }
 
-        sycl::group_barrier(it.get_group());
-
-// Compute: C[m][n] += sum_k A[m][k] * B[n][k]
-// This is the transposed multiply: C = A * B^T
-#pragma unroll
-        for (int k = 0; k < BK; ++k) {
-            float a_reg[TM];
-#pragma unroll
-            for (int tm = 0; tm < TM; ++tm) {
-                a_reg[tm] = tile_A[(thread_row * TM + tm) * BK + k];
-            }
-
-            float b_reg[TN];
-#pragma unroll
-            for (int tn = 0; tn < TN; ++tn) {
-                b_reg[tn] = tile_B[(thread_col * TN + tn) * BK + k];
-            }
-
-#pragma unroll
-            for (int tm = 0; tm < TM; ++tm) {
-#pragma unroll
-                for (int tn = 0; tn < TN; ++tn) {
-                    acc[tm][tn] = sycl::fma(a_reg[tm], b_reg[tn], acc[tm][tn]);
-                }
-            }
-        }
-
-        sycl::group_barrier(it.get_group());
+        yb += LANES_PER_BLOCK * QK_MXFP4;
     }
 
-// Write results: C[m][n]
-#pragma unroll
-    for (int tm = 0; tm < TM; ++tm) {
-        const int global_row = row_start + tm;
-        if (global_row >= M) {
-            continue;
-        }
+    for (int col = 0; col < N_DST; ++col) {
+        const float tot = sycl::reduce_over_group(sg, sumf[col], sycl::plus<float>());
 
-#pragma unroll
-        for (int tn = 0; tn < TN; ++tn) {
-            const int global_col = col_start + tn;
-            if (global_col >= N) {
-                continue;
-            }
-
-            const int c_idx = global_row * ldc + global_col;
+        const int global_col = first_col + col;
+        if (lane_id == 0 && global_col < N) {
             if (beta == 0.0f) {
-                C_ptr[c_idx] = alpha * acc[tm][tn];
+                C_ptr[m * ldc + global_col] = alpha * tot;
             } else {
-                C_ptr[c_idx] = alpha * acc[tm][tn] + beta * C_ptr[c_idx];
+                C_ptr[m * ldc + global_col] = alpha * tot + beta * C_ptr[m * ldc + global_col];
             }
         }
     }
 }
 
-template <int BM, int BN, int BK, int TM, int TN>
-inline void gemm_mxfp4_f32_tiled_kernel_indirect_f16(
-    sycl::nd_item<2>               it,
-    sycl::local_accessor<float, 1> tile_A,
-    sycl::local_accessor<float, 1> tile_B,
-    const sycl::half * __restrict__ A,    // src1_packed (activations, F16), M x K
-    const block_mxfp4 * __restrict__ B,   // weights (MXFP4), N x K
-    float * __restrict__ C,               // dst_packed (output, F32), M x N
-    const int * __restrict__ M_ptr,       // pointer to row count for this expert
-    const int * __restrict__ offset_ptr,  // pointer to row offset in packed buffers
-    const int   N,
-    const int   K,                        // N = output dim, K = input dim
-    const float alpha,
-    const float beta,
-    const int   lda,
-    const int   ldb,
-    const int   ldc) {
-    // BK must match QK_MXFP4 for correct block alignment
-    static_assert(BK == QK_MXFP4, "BK must equal QK_MXFP4 for MXFP4 block alignment");
+// Kernel: F16 activations x MXFP4 weights
+template <int SG_SIZE, int N_DST, int N_SG, int NB>
+inline void gemm_mxfp4_f32_sg_kernel_indirect_f16(
+    sycl::nd_item<2>                 it,
+    const sycl::half * __restrict__  A,          // src1_packed (activations, F16), M x K
+    const block_mxfp4 * __restrict__ B,          // weights (MXFP4), N x K
+    float * __restrict__             C,          // dst_packed (output, F32), M x N
+    const int * __restrict__         M_ptr,
+    const int * __restrict__         offset_ptr,
+    const int                        N,
+    const int                        K,
+    const float                      alpha,
+    const float                      beta,
+    const int                        lda,
+    const int                        ldb,
+    const int                        ldc) {
 
     const int M = *M_ptr;
-    if (M <= 0) {
-        return;
-    }
+    if (M <= 0) return;
 
     const int offset = (offset_ptr) ? *offset_ptr : 0;
-
-    // Apply offset to A and C (packed buffers)
     const sycl::half * A_ptr = A + offset * lda;
     float *            C_ptr = C + offset * ldc;
 
-    constexpr int WG_M = BM / TM;
-    constexpr int WG_N = BN / TN;
+    const int m = it.get_group(0);
+    if (m >= M) return;
 
-    const int block_row = it.get_group(0);
-    const int block_col = it.get_group(1);
+    sycl::sub_group sg      = it.get_sub_group();
+    const int       sg_id   = sg.get_group_id()[0];
+    const int       lane_id = sg.get_local_id()[0];
 
-    if (block_row * BM >= M) {
-        return;
-    }
+    const int first_col = (it.get_group(1) * N_SG + sg_id) * N_DST;
+    if (first_col >= N) return;
 
-    const int thread_row = it.get_local_id(0);
-    const int thread_col = it.get_local_id(1);
-    const int thread_id  = thread_row * WG_N + thread_col;
+    const int nb = ldb / QK_MXFP4;
 
-    const int row_start = block_row * BM + thread_row * TM;
-    const int col_start = block_col * BN + thread_col * TN;
+    const sycl::half * y = A_ptr + m * lda;
 
-    float acc[TM][TN];
-#pragma unroll
-    for (int tm = 0; tm < TM; ++tm) {
-#pragma unroll
-        for (int tn = 0; tn < TN; ++tn) {
-            acc[tm][tn] = 0.0f;
-        }
-    }
+    constexpr int LANES_PER_BLOCK = SG_SIZE / (QK_MXFP4 / NB);
+    const int     ix = lane_id / (QK_MXFP4 / NB);
+    const int     il = lane_id % (QK_MXFP4 / NB);
+    const int     elem_offset = il * NB;
 
-    constexpr int WG_SIZE            = WG_M * WG_N;
-    constexpr int A_TILE_SIZE        = BM * BK;
-    constexpr int B_TILE_SIZE        = BN * BK;
-    constexpr int A_LOADS_PER_THREAD = (A_TILE_SIZE + WG_SIZE - 1) / WG_SIZE;
-    constexpr int B_LOADS_PER_THREAD = (B_TILE_SIZE + WG_SIZE - 1) / WG_SIZE;
+    const sycl::half * yb = y + ix * QK_MXFP4 + elem_offset;
 
-    const int num_blocks_per_row = ldb / QK_MXFP4;
-    const int num_k_tiles        = (K + BK - 1) / BK;
+    float sumf[N_DST] = { 0.0f };
 
-    for (int k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
-        const int k_start = k_tile * BK;
-        const int k_block = k_tile;
-
-#pragma unroll
-        for (int load = 0; load < A_LOADS_PER_THREAD; ++load) {
-            const int flat_idx = thread_id + load * WG_SIZE;
-            if (flat_idx < A_TILE_SIZE) {
-                const int tile_m     = flat_idx / BK;
-                const int tile_k     = flat_idx % BK;
-                const int global_row = block_row * BM + tile_m;
-                const int global_k   = k_start + tile_k;
-
-                float val = 0.0f;
-                if (global_row < M && global_k < K) {
-                    val = static_cast<float>(A_ptr[global_row * lda + global_k]);
-                }
-                tile_A[tile_m * BK + tile_k] = val;
-            }
+    for (int ib = ix; ib < nb; ib += LANES_PER_BLOCK) {
+        float yl[NB];
+        for (int i = 0; i < NB; ++i) {
+            yl[i] = static_cast<float>(yb[i]);
         }
 
-#pragma unroll
-        for (int load = 0; load < B_LOADS_PER_THREAD; ++load) {
-            const int flat_idx = thread_id + load * WG_SIZE;
-            if (flat_idx < B_TILE_SIZE) {
-                const int tile_n     = flat_idx / BK;
-                const int tile_k     = flat_idx % BK;
-                const int global_col = block_col * BN + tile_n;
-                const int global_k   = k_start + tile_k;
+        for (int col = 0; col < N_DST; ++col) {
+            const int global_col = first_col + col;
+            if (global_col < N) {
+                const block_mxfp4 & blk = B[global_col * nb + ib];
+                const float d = ggml_sycl_e8m0_to_fp32(blk.e);
 
-                float val = 0.0f;
-                if (global_col < N && global_k < K) {
-                    const int           block_idx = global_col * num_blocks_per_row + k_block;
-                    const block_mxfp4 & blk       = B[block_idx];
-
-                    const float d = ggml_sycl_e8m0_to_fp32(blk.e);
-
+                float partial = 0.0f;
+                for (int i = 0; i < NB; ++i) {
+                    const int idx = elem_offset + i;
                     uint8_t q4;
-                    if (tile_k < 16) {
-                        q4 = blk.qs[tile_k] & 0x0F;
+                    if (idx < 16) {
+                        q4 = blk.qs[idx] & 0x0F;
                     } else {
-                        q4 = blk.qs[tile_k - 16] >> 4;
+                        q4 = blk.qs[idx - 16] >> 4;
                     }
-
-                    val = d * static_cast<float>(kvalues_mxfp4[q4]) * 0.5f;
+                    partial += yl[i] * (d * static_cast<float>(kvalues_mxfp4[q4]) * 0.5f);
                 }
-                tile_B[tile_n * BK + tile_k] = val;
+                sumf[col] += partial;
             }
         }
 
-        sycl::group_barrier(it.get_group());
-
-#pragma unroll
-        for (int k = 0; k < BK; ++k) {
-            float a_reg[TM];
-#pragma unroll
-            for (int tm = 0; tm < TM; ++tm) {
-                a_reg[tm] = tile_A[(thread_row * TM + tm) * BK + k];
-            }
-
-            float b_reg[TN];
-#pragma unroll
-            for (int tn = 0; tn < TN; ++tn) {
-                b_reg[tn] = tile_B[(thread_col * TN + tn) * BK + k];
-            }
-
-#pragma unroll
-            for (int tm = 0; tm < TM; ++tm) {
-#pragma unroll
-                for (int tn = 0; tn < TN; ++tn) {
-                    acc[tm][tn] = sycl::fma(a_reg[tm], b_reg[tn], acc[tm][tn]);
-                }
-            }
-        }
-
-        sycl::group_barrier(it.get_group());
+        yb += LANES_PER_BLOCK * QK_MXFP4;
     }
 
-#pragma unroll
-    for (int tm = 0; tm < TM; ++tm) {
-        const int global_row = row_start + tm;
-        if (global_row >= M) {
-            continue;
-        }
+    for (int col = 0; col < N_DST; ++col) {
+        const float tot = sycl::reduce_over_group(sg, sumf[col], sycl::plus<float>());
 
-#pragma unroll
-        for (int tn = 0; tn < TN; ++tn) {
-            const int global_col = col_start + tn;
-            if (global_col >= N) {
-                continue;
-            }
-
-            const int c_idx = global_row * ldc + global_col;
+        const int global_col = first_col + col;
+        if (lane_id == 0 && global_col < N) {
             if (beta == 0.0f) {
-                C_ptr[c_idx] = alpha * acc[tm][tn];
+                C_ptr[m * ldc + global_col] = alpha * tot;
             } else {
-                C_ptr[c_idx] = alpha * acc[tm][tn] + beta * C_ptr[c_idx];
+                C_ptr[m * ldc + global_col] = alpha * tot + beta * C_ptr[m * ldc + global_col];
             }
         }
     }
 }
 
-// Launch function for indirect MXFP4->F32 GEMM (MUL_MAT_ID)
-// Computes: C = A * B^T where B is MXFP4, for a subset of rows
-// A: [max_M x K] (F32), B: [N x K] (MXFP4), C: [max_M x N] (F32)
-// M_ptr: pointer to actual row count, offset_ptr: pointer to row offset
+// Launch function for indirect MXFP4->F32 GEMM (MUL_MAT_ID) with F32 activations
 inline void launch_gemm_tiled_indirect_mxfp4(sycl::queue *       stream,
                                              const float *       A,           // src1_packed (activations, F32)
                                              const block_mxfp4 * B,           // weights (MXFP4)
@@ -692,29 +529,25 @@ inline void launch_gemm_tiled_indirect_mxfp4(sycl::queue *       stream,
                                              const int           lda,
                                              const int           ldb,
                                              const int           ldc) {
-    constexpr int BM   = GEMM_MXFP4_F32_BM;  // 64
-    constexpr int BN   = GEMM_MXFP4_F32_BN;  // 64
-    constexpr int BK   = GEMM_MXFP4_F32_BK;  // 32 = QK_MXFP4
-    constexpr int TM   = GEMM_MXFP4_F32_TM;  // 4
-    constexpr int TN   = GEMM_MXFP4_F32_TN;  // 4
-    constexpr int WG_M = BM / TM;            // 16
-    constexpr int WG_N = BN / TN;            // 16
+    constexpr int SG_SIZE = MXFP4_SG_SIZE;
+    constexpr int N_DST   = MXFP4_N_DST;
+    constexpr int N_SG    = MXFP4_N_SG;
+    constexpr int NB      = MXFP4_NB;
+    constexpr int WG_SIZE = N_SG * SG_SIZE;
 
-    const int grid_m = (max_M + BM - 1) / BM;
-    const int grid_n = (N + BN - 1) / BN;
+    const int cols_per_wg = N_SG * N_DST;
+    const int grid_n      = (N + cols_per_wg - 1) / cols_per_wg;
 
-    sycl::range<2> global(grid_m * WG_M, grid_n * WG_N);
-    sycl::range<2> local(WG_M, WG_N);
+    sycl::range<2> global(max_M * 1, grid_n * WG_SIZE);
+    sycl::range<2> local(1, WG_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
-        // Double-buffering: allocate 2x local memory for ping-pong tiles
-        sycl::local_accessor<float, 1> tile_A(sycl::range<1>(2 * BM * BK), cgh);
-        sycl::local_accessor<float, 1> tile_B(sycl::range<1>(2 * BN * BK), cgh);
-
-        cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) {
-            gemm_mxfp4_f32_tiled_kernel_indirect<BM, BN, BK, TM, TN>(it, tile_A, tile_B, A, B, C, M_ptr, offset_ptr, N,
-                                                                     K, alpha, beta, lda, ldb, ldc);
-        });
+        cgh.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                gemm_mxfp4_f32_sg_kernel_indirect<SG_SIZE, N_DST, N_SG, NB>(
+                    it, A, B, C, M_ptr, offset_ptr, N, K, alpha, beta, lda, ldb, ldc);
+            });
     });
 }
 
@@ -733,29 +566,25 @@ inline void launch_gemm_tiled_indirect_mxfp4_f16(sycl::queue *       stream,
                                                  const int           lda,
                                                  const int           ldb,
                                                  const int           ldc) {
-    constexpr int BM   = GEMM_MXFP4_F32_BM;
-    constexpr int BN   = GEMM_MXFP4_F32_BN;
-    constexpr int BK   = GEMM_MXFP4_F32_BK;
-    constexpr int TM   = GEMM_MXFP4_F32_TM;
-    constexpr int TN   = GEMM_MXFP4_F32_TN;
-    constexpr int WG_M = BM / TM;
-    constexpr int WG_N = BN / TN;
+    constexpr int SG_SIZE = MXFP4_SG_SIZE;
+    constexpr int N_DST   = MXFP4_N_DST;
+    constexpr int N_SG    = MXFP4_N_SG;
+    constexpr int NB      = MXFP4_NB;
+    constexpr int WG_SIZE = N_SG * SG_SIZE;
 
-    const int grid_m = (max_M + BM - 1) / BM;
-    const int grid_n = (N + BN - 1) / BN;
+    const int cols_per_wg = N_SG * N_DST;
+    const int grid_n      = (N + cols_per_wg - 1) / cols_per_wg;
 
-    sycl::range<2> global(grid_m * WG_M, grid_n * WG_N);
-    sycl::range<2> local(WG_M, WG_N);
+    sycl::range<2> global(max_M * 1, grid_n * WG_SIZE);
+    sycl::range<2> local(1, WG_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
-        // Double-buffering: allocate 2x local memory for ping-pong tiles
-        sycl::local_accessor<float, 1> tile_A(sycl::range<1>(2 * BM * BK), cgh);
-        sycl::local_accessor<float, 1> tile_B(sycl::range<1>(2 * BN * BK), cgh);
-
-        cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) {
-            gemm_mxfp4_f32_tiled_kernel_indirect_f16<BM, BN, BK, TM, TN>(it, tile_A, tile_B, A, B, C, M_ptr, offset_ptr,
-                                                                         N, K, alpha, beta, lda, ldb, ldc);
-        });
+        cgh.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                gemm_mxfp4_f32_sg_kernel_indirect_f16<SG_SIZE, N_DST, N_SG, NB>(
+                    it, A, B, C, M_ptr, offset_ptr, N, K, alpha, beta, lda, ldb, ldc);
+            });
     });
 }
 
