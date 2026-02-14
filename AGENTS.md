@@ -47,6 +47,34 @@
   - This eliminated the need for the per-type XE2 workaround in matmul.cpp (Q8_0, Q2_K-Q6_K are now all enabled on XE2).
   - Test: `./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q8_0"`
   - Test: `./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q4_K"`
+- SYCL MUL_MAT_ID remaining IGC crash (Feb 2026):
+  - MUL_MAT_ID with q8_0, n_used=4, n=32 still crashes in AddRequiredMemoryFences.cpp despite the barrier fix.
+  - The SPIR-V module compiled for MUL_MAT_ID bundles kernels differently than MUL_MAT, triggering the same IGC bug in a different code path.
+  - MUL_MAT q8_0 passes all tests (the same kernel template compiles fine in isolation).
+  - This is an upstream IGC bug (empty `getUniqueExitBlocks()` dereference). May need IGC update to fully resolve.
+  - Test: `./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p "type_a=q8_0"`
+
+## Debugging SYCL SIGSEGV Crashes
+
+When investigating SIGSEGV crashes in the SYCL backend, **always use gdb** rather than relying on stderr output alone. IGC compiler crashes happen inside `libigc.so` during JIT compilation and produce no stderr output — the process just dies with SIGSEGV. Under gdb, the backtrace reveals:
+- Which IGC pass crashed (e.g., `AddRequiredMemoryFences.cpp:168`)
+- Which kernel was being JIT-compiled (e.g., `launch_q8_0<64, 128, 8>`)
+- The full SYCL runtime → Level Zero → IGC call chain
+
+```bash
+# Basic crash diagnosis
+gdb -batch -ex "set print thread-events off" -ex run -ex bt \
+  --args ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p "type_a=q8_0"
+
+# With debug logging
+GGML_SYCL_DEBUG=1 gdb -batch -ex "set print thread-events off" -ex run -ex bt \
+  --args ./build-sycl/bin/test-backend-ops ...
+```
+
+Key frames to look for in the backtrace:
+- `IGC::AddRequiredMemoryFences::runOnFunction` — SLM fence insertion bug
+- `launch_q8_0<...>` / `launch_q4_K<...>` — identifies the crashing kernel template
+- `ggml_sycl_op_mul_mat_q` vs `ggml_sycl_op_mul_mat_sycl` — identifies the dispatch path
 
 ## SYCL Runtime Architecture Detection
 
