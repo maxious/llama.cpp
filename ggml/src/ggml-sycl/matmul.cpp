@@ -1377,12 +1377,7 @@ __dpct_inline__ static void k_copy_src1_to_contiguous(const char * __restrict__ 
         src1_row              = dpct::atomic_fetch_add<sycl::access::address_space::generic_space>(cur_src1_row, 1);
         row_mapping[src1_row] = { id, iid1 };
     }
-    /*
-    DPCT1065:194: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
-    item_ct1.barrier();
+    item_ct1.barrier(sycl::access::fence_space::local_space);
 
     const float * src1_row_original   = (const float *) (src1_original + i11 * nb11 + i12 * nb12);
     float *       src1_row_contiguous = (float *) (src1_contiguous + src1_row * nb11);

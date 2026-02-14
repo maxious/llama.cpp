@@ -85,16 +85,7 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
         if (lane_id == 0) {
             s_sum[warp_id] = tmp;
         }
-        /*
-        DPCT1118:1: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065:54: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
-        item_ct1.barrier();
+        item_ct1.barrier(sycl::access::fence_space::local_space);
         tmp = 0.f;
         for (size_t i = 0; i < nreduce; i += 1)
         {
@@ -120,16 +111,7 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
         if (lane_id == 0) {
             s_sum[warp_id] = tmp;
         }
-        /*
-        DPCT1118:2: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065:55: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
-        item_ct1.barrier();
+        item_ct1.barrier(sycl::access::fence_space::local_space);
         tmp = 0.f;
         for (size_t i = 0; i < nreduce; i += 1)
         {
@@ -225,10 +207,6 @@ static void l2_norm_f32(const float* x, float* dst, const int ncols, const float
         if (lane_id == 0) {
             s_sum[warp_id] = tmp;
         }
-        /*
-        DPCT1118:3: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
         size_t nreduce = nwarps / WARP_SIZE;
         tmp = 0.f;
@@ -266,11 +244,6 @@ static void norm_f32_sycl(const float * x, float * dst, const int ncols, const i
         const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
         assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
         const sycl::range<3> block_dims(1, 1, work_group_size);
-        /*
-        DPCT1049:17: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
         stream->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<sycl::float2, 1> s_sum_acc_ct1(
                             sycl::range<1>(work_group_size / WARP_SIZE), cgh);
@@ -306,12 +279,6 @@ static void group_norm_f32_sycl(const float* x, float* dst,
         const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
         assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
         const sycl::range<3> block_dims(1, 1, work_group_size);
-        /*
-        DPCT1049:18: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-
         stream->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> s_sum_acc_ct1(sycl::range<1>(work_group_size / WARP_SIZE),
                 cgh);
@@ -351,11 +318,6 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
         const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
         assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
         const sycl::range<3> block_dims(1, 1, work_group_size);
-        /*
-        DPCT1049:19: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
         stream->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> s_sum_acc_ct1(sycl::range<1>(work_group_size / WARP_SIZE),
                 cgh);
@@ -390,11 +352,6 @@ static void l2_norm_f32_sycl(const float* x, float* dst, const int ncols,
         const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
         assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
         const sycl::range<3> block_dims(1, 1, work_group_size);
-        /*
-        DPCT1049:19: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
         stream->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> s_sum_acc_ct1(sycl::range<1>(work_group_size / WARP_SIZE),
                 cgh);
