@@ -791,7 +791,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     bool small_batch     = !force_xmx && (N < 32);
     bool recording_graph = false;
 #ifdef GGML_SYCL_GRAPH
-    if (ctx.is_graph_recording()) {
+    if (ctx.force_graph_compatible) {
         recording_graph = true;
     }
 #endif

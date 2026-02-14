@@ -241,7 +241,7 @@ option(GGML_OPENMP                          "ggml: use OpenMP"                  
 option(GGML_RPC                             "ggml: use RPC"                                   OFF)
 option(GGML_SYCL                            "ggml: use SYCL"                                  OFF)
 option(GGML_SYCL_F16                        "ggml: use 16 bit floats for sycl calculations"   ON)
-option(GGML_SYCL_GRAPH                      "ggml: enable graphs in the SYCL backend"         OFF)
+option(GGML_SYCL_GRAPH                      "ggml: enable graphs in the SYCL backend"         ON)
 option(GGML_SYCL_DNN                        "ggml: enable oneDNN in the SYCL backend"         ON)
 option(GGML_SYCL_XMX                        "ggml: enable SYCL XMX/cooperative matrix kernels" OFF)
 set   (GGML_SYCL_TARGET "INTEL" CACHE STRING

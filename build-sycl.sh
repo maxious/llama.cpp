@@ -119,7 +119,7 @@ source /opt/intel/oneapi/setvars.sh --force > /dev/null 2>&1 || true
 echo "Configuring CMake..."
 CMAKE_OPTS=(
     -DGGML_SYCL=ON
-    -DGGML_SYCL_GRAPH=OFF
+    -DGGML_SYCL_GRAPH=ON
     -DCMAKE_C_COMPILER=/opt/intel/oneapi/compiler/2025.3/bin/icx
     -DCMAKE_CXX_COMPILER=/opt/intel/oneapi/compiler/2025.3/bin/icpx
     -DLLAMA_CURL=OFF
