@@ -43,11 +43,11 @@ template <> inline float load_as_float<sycl::ext::oneapi::bfloat16>(const sycl::
 }
 #endif
 
-// Single-kernel fused flash attention (runtime DQK, DV)
+// Single-kernel fused flash attention (template DQK, DV)
 // QType: element type of Q (float, half, bfloat16)
 // KVType: element type of K, V (float, half, bfloat16)
 // MaskT: element type of mask (float, half)
-template <typename QType, typename KVType, typename MaskT>
+template <typename QType, typename KVType, typename MaskT, int DQK, int DV>
 inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                                           const QType *                Q,
                                           const KVType *               K,
@@ -62,9 +62,7 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                                           const MaskT *                mask,
                                           const int64_t                mask_stride,
                                           const float *                sinks,
-                                          const fattn_tensor_strides & strides,
-                                          int                          DQK,
-                                          int                          DV) {
+                                          const fattn_tensor_strides & strides) {
     (void)
         n_kv_heads;  // Suppress unused parameter warning (GQA ratio uses n_heads/n_kv_heads, but n_kv_heads itself not needed directly)
     constexpr int BQ   = FATTN_BQ;
@@ -104,12 +102,14 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
             float * shV = shK + BK * DQK;
 
             // Thread-local accumulators (Registers)
-            float acc[FATTN_MAX_HEAD_SIZE];  // Max size 128
-            float logits[FATTN_BK];          // Max size 32
+            // Sized from template parameters to force register promotion
+            float acc[DV];
+            float logits[FATTN_BK];  // Max size 32
             float m_curr = -1.0e20f;
             float l_curr = 0.0f;
 
-            // Initialize accumulators
+// Initialize accumulators
+#pragma unroll
             for (int i = 0; i < DV; ++i) {
                 acc[i] = 0.0f;
             }
@@ -129,18 +129,13 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
             }
             it.barrier(sycl::access::fence_space::local_space);
 
-            // Iterate over KV splits
-            const int num_splits = (N_kv + BK - 1) / BK;
-            for (int split = 0; split < num_splits; ++split) {
-                const int kv_start = split * BK;
-                const int kv_end   = sycl::min(kv_start + BK, N_kv);
-                const int kv_chunk = kv_end - kv_start;
-                if (kv_chunk <= 0) {
-                    break;
-                }
+            // Loop over KV blocks
+            for (int kv_start = 0; kv_start < N_kv; kv_start += BK) {
+                int split    = kv_start / BK;
+                int kv_chunk = (kv_start + BK <= N_kv) ? BK : (N_kv - kv_start);
 
                 // Load K tile
-                for (int idx = lane_in_wg; idx < kv_chunk * DQK; idx += FATTN_WG_SIZE) {
+                for (int idx = lane_in_wg; idx < BK * DQK; idx += FATTN_WG_SIZE) {
                     int k_local = idx / DQK;
                     int d       = idx % DQK;
                     int kv_idx  = kv_start + k_local;
@@ -154,7 +149,7 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                 }
 
                 // Load V tile
-                for (int idx = lane_in_wg; idx < kv_chunk * DV; idx += FATTN_WG_SIZE) {
+                for (int idx = lane_in_wg; idx < BK * DV; idx += FATTN_WG_SIZE) {
                     int v_local = idx / DV;
                     int d       = idx % DV;
                     int kv_idx  = kv_start + v_local;
@@ -179,8 +174,15 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
 
                     // Compute logits Q @ K^T for this KV chunk
                     float m_split = -1.0e20f;
-                    for (int k = 0; k < kv_chunk; ++k) {
+                    // #pragma unroll // Removed to reduce JIT time
+                    for (int k = 0; k < BK; ++k) {
+                        if (k >= kv_chunk) {
+                            logits[k] = -1.0e20f;
+                            continue;
+                        }
+
                         float dot = 0.0f;
+                        // #pragma unroll // Removed to reduce JIT time
                         for (int d = 0; d < DQK; ++d) {
                             dot += shQ[q_local * DQK + d] * shK[k * DQK + d];
                         }
@@ -189,7 +191,9 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                         if (mask != nullptr) {
                             int global_k = kv_start + k;
                             if (global_k < N_kv) {
-                                logit += mask[q_idx * mask_stride + global_k];
+                                logit += load_as_float<MaskT>(&mask[q_idx * mask_stride + global_k]);
+                            } else {
+                                logit = -1.0e20f;  // Masked out
                             }
                         }
                         logits[k] = logit;
@@ -208,16 +212,22 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                     float alpha_prev = sycl::exp(m_prev - m_new);
 
                     // Scale previous accumulators
+                    // #pragma unroll // Removed to reduce JIT time
                     for (int d = 0; d < DV; ++d) {
                         acc[d] *= alpha_prev;
                     }
 
                     // Compute exp and accumulate PV
                     float l_split = 0.0f;
-                    for (int k = 0; k < kv_chunk; ++k) {
+                    // #pragma unroll // Removed to reduce JIT time
+                    for (int k = 0; k < BK; ++k) {
+                        if (k >= kv_chunk)
+                            continue;
+
                         float exp_val = sycl::exp(sycl::fmax(logits[k] - m_new, -20.0f));
-                        logits[k]     = exp_val;  // reuse logits register for P
+                        // Reuse logits register
                         l_split += exp_val;
+                        // #pragma unroll // Removed to reduce JIT time
                         for (int d = 0; d < DV; ++d) {
                             acc[d] += exp_val * shV[k * DV + d];
                         }
@@ -236,14 +246,7 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                 it.barrier(sycl::access::fence_space::local_space);
             }  // end splits
 
-            // Final normalization and store - cooperative across all threads
-            // No barrier needed here if we don't rely on other threads' results (we don't)
-            // it.barrier(sycl::access::fence_space::local_space);
-
-            // Only process valid rows (redundant check but safe)
-            // if (q_start >= N) return; // Checked at start
-
-            // Each thread writes its own result
+            // Final normalization and store
             const int local_row = it.get_local_id(0);
             for (int q_local = local_row; q_local < BQ; q_local += WG_M) {
                 int q_idx = q_start + q_local;
@@ -252,6 +255,7 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                 }
 
                 float inv_l = 1.0f / (l_curr > 1e-10f ? l_curr : 1.0f);
+#pragma unroll
                 for (int d = 0; d < DV; ++d) {
                     ptrdiff_t o_idx =
                         (ptrdiff_t) head_idx * strides.o_stride_head + (ptrdiff_t) q_idx * strides.o_stride_seq + d;
