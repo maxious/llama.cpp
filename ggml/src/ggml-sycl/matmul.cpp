@@ -1283,11 +1283,6 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     use_mul_mat_q                   = use_mul_mat_q && (src0->ne[1] >= MMQ_MIN_NROWS);
     use_mul_mat_q                   = use_mul_mat_q && (src1->ne[1] >= MMQ_MIN_NROWS);
 
-    // XE2 workaround: Q8_0 MMQ kernels cause compiler/driver crashes for batch sizes >= 128
-    // Fallback to oneMKL/XMX which are stable.
-    if (ggml_sycl_info().devices[ctx.device].arch == SYCL_ARCH_INTEL_XE2 && src0->type == GGML_TYPE_Q8_0) {
-        use_mul_mat_q = false;
-    }
 
     // Dispatch becomes obscure with the reorder, MMVQ when the reorder optimization
     // is enabled takes precedence over DMMV, the current if-else implementation
@@ -1798,43 +1793,43 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
             // Q4_0 weights with fused dequantization
             // ldb = K (used for block indexing: K/QK4_0 blocks per row)
             const block_q4_0 * weights = (const block_q4_0 *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_q4_0(stream, src1_packed_f32, weights, dst_packed,
-                                            dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+            launch_gemm_tiled_indirect_q4_0(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
+                                            dev_expert_offsets.get() + i,
                                             total_rows,  // max_M
                                             N_local, K, 1.0f, 0.0f, K, K, N_local);
         } else if (src0->type == GGML_TYPE_Q8_0) {
             // Q8_0 weights with fused dequantization
             // ldb = K (used for block indexing: K/QK8_0 blocks per row)
             const block_q8_0 * weights = (const block_q8_0 *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_q8_0(stream, src1_packed_f32, weights, dst_packed,
-                                            dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+            launch_gemm_tiled_indirect_q8_0(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
+                                            dev_expert_offsets.get() + i,
                                             total_rows,  // max_M
                                             N_local, K, 1.0f, 0.0f, K, K, N_local);
         } else if (src0->type == GGML_TYPE_Q2_K) {
             const block_q2_K * weights = (const block_q2_K *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_q2_K(stream, src1_packed_f32, weights, dst_packed,
-                                            dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
-                                            total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+            launch_gemm_tiled_indirect_q2_K(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
+                                            dev_expert_offsets.get() + i, total_rows, N_local, K, 1.0f, 0.0f, K, K,
+                                            N_local);
         } else if (src0->type == GGML_TYPE_Q3_K) {
             const block_q3_K * weights = (const block_q3_K *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_q3_K(stream, src1_packed_f32, weights, dst_packed,
-                                            dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
-                                            total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+            launch_gemm_tiled_indirect_q3_K(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
+                                            dev_expert_offsets.get() + i, total_rows, N_local, K, 1.0f, 0.0f, K, K,
+                                            N_local);
         } else if (src0->type == GGML_TYPE_Q4_K) {
             const block_q4_K * weights = (const block_q4_K *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_q4_K(stream, src1_packed_f32, weights, dst_packed,
-                                            dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
-                                            total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+            launch_gemm_tiled_indirect_q4_K(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
+                                            dev_expert_offsets.get() + i, total_rows, N_local, K, 1.0f, 0.0f, K, K,
+                                            N_local);
         } else if (src0->type == GGML_TYPE_Q5_K) {
             const block_q5_K * weights = (const block_q5_K *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_q5_K(stream, src1_packed_f32, weights, dst_packed,
-                                            dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
-                                            total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+            launch_gemm_tiled_indirect_q5_K(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
+                                            dev_expert_offsets.get() + i, total_rows, N_local, K, 1.0f, 0.0f, K, K,
+                                            N_local);
         } else if (src0->type == GGML_TYPE_Q6_K) {
             const block_q6_K * weights = (const block_q6_K *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_q6_K(stream, src1_packed_f32, weights, dst_packed,
-                                            dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
-                                            total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+            launch_gemm_tiled_indirect_q6_K(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
+                                            dev_expert_offsets.get() + i, total_rows, N_local, K, 1.0f, 0.0f, K, K,
+                                            N_local);
         } else {
             const float * weights = (const float *) ((const char *) src0_base + i * expert_stride);
             launch_gemm_tiled_indirect(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,

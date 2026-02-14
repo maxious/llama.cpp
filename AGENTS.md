@@ -40,11 +40,13 @@
   - Same block alignment constraint (BK=32=QK_MXFP4) and dequantization logic as MUL_MAT.
   - Supported weight types in MUL_MAT_ID: F32, F16, BF16, MXFP4.
   - Test: `GGML_SYCL_DISABLE_GRAPH=0 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p "type_a=mxfp4"`
-- SYCL XE2 Q8_0 MMQ Workaround (Feb 2026):
-  - Q8_0 MMQ kernels on Intel XE2 GPUs (Arc Battlemage) cause compiler/driver crashes (segfault in libigc.so) for batch sizes >= 128.
-  - This affects prompt processing in `llama-bench` with `-b 128`.
-  - Fix: Added a specific check in `matmul.cpp` to disable MMQ for Q8_0 on XE2, forcing fallback to oneMKL (or XMX if compatible types) which is stable.
-  - Test: `GGML_SYCL_DEBUG=1 ./build-sycl/bin/llama-bench -m models/koboldcpp/Qwen3-Coder-30B-A3B-Instruct-MXFP4_MOE.gguf -p 128 -n 64 -b 128 -ub 128`
+- SYCL MMQ IGC compiler crash fix (Feb 2026):
+  - MMQ kernels caused IGC compiler crashes (segfault in AddRequiredMemoryFences.cpp) on Intel XE2 GPUs for batch sizes >= 128.
+  - Root cause: `item_ct1.barrier()` (no fence space) didn't emit an SLM fence intrinsic that IGC's `IsSlmFence()` recognizes. The pass then tried to insert fences at loop exits, but `getUniqueExitBlocks()` returned empty for the optimized loop, causing an empty-vector dereference.
+  - Fix: Changed barriers in `mul_mat_q` (mmq_internal.hpp) to `item_ct1.barrier(sycl::access::fence_space::local_space)`, which emits an explicit SLM fence that the IGC pass recognizes, preventing it from taking the buggy loop-exit path.
+  - This eliminated the need for the per-type XE2 workaround in matmul.cpp (Q8_0, Q2_K-Q6_K are now all enabled on XE2).
+  - Test: `./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q8_0"`
+  - Test: `./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q4_K"`
 
 ## SYCL Runtime Architecture Detection
 
