@@ -1,4 +1,23 @@
-# Project Notes
+## Optimization Goals (Feb 2026)
+
+### 1. Optimize Fused Flash Attention (`fattn_fused`)
+- **Status**: Graph-compatible (no crashes), but performance is low (~720 t/s) compared to non-FA path (~9200 t/s).
+- **Issue**: Likely register pressure (spilling to memory) due to large accumulators (`float acc[128]`, `logits[32]`) or inefficient thread serialization.
+- **Goal**: Reach parity with `fa=off` performance (~9000+ t/s) for single-device prompt processing.
+- **Strategy**: Tune tile sizes (`BQ=16`, `BK=32`), reduce register usage, investigate vectorization.
+
+### 2. Close Token Generation Gap
+- **Status**: Branch (~43 t/s) trails Master SYCL (~54 t/s) and Master Vulkan (~67 t/s).
+- **Issue**: Latency regression in small-batch workloads (`n=1`). Possible overhead in kernel launch, graph submission, or `gemv`/`dequantize` kernels.
+- **Goal**: Reach ~65 t/s on Llama-3.2-1B to match Vulkan.
+- **Strategy**: Profile with `onetrace` specifically for `tg128` workload. Check `gemv` implementation.
+
+### 3. Verify Multi-Device Scaling
+- **Status**: Scaling logic implemented but not showing benefits on 1B model (compute bound on single device).
+- **Goal**: Confirm scaling efficiency on larger models (Llama-3-8B or 70B).
+- **Strategy**: Run benchmarks on larger models. Ensure P2P is active and effective.
+
+## Project Notes
 
 - For SYCL builds, use `./build-sycl.sh` which configures `build-sycl/` and builds via CMake (`cmake --build`), not Ninja.
 - The SYCL build directory `build-sycl/` does not contain `build.ninja` in this setup.
@@ -47,11 +66,27 @@
   - This eliminated the need for the per-type XE2 workaround in matmul.cpp (Q8_0, Q2_K-Q6_K are now all enabled on XE2).
   - Test: `./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q8_0"`
   - Test: `./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q4_K"`
-- SYCL MUL_MAT_ID remaining IGC crash (Feb 2026):
-  - MUL_MAT_ID with q8_0, n_used=4, n=32 still crashes in AddRequiredMemoryFences.cpp despite the barrier fix.
-  - The SPIR-V module compiled for MUL_MAT_ID bundles kernels differently than MUL_MAT, triggering the same IGC bug in a different code path.
-  - MUL_MAT q8_0 passes all tests (the same kernel template compiles fine in isolation).
-  - This is an upstream IGC bug (empty `getUniqueExitBlocks()` dereference). May need IGC update to fully resolve.
+- SYCL MUL_MAT_ID IGC crash workaround (Feb 2026):
+  - MUL_MAT_ID with q8_0 crashed in AddRequiredMemoryFences.cpp despite the barrier(local_space) fix.
+  - Root cause: All SYCL `.cpp` files compile into one library (`ggml-sycl`), so all device kernels share one SPIR-V fat binary. When IGC JIT-compiles kernels for MUL_MAT_ID, it processes a different subset/ordering than MUL_MAT, hitting the bug through a different IR path.
+  - Fix: On XE2, `ggml_sycl_mul_mat_id()` always uses the tiled path (`ggml_sycl_mul_mat_id_tiled`) instead of the MMQ path. The tiled kernels don't trigger the IGC bug.
+  - The tiled path supports all weight types: F32, F16, BF16, MXFP4, Q4_0, Q8_0, Q2_K-Q6_K.
+  - This is an upstream IGC bug (empty `getUniqueExitBlocks()` dereference). The workaround can be removed once IGC fixes `AddRequiredMemoryFences.cpp`.
+  - A patched IGC is at `~/igc_workspace/` on branch `fix-add-required-memory-fences-crash` (fork: https://github.com/maxious/intel-graphics-compiler).
+  - To test with the patched IGC (bypasses the Xe2 workaround):
+    ```bash
+    # Build the patched IGC (uses icecc for distributed build):
+    cd ~/igc_workspace/build
+    CCACHE_PREFIX=icecc ICECC_SCHEDULER_HOST=192.168.1.192 make igc_dll -j96
+    # Three GCC 15 compat patches are needed in the bundled LLVM 16 code (already applied locally):
+    #   - clang/lib/Driver/ToolChains/Arch/X86.cpp: StringMapKeyIterator range-for
+    #   - clang/lib/Sema/SemaExpr.cpp: [=, this] capture
+    #   - IGC/Compiler/Optimizer/InstructionHoistingOptimization.cpp: const ref vector param
+
+    # Run llama.cpp tests with the patched libigc.so:
+    LD_LIBRARY_PATH=~/igc_workspace/build/IGC/Release:$LD_LIBRARY_PATH \
+      ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p "type_a=q8_0"
+    ```
   - Test: `./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p "type_a=q8_0"`
 
 ## Debugging SYCL SIGSEGV Crashes
