@@ -44,6 +44,13 @@
 #include "ggml-sycl/gemm_bf16_f32_tiled.hpp"
 #include "ggml-sycl/gemm_f16_f32_tiled.hpp"
 #include "ggml-sycl/gemm_mxfp4_f32_tiled.hpp"
+#include "ggml-sycl/gemm_q2_K_f32_tiled.hpp"
+#include "ggml-sycl/gemm_q3_K_f32_tiled.hpp"
+#include "ggml-sycl/gemm_q4_0_f32_tiled.hpp"
+#include "ggml-sycl/gemm_q4_K_f32_tiled.hpp"
+#include "ggml-sycl/gemm_q5_K_f32_tiled.hpp"
+#include "ggml-sycl/gemm_q6_K_f32_tiled.hpp"
+#include "ggml-sycl/gemm_q8_0_f32_tiled.hpp"
 #include "ggml-sycl/gemm_tiled.hpp"
 #include "ggml-sycl/gemm_xmx.hpp"
 #include "ggml-sycl/getrows.hpp"
@@ -1757,7 +1764,7 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
         // nb[1] = K * type_size
         // nb[2] = N * K * type_size
         // If split, N becomes N_local.
-        expert_stride = K * N_local * ggml_type_size(src0->type);
+        expert_stride = N_local * ggml_row_size(src0->type, K);
     }
 
     const float *      src0_base       = (const float *) src0->data;
@@ -1787,6 +1794,47 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
                                                  dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
                                                  total_rows,  // max_M
                                                  N_local, K, 1.0f, 0.0f, K, K, N_local);
+        } else if (src0->type == GGML_TYPE_Q4_0) {
+            // Q4_0 weights with fused dequantization
+            // ldb = K (used for block indexing: K/QK4_0 blocks per row)
+            const block_q4_0 * weights = (const block_q4_0 *) ((const char *) src0_base + i * expert_stride);
+            launch_gemm_tiled_indirect_q4_0(stream, src1_packed_f32, weights, dst_packed,
+                                            dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                            total_rows,  // max_M
+                                            N_local, K, 1.0f, 0.0f, K, K, N_local);
+        } else if (src0->type == GGML_TYPE_Q8_0) {
+            // Q8_0 weights with fused dequantization
+            // ldb = K (used for block indexing: K/QK8_0 blocks per row)
+            const block_q8_0 * weights = (const block_q8_0 *) ((const char *) src0_base + i * expert_stride);
+            launch_gemm_tiled_indirect_q8_0(stream, src1_packed_f32, weights, dst_packed,
+                                            dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                            total_rows,  // max_M
+                                            N_local, K, 1.0f, 0.0f, K, K, N_local);
+        } else if (src0->type == GGML_TYPE_Q2_K) {
+            const block_q2_K * weights = (const block_q2_K *) ((const char *) src0_base + i * expert_stride);
+            launch_gemm_tiled_indirect_q2_K(stream, src1_packed_f32, weights, dst_packed,
+                                            dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                            total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+        } else if (src0->type == GGML_TYPE_Q3_K) {
+            const block_q3_K * weights = (const block_q3_K *) ((const char *) src0_base + i * expert_stride);
+            launch_gemm_tiled_indirect_q3_K(stream, src1_packed_f32, weights, dst_packed,
+                                            dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                            total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+        } else if (src0->type == GGML_TYPE_Q4_K) {
+            const block_q4_K * weights = (const block_q4_K *) ((const char *) src0_base + i * expert_stride);
+            launch_gemm_tiled_indirect_q4_K(stream, src1_packed_f32, weights, dst_packed,
+                                            dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                            total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+        } else if (src0->type == GGML_TYPE_Q5_K) {
+            const block_q5_K * weights = (const block_q5_K *) ((const char *) src0_base + i * expert_stride);
+            launch_gemm_tiled_indirect_q5_K(stream, src1_packed_f32, weights, dst_packed,
+                                            dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                            total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+        } else if (src0->type == GGML_TYPE_Q6_K) {
+            const block_q6_K * weights = (const block_q6_K *) ((const char *) src0_base + i * expert_stride);
+            launch_gemm_tiled_indirect_q6_K(stream, src1_packed_f32, weights, dst_packed,
+                                            dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                            total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
         } else {
             const float * weights = (const float *) ((const char *) src0_base + i * expert_stride);
             launch_gemm_tiled_indirect(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,

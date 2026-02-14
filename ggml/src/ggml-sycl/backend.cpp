@@ -642,14 +642,18 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                 {
                     // Graph-compatible tiled implementation is available for MoE expert dispatch.
                     // Runs entirely on device without host synchronization.
-                    // Supported weight types: F32, F16, BF16, MXFP4
+                    // Supported weight types: F32, F16, BF16, MXFP4, Q4_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K
                     // src1 (input) and dst (output) must be F32.
                     ggml_tensor * src0 = node->src[0];
                     ggml_tensor * src1 = node->src[1];
                     ggml_tensor * dst  = node;
 
                     bool src0_supported = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
-                                           src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_MXFP4);
+                                           src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_MXFP4 ||
+                                           src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0 ||
+                                           src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K ||
+                                           src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K ||
+                                           src0->type == GGML_TYPE_Q6_K);
 
                     if (!src0_supported || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
                         GGML_LOG_INFO(
