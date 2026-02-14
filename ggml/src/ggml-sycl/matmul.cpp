@@ -1857,7 +1857,12 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
 }
 
 void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
-    if (ctx.force_graph_compatible) {
+    // Use tiled path on Xe2 to work around IGC compiler crash in AddRequiredMemoryFences pass.
+    // The MMQ kernels trigger a bug in IGC's SLM fence insertion when compiled as part of the
+    // MUL_MAT_ID SPIR-V module (same kernels work fine in the MUL_MAT path).
+    const bool use_tiled = ctx.force_graph_compatible ||
+                           ggml_sycl_info().devices[ctx.device].arch == SYCL_ARCH_INTEL_XE2;
+    if (use_tiled) {
         GGML_SYCL_ITT_MUL_MAT_ID_TILED(moe);
         ggml_sycl_mul_mat_id_tiled(ctx, dst);
         return;

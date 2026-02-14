@@ -70,7 +70,7 @@ echo "Log file: $LOG_FILE"
 echo "PID file: $PID_FILE"
 
 nohup ./build-sycl/bin/llama-server \
-    --model models/koboldcpp/Qwen3-Coder-30B-A3B-Instruct-MXFP4_MOE.gguf \
+    --model /media/maxious/Data/Qwen3-Coder-REAP-25B-A3B-MXFP4_MOE.gguf \
     --port 5000 --host 0.0.0.0 \
     --fit on -c 65536 --fit-ctx 65536 --flash-attn on \
     --temp 0 \

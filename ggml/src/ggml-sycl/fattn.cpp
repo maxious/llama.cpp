@@ -212,7 +212,7 @@ inline bool ggml_sycl_flash_attn_xmx_allow_head(int64_t head_size) {
     if (!allowlist_checked) {
         const char * env = getenv("GGML_SYCL_FLASH_ATTN_XMX_ALLOWLIST");
         if (env == nullptr) {
-            allowlist = { 64, 96, 128, 256 };
+            allowlist = { 64, 80, 96, 112, 128, 256 };
         } else if (strcmp(env, "all") == 0) {
             allowlist_all = true;
         } else {
@@ -835,7 +835,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
             }
         }
 
-        if (!sycl_use_xmx || sycl_use_mkl || use_mkl_for_sinks || small_batch || mask != nullptr) {
+        if (!sycl_use_xmx || sycl_use_mkl || use_mkl_for_sinks || small_batch) {
             return false;
         }
 
@@ -1432,7 +1432,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
 mkl_fallback:
     // Use oneMKL KV-split path when MKL is available and needed
     // KV-split handles both short and long contexts efficiently (n_splits=1 for short contexts)
-    if (sycl_use_mkl || use_mkl_for_sinks || small_batch || mask != nullptr) {
+    if (sycl_use_mkl || use_mkl_for_sinks || small_batch ) {
         GGML_SYCL_ITT_FATTN_MKL_DYNAMIC();
         if (!recording_graph) {
             if (DQK == 576 && DV == 512) {
@@ -1785,7 +1785,7 @@ mkl_fallback:
         }
 
         // If we get here and it was mandatory MKL, then we should probably abort or warn
-        if (!recording_graph && (sycl_use_mkl || use_mkl_for_sinks || mask != nullptr)) {
+        if (!recording_graph && (sycl_use_mkl || use_mkl_for_sinks )) {
             GGML_ABORT(
                 "ggml_sycl: oneMKL flash attention path failed (unsupported head size); XMX is required but fallback "
                 "failed\n");

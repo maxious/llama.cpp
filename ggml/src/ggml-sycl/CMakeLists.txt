@@ -142,6 +142,19 @@ if (GGML_SYCL_TARGET STREQUAL "INTEL")
     add_compile_definitions(GGML_SYCL_WARP_SIZE=16)
     target_link_options(ggml-sycl PRIVATE  -Xs   -ze-intel-greater-than-4GB-buffer-required)
 
+    # AOT Compilation for Intel GPUs
+    # Reduces runtime JIT overhead significantly
+    if (GGML_SYCL_AOT)
+        message(STATUS "SYCL AOT compilation enabled for Intel (Xe-HPG, Xe-HPC, Xe2)")
+        # Target spir64_gen (generic Intel) and specify device architectures
+        # acm-g10 = Arc A770/A750 (Alchemist)
+        # pvc = Data Center GPU Max (Ponte Vecchio)
+        # bmg-g21 = Arc B580/B570 (Battlemage)
+        set(AOT_FLAGS "-fsycl-targets=spir64_gen" "-Xsycl-target-backend" "-device acm-g10,pvc,bmg-g21")
+        target_compile_options(ggml-sycl PRIVATE ${AOT_FLAGS})
+        target_link_options(ggml-sycl PRIVATE ${AOT_FLAGS})
+    endif()
+
     # Link against Intel oneMKL
     if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         set(SYCL_COMPILER ON)
@@ -154,11 +167,15 @@ else()
     add_compile_definitions(GGML_SYCL_WARP_SIZE=32)
 endif()
 
-if (GGML_SYCL_GRAPH)
-    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_GRAPH)
-endif()
+ if (GGML_SYCL_GRAPH)
+     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_GRAPH)
+ endif()
 
-if (GGML_SYCL_DEVICE_ARCH)
+ if (GGML_SYCL_XMX)
+     target_compile_definitions(ggml-sycl PRIVATE SYCL_USE_XMX)
+ endif()
+
+ if (GGML_SYCL_DEVICE_ARCH)
     target_compile_options(ggml-sycl PRIVATE -Xsycl-target-backend --offload-arch=${GGML_SYCL_DEVICE_ARCH})
     target_link_options(ggml-sycl PRIVATE -Xsycl-target-backend --offload-arch=${GGML_SYCL_DEVICE_ARCH})
 endif()
