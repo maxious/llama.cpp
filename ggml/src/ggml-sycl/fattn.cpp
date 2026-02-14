@@ -1173,7 +1173,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                                      actual_d, actual_dv);
         } catch (const std::exception & e) {
             GGML_SYCL_DEBUG("ggml_sycl: XMX flash attention failed: %s, falling back to non-XMX path\n", e.what());
-            if (DQK == 576 && DV == 512) {
+            if (DQK == 576 && DV == 512 && !recording_graph) {
                 ggml_sycl_op_flash_attn_mkl<576, 512>(ctx, dst);
                 xmx_impl = "mkl";
                 return true;
