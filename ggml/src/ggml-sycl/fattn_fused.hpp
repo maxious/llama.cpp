@@ -16,7 +16,7 @@
 // BK: number of KV positions processed per tile
 // ROWS_PER_WG: number of query rows per workgroup (= number of subgroups)
 constexpr int FATTN_BK              = 32;
-constexpr int FATTN_ROWS_PER_WG     = 8;
+constexpr int FATTN_ROWS_PER_WG     = 32;
 constexpr int FATTN_MAX_HEAD_SIZE   = 128;
 
 // Compute shared memory size needed (in bytes)
@@ -196,11 +196,6 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                     if (active_row) {
                         const int split = kv_start / BK;
 
-                        // Compute Q @ K^T for this KV chunk
-                        // Each lane computes partial dot over its D-slice,
-                        // then subgroup reduce to get full dot product
-                        float m_split = -1.0e20f;
-
                         for (int k = 0; k < kv_chunk; ++k) {
                             float partial_dot = 0.0f;
                             #pragma unroll
@@ -208,12 +203,10 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                                 const int d = lane + di * SG_SIZE;
                                 partial_dot += shQ[row_in_wg * DQK + d] * shK[k * DQK + d];
                             }
-                            // Subgroup reduce to get full dot product
                             float dot = warp_reduce_sum<SG_SIZE>(partial_dot);
 
                             float logit = scale * dot;
 
-                            // Apply mask
                             if (mask != nullptr) {
                                 const int global_k = kv_start + k;
                                 if (global_k < N_kv) {
@@ -223,11 +216,8 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                                 }
                             }
 
-                            // Online softmax: compute exp and accumulate P*V
-                            // All lanes have the same logit after the reduce
+                            // Online softmax + P*V accumulation
                             float m_new = sycl::fmax(m_curr, logit);
-
-                            // Rescale previous accumulator
                             float alpha_prev = sycl::exp(m_curr - m_new);
                             #pragma unroll
                             for (int i = 0; i < D_PER_THREAD; ++i) {
@@ -238,7 +228,6 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                             float exp_val = sycl::exp(sycl::fmax(logit - m_new, -20.0f));
                             l_curr += exp_val;
 
-                            // Accumulate P * V (each lane handles its D-slice)
                             #pragma unroll
                             for (int i = 0; i < D_PER_THREAD; ++i) {
                                 const int d = lane + i * SG_SIZE;
@@ -250,15 +239,15 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
 
                         // Handle attention sinks (first tile only)
                         if (split == 0 && sinks != nullptr) {
-                            float sink_val = sinks[head_idx];
-                            float m_new    = sycl::fmax(m_curr, sink_val);
-                            float alpha_prev = sycl::exp(m_curr - m_new);
+                            float sink_val   = sinks[head_idx];
+                            float m_sink     = sycl::fmax(m_curr, sink_val);
+                            float alpha_sink = sycl::exp(m_curr - m_sink);
                             #pragma unroll
                             for (int i = 0; i < D_PER_THREAD; ++i) {
-                                acc[i] *= alpha_prev;
+                                acc[i] *= alpha_sink;
                             }
-                            l_curr = l_curr * alpha_prev + sycl::exp(sycl::fmax(sink_val - m_new, -20.0f));
-                            m_curr = m_new;
+                            l_curr = l_curr * alpha_sink + sycl::exp(sycl::fmax(sink_val - m_sink, -20.0f));
+                            m_curr = m_sink;
                         }
                     }
 
