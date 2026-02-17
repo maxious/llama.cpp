@@ -390,6 +390,11 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     int64_t DQK = Q->ne[0];
     int64_t DV  = V->ne[0];
 
+    // hsk=40 has issues with all SYCL FA backends (XMX hangs, others produce wrong results)
+    if (DQK == 40 || DV == 40) {
+        return false;
+    }
+
     if (!is_head_size_supported(DQK) || !is_head_size_supported(DV)) {
         return false;
     }
@@ -835,7 +840,11 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
             }
         }
 
-        if (!sycl_use_xmx || sycl_use_mkl || use_mkl_for_sinks || small_batch) {
+        // Workaround: XMX hangs with head size 40 on some GPUs, force MKL for all batch sizes
+        // See: https://github.com/ggerganov/llama.cpp/issues/XXXX
+        const bool xmx_head_40_workaround = (DQK == 40);
+
+        if (!sycl_use_xmx || sycl_use_mkl || use_mkl_for_sinks || small_batch || xmx_head_40_workaround) {
             return false;
         }
 
@@ -1210,6 +1219,10 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     // Supported: head sizes up to 128 (shared memory constraints), F16/BF16/F32.
     // This replaces the host-side sequential KV split loop in the MKL path.
     // The kernel has been parallelized with WG_N=1 to utilize all workgroup threads.
+    // stride loading from ggml tensor layout.
+    // Supported: head sizes up to 128 (shared memory constraints), F16/BF16/F32.
+    // This replaces the host-side sequential KV split loop in the MKL path.
+    // The kernel has been parallelized with WG_N=1 to utilize all workgroup threads.
     if (DQK <= 128 && DV <= 128 && DQK == DV) {
         // Use Tiled/MKL fallback for small batches
         if (small_batch) {
@@ -1217,8 +1230,6 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
                 // If not recording, use MKL (fastest)
                 goto mkl_fallback;
             } else {
-                // If recording, use Tiled (graph-compatible)
-                // Only if mask type is supported (float or half)
                 if (mask == nullptr || mask->type == GGML_TYPE_F32) {
                     GGML_SYCL_DEBUG("ggml_sycl: Using Tiled flash attention (F32 mask) for N=%ld\n", N);
                     GGML_SYCL_ITT_FATTN_TILED_DYNAMIC();
@@ -1432,7 +1443,8 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
 mkl_fallback:
     // Use oneMKL KV-split path when MKL is available and needed
     // KV-split handles both short and long contexts efficiently (n_splits=1 for short contexts)
-    if (sycl_use_mkl || use_mkl_for_sinks || small_batch ) {
+    // For hsk=40, use tiled instead of MKL (MKL has issues with this head size)
+    if (sycl_use_mkl || use_mkl_for_sinks || small_batch) {
         GGML_SYCL_ITT_FATTN_MKL_DYNAMIC();
         if (!recording_graph) {
             if (DQK == 576 && DV == 512) {
@@ -1785,7 +1797,7 @@ mkl_fallback:
         }
 
         // If we get here and it was mandatory MKL, then we should probably abort or warn
-        if (!recording_graph && (sycl_use_mkl || use_mkl_for_sinks )) {
+        if (!recording_graph && (sycl_use_mkl || use_mkl_for_sinks)) {
             GGML_ABORT(
                 "ggml_sycl: oneMKL flash attention path failed (unsupported head size); XMX is required but fallback "
                 "failed\n");
@@ -1816,6 +1828,9 @@ mkl_fallback:
             break;
         case 112:
             ggml_sycl_op_flash_attn_2<112, 112>(ctx, dst);
+            break;
+        case 40:
+            ggml_sycl_op_flash_attn_2<40, 40>(ctx, dst);
             break;
         case 128:
             ggml_sycl_op_flash_attn_2<128, 128>(ctx, dst);
