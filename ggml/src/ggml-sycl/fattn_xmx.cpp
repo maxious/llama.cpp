@@ -261,8 +261,9 @@ inline void flash_attn_coopmat_kernel_padded(
                 float     s_val  = shS[row * S_STRIDE + c];
                 const int kv_col = col0 + c;  // Global KV column index
 
-                // Apply mask from precomputed mask tensor
-                if (mask != nullptr && kv_col < N_kv && q_row < N) {
+                if (kv_col >= N_kv || q_row >= N) {
+                    s_val = -1.0e20f;
+                } else if (mask != nullptr) {
                     const float mask_val = mask[q_row * mask_stride + kv_col];
                     s_val += mask_val;  // mask is 0.0 for unmasked, -inf for masked
                 }
@@ -671,7 +672,9 @@ inline void flash_attn_coopmat_kernel_small_tile(
                 float     s_val  = shS[row * S_STRIDE + c];
                 const int kv_col = col0 + c;
 
-                if (mask != nullptr && kv_col < N_kv && q_row < N) {
+                if (kv_col >= N_kv || q_row >= N) {
+                    s_val = -1.0e20f;
+                } else if (mask != nullptr) {
                     s_val += mask[q_row * mask_stride + kv_col];
                 }
                 shS[row * S_STRIDE + c] = s_val;
@@ -1076,6 +1079,8 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
 
     float * l_d = ctx.fattn_buffers->get_l(N * n_heads * sizeof(float), stream);
     float * m_d = ctx.fattn_buffers->get_m(N * n_heads * sizeof(float), stream);
+    stream->fill(l_d, 0.0f, N * n_heads);
+    stream->fill(m_d, -1.0e20f, N * n_heads);
 
     sycl::range<2> global(Tr * THREADS_PER_WG, n_heads);
     sycl::range<2> local(THREADS_PER_WG, 1);
@@ -1206,6 +1211,9 @@ void ggml_sycl_op_flash_attn_coopmat_padded(ggml_backend_sycl_context & ctx, ggm
             });
         }
     }
+
+    // Ensure the XMX kernel has finished before starting output reorders.
+    xmx_event.wait();
 
     // Output reorder kernels depend on XMX kernel completion
     std::vector<sycl::event> reorder_events;
@@ -1623,6 +1631,7 @@ template void ggml_sycl_op_flash_attn_coopmat_padded<64, 64, 64, 64>(ggml_backen
 template void ggml_sycl_op_flash_attn_coopmat_padded<96, 96, 96, 96>(ggml_backend_sycl_context &, ggml_tensor *);
 template void ggml_sycl_op_flash_attn_coopmat_padded<128, 128, 128, 128>(ggml_backend_sycl_context &, ggml_tensor *);
 template void ggml_sycl_op_flash_attn_coopmat_padded<256, 256, 256, 256>(ggml_backend_sycl_context &, ggml_tensor *);
+template void ggml_sycl_op_flash_attn_coopmat_padded<576, 512, 576, 512>(ggml_backend_sycl_context &, ggml_tensor *);
 
 template void ggml_sycl_op_flash_attn_coopmat_direct<32, 32>(ggml_backend_sycl_context &, ggml_tensor *);
 template void ggml_sycl_op_flash_attn_coopmat_direct<64, 64>(ggml_backend_sycl_context &, ggml_tensor *);

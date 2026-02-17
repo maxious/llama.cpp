@@ -21,6 +21,11 @@
 
 - For SYCL builds, use `./build-sycl.sh` which configures `build-sycl/` and builds via CMake (`cmake --build`), not Ninja.
 - The SYCL build directory `build-sycl/` does not contain `build.ninja` in this setup.
+- Running benchmarks requires the patched IGC to avoid JIT compile hangs:
+  ```bash
+  source /opt/intel/oneapi/setvars.sh -i --force
+  LD_LIBRARY_PATH=~/igc_workspace/build/IGC/Release:$LD_LIBRARY_PATH python3 bench.py --devices single
+  ```
 - Multi-device SYCL testing tips:
   - Build with `./build-sycl.sh`.
   - Use `--split-mode layer` or `--split-mode row` plus `--tensor-split` to exercise multi-device scheduling.
@@ -88,6 +93,43 @@
       ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p "type_a=q8_0"
     ```
   - Test: `./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p "type_a=q8_0"`
+
+## SYCL Flash Attention hsk=40 Investigation (Feb 2026)
+
+**Problem**: Page faults in SYCL Flash Attention for head size 40 (hsk=40) on Intel Arc B60.
+
+**Root Cause**: All XMX tile configurations (32x32, 16x16) cause issues with hsk=40:
+- XMX padded kernel: hangs with 64x64 tiles (padded from 40)
+- Fused path: not implemented for hsk=40
+- MKL/tiled paths: produce wrong results
+
+**LLVM SYCL e2e Tests Reference** (`~/llvm/sycl/test-e2e/Matrix/`):
+- Intel AMX: TM=16, TN=16, TK=16/32
+- Intel PVC (B60): TM=8, TN=16, TK=16 (nsize=16)
+- Intel DG2: TM=8, TN=8, TK=16 (nsize=8)
+- Note: Tests don't cover head dimensions as small as 40
+
+**Current Fix**: Disabled hsk=40 in `ggml_sycl_flash_attn_ext_supported()` - returns false so SYCL skips FA and falls back to CPU.
+
+**Potential Future Fixes**:
+1. Enable small-tile kernel (16x16) for hsk=40 instead of using 32x32
+2. Add explicit handling for head dims that pad to 64
+3. Add similar `row_split` logic from Vulkan PR #19625 to avoid cross-workgroup barriers
+
+**Test**:
+```bash
+./build-sycl/bin/test-backend-ops -b SYCL0 -o FLASH_ATTN_EXT -p "hsk=40"
+# Should show "not supported [SYCL0]"
+```
+
+## SYCL XMX Flash Attention Guardrails
+
+- For MLA head sizes (e.g., 576/512), ensure the XMX allowlist includes the head size or use `GGML_SYCL_FLASH_ATTN_XMX_ALLOWLIST=all`.
+- Small-tile kernels do not allocate `shV`. When estimating SLM usage, exclude the `shV` term or the kernel may be rejected despite fitting.
+- Masking must clamp out-of-range KV columns (`kv_col >= N_kv`) to a large negative value before softmax, even when `mask == nullptr`.
+- Ensure reorder kernels wait on the XMX kernel event (or use explicit event dependencies) before reading shared output buffers.
+- When reusing pooled `l_d`/`m_d`, reinitialize them on every call (`l_d = 0`, `m_d = -1e20f`) to avoid stale online softmax state.
+- Always include XMX coverage in `test-backend-ops` with `GGML_SYCL_FLASH_ATTN_FORCE_XMX=1` for new head sizes.
 
 ## Debugging SYCL SIGSEGV Crashes
 
