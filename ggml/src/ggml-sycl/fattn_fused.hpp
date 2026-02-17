@@ -1,6 +1,8 @@
 // fattn_fused.hpp - Single-kernel fused Flash Attention for SYCL
-// Online softmax, direct stride loading, graph-compatible
-// Version: runtime DQK/DV (no template on dimensions)
+// Subgroup-cooperative D-dimension parallelism with online softmax.
+// Each subgroup handles one query row; threads within a subgroup split the
+// head dimension (D) to reduce register pressure from ~160 to ~24 regs/thread.
+// Graph-compatible, no oneMKL dependency.
 
 #ifndef GGML_SYCL_FATTN_FUSED_HPP
 #define GGML_SYCL_FATTN_FUSED_HPP
@@ -10,19 +12,18 @@
 
 #include <sycl/sycl.hpp>
 
-// Tile configuration (optimized for head sizes up to 128)
-constexpr int FATTN_BQ            = 16;   // Queries per workgroup
-constexpr int FATTN_BK            = 32;   // KV tile size
-constexpr int FATTN_WG_M          = 16;
-constexpr int FATTN_WG_N          = 1;    // Single-column workgroup for full parallelization
-constexpr int FATTN_WG_SIZE       = FATTN_WG_M * FATTN_WG_N;
-constexpr int FATTN_MAX_HEAD_SIZE = 128;  // Max DQK/DV supported by this kernel
+// Tile configuration
+// BK: number of KV positions processed per tile
+// ROWS_PER_WG: number of query rows per workgroup (= number of subgroups)
+constexpr int FATTN_BK              = 32;
+constexpr int FATTN_ROWS_PER_WG     = 8;
+constexpr int FATTN_MAX_HEAD_SIZE   = 128;
 
 // Compute shared memory size needed (in bytes)
-inline size_t compute_shmem_size(int DQK, int DV) {
-    size_t size = FATTN_BQ * DQK;  // shQ
-    size += FATTN_BK * DQK;        // shK
-    size += FATTN_BK * DV;         // shV
+inline size_t fattn_fused_shmem_size(int DQK, int DV, int rows_per_wg, int BK) {
+    size_t size = rows_per_wg * DQK;  // shQ
+    size += BK * DQK;                  // shK
+    size += BK * DV;                   // shV
     return size * sizeof(float);
 }
 
@@ -43,11 +44,26 @@ template <> inline float load_as_float<sycl::ext::oneapi::bfloat16>(const sycl::
 }
 #endif
 
-// Single-kernel fused flash attention (template DQK, DV)
-// QType: element type of Q (float, half, bfloat16)
-// KVType: element type of K, V (float, half, bfloat16)
-// MaskT: element type of mask (float, half)
-template <typename QType, typename KVType, typename MaskT, int DQK, int DV>
+// Single-kernel fused flash attention with subgroup D-splitting.
+//
+// Template parameters:
+//   QType, KVType, MaskT: element types
+//   DQK: head dimension for Q/K (must be multiple of SG_SIZE)
+//   DV:  head dimension for V   (must be multiple of SG_SIZE)
+//   SG_SIZE: subgroup size (16 on Intel Xe)
+//   ROWS_PER_WG: query rows per workgroup (= subgroups per workgroup)
+//   BK: KV tile size
+//
+// Work-group layout: sycl::range<2>(ROWS_PER_WG, SG_SIZE)
+//   dim 0 = which query row in this workgroup (slow-varying)
+//   dim 1 = lane within subgroup (fast-varying → maps to subgroup lanes)
+//
+// Each thread owns:
+//   acc[DV / SG_SIZE]   (e.g. 128/16 = 8 floats)
+//   m_curr, l_curr      (2 floats)
+// Total: ~10 registers (was ~160)
+template <typename QType, typename KVType, typename MaskT, int DQK, int DV,
+          int SG_SIZE = 16, int ROWS_PER_WG = FATTN_ROWS_PER_WG, int BK = FATTN_BK>
 inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                                           const QType *                Q,
                                           const KVType *               K,
@@ -63,207 +79,208 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                                           const int64_t                mask_stride,
                                           const float *                sinks,
                                           const fattn_tensor_strides & strides) {
-    (void)
-        n_kv_heads;  // Suppress unused parameter warning (GQA ratio uses n_heads/n_kv_heads, but n_kv_heads itself not needed directly)
-    constexpr int BQ   = FATTN_BQ;
-    constexpr int BK   = FATTN_BK;
-    constexpr int WG_M = FATTN_WG_M;
-    constexpr int WG_N = FATTN_WG_N;
+    (void)n_kv_heads;
 
-    const int      num_q_blocks = (N + BQ - 1) / BQ;
-    sycl::range<2> global(num_q_blocks * WG_M, n_heads * WG_N);
-    sycl::range<2> local(WG_M, WG_N);
+    static_assert(DQK % SG_SIZE == 0, "DQK must be a multiple of SG_SIZE");
+    static_assert(DV  % SG_SIZE == 0, "DV must be a multiple of SG_SIZE");
 
-    const size_t shmem_elems = compute_shmem_size(DQK, DV) / sizeof(float);
+    constexpr int WG_SIZE       = SG_SIZE * ROWS_PER_WG;
+    constexpr int D_PER_THREAD  = DV / SG_SIZE;
+    constexpr int DK_PER_THREAD = DQK / SG_SIZE;
+
+    const int num_q_blocks = (N + ROWS_PER_WG - 1) / ROWS_PER_WG;
+
+    // Work-group: dim0 = ROWS_PER_WG (rows/subgroups), dim1 = SG_SIZE (lanes)
+    // dim1 varies fastest in SYCL linearization, so consecutive linear IDs
+    // share the same row → one subgroup = one query row
+    sycl::range<2> global(num_q_blocks * ROWS_PER_WG, n_heads * SG_SIZE);
+    sycl::range<2> local(ROWS_PER_WG, SG_SIZE);
+
+    const size_t shmem_elems = fattn_fused_shmem_size(DQK, DV, ROWS_PER_WG, BK) / sizeof(float);
 
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<float, 1> shmem_acc(sycl::range<1>(shmem_elems), cgh);
 
-        cgh.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) [[intel::kernel_args_restrict]] {
-            float *   shmem       = &shmem_acc[0];
-            const int q_block_idx = it.get_group(0);
-            const int head_idx    = it.get_group(1);
-            const int lane_in_wg  = it.get_local_linear_id();
-            // const int wg_col = it.get_local_id(1); // unused
+        cgh.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) [[intel::reqd_sub_group_size(SG_SIZE)]] {
+                float * shmem = &shmem_acc[0];
 
-            const int q_start = q_block_idx * BQ;
-            if (q_start >= N) {
-                return;
-            }
-            if (head_idx >= n_heads) {
-                return;
-            }
+                const int row_in_wg   = it.get_local_id(0);   // 0..ROWS_PER_WG-1
+                const int lane        = it.get_local_id(1);   // 0..SG_SIZE-1
+                const int q_block_idx = it.get_group(0);
+                const int head_idx    = it.get_group(1);
+                const int lid         = it.get_local_linear_id(); // row_in_wg * SG_SIZE + lane
 
-            const int kv_head_idx = head_idx / gqa_ratio;
+                const int q_start = q_block_idx * ROWS_PER_WG;
 
-            // Partition shared memory
-            float * shQ = shmem;
-            float * shK = shQ + BQ * DQK;
-            float * shV = shK + BK * DQK;
-
-            // Thread-local accumulators (Registers)
-            // Sized from template parameters to force register promotion
-            float acc[DV];
-            float logits[FATTN_BK];  // Max size 32
-            float m_curr = -1.0e20f;
-            float l_curr = 0.0f;
-
-// Initialize accumulators
-#pragma unroll
-            for (int i = 0; i < DV; ++i) {
-                acc[i] = 0.0f;
-            }
-
-            // Load Q tile (persistent)
-            for (int idx = lane_in_wg; idx < BQ * DQK; idx += FATTN_WG_SIZE) {
-                int q_local = idx / DQK;
-                int d       = idx % DQK;
-                int q_idx   = q_start + q_local;
-                if (q_idx < N && d < DQK) {
-                    ptrdiff_t global_idx =
-                        (ptrdiff_t) head_idx * strides.q_stride_head + (ptrdiff_t) q_idx * strides.q_stride_seq + d;
-                    shQ[q_local * DQK + d] = load_as_float<QType>(&Q[global_idx]);
-                } else {
-                    shQ[q_local * DQK + d] = 0.0f;
-                }
-            }
-            it.barrier(sycl::access::fence_space::local_space);
-
-            // Loop over KV blocks
-            for (int kv_start = 0; kv_start < N_kv; kv_start += BK) {
-                int split    = kv_start / BK;
-                int kv_chunk = (kv_start + BK <= N_kv) ? BK : (N_kv - kv_start);
-
-                // Load K tile
-                for (int idx = lane_in_wg; idx < BK * DQK; idx += FATTN_WG_SIZE) {
-                    int k_local = idx / DQK;
-                    int d       = idx % DQK;
-                    int kv_idx  = kv_start + k_local;
-                    if (kv_idx < N_kv && d < DQK) {
-                        ptrdiff_t global_idx = (ptrdiff_t) kv_head_idx * strides.k_stride_head +
-                                               (ptrdiff_t) kv_idx * strides.k_stride_seq + d;
-                        shK[k_local * DQK + d] = load_as_float<KVType>(&K[global_idx]);
-                    } else {
-                        shK[k_local * DQK + d] = 0.0f;
-                    }
+                // Entire workgroup out of bounds — safe uniform exit
+                if (q_start >= N || head_idx >= n_heads) {
+                    return;
                 }
 
-                // Load V tile
-                for (int idx = lane_in_wg; idx < BK * DV; idx += FATTN_WG_SIZE) {
-                    int v_local = idx / DV;
-                    int d       = idx % DV;
-                    int kv_idx  = kv_start + v_local;
-                    if (kv_idx < N_kv && d < DV) {
-                        ptrdiff_t global_idx = (ptrdiff_t) kv_head_idx * strides.v_stride_head +
-                                               (ptrdiff_t) kv_idx * strides.v_stride_seq + d;
-                        shV[v_local * DV + d] = load_as_float<KVType>(&V[global_idx]);
+                const int  q_idx       = q_start + row_in_wg;
+                const bool active_row  = (q_idx < N);
+                const int  kv_head_idx = head_idx / gqa_ratio;
+
+                // Partition shared memory
+                float * shQ = shmem;                           // [ROWS_PER_WG][DQK]
+                float * shK = shQ + ROWS_PER_WG * DQK;        // [BK][DQK]
+                float * shV = shK + BK * DQK;                 // [BK][DV]
+
+                // Thread-local accumulators (D-split)
+                float acc[D_PER_THREAD];
+                #pragma unroll
+                for (int i = 0; i < D_PER_THREAD; ++i) {
+                    acc[i] = 0.0f;
+                }
+                float m_curr = -1.0e20f;
+                float l_curr = 0.0f;
+
+                // ============================================================
+                // Load Q tile into SLM (cooperative across entire workgroup)
+                // ============================================================
+                for (int idx = lid; idx < ROWS_PER_WG * DQK; idx += WG_SIZE) {
+                    const int q_local = idx / DQK;
+                    const int d       = idx % DQK;
+                    const int qi      = q_start + q_local;
+                    if (qi < N) {
+                        const ptrdiff_t gi = (ptrdiff_t)head_idx * strides.q_stride_head
+                                           + (ptrdiff_t)qi * strides.q_stride_seq + d;
+                        shQ[q_local * DQK + d] = load_as_float<QType>(&Q[gi]);
                     } else {
-                        shV[v_local * DV + d] = 0.0f;
+                        shQ[q_local * DQK + d] = 0.0f;
                     }
                 }
                 it.barrier(sycl::access::fence_space::local_space);
 
-                // Each row is processed by exactly one thread (thread-local row index)
-                // With WG_N=1, all threads participate - no serialization
-                const int local_row = it.get_local_id(0);
-                for (int q_local = local_row; q_local < BQ; q_local += WG_M) {
-                    int q_idx = q_start + q_local;
-                    if (q_idx >= N) {
-                        continue;
+                // ============================================================
+                // Loop over KV blocks
+                // ============================================================
+                for (int kv_start = 0; kv_start < N_kv; kv_start += BK) {
+                    const int kv_chunk = sycl::min(BK, N_kv - kv_start);
+
+                    // Load K tile (cooperative)
+                    for (int idx = lid; idx < BK * DQK; idx += WG_SIZE) {
+                        const int k_local = idx / DQK;
+                        const int d       = idx % DQK;
+                        const int kv_idx  = kv_start + k_local;
+                        if (kv_idx < N_kv) {
+                            const ptrdiff_t gi = (ptrdiff_t)kv_head_idx * strides.k_stride_head
+                                               + (ptrdiff_t)kv_idx * strides.k_stride_seq + d;
+                            shK[k_local * DQK + d] = load_as_float<KVType>(&K[gi]);
+                        } else {
+                            shK[k_local * DQK + d] = 0.0f;
+                        }
                     }
 
-                    // Compute logits Q @ K^T for this KV chunk
-                    float m_split = -1.0e20f;
-                    // #pragma unroll // Removed to reduce JIT time
-                    for (int k = 0; k < BK; ++k) {
-                        if (k >= kv_chunk) {
-                            logits[k] = -1.0e20f;
-                            continue;
+                    // Load V tile (cooperative)
+                    for (int idx = lid; idx < BK * DV; idx += WG_SIZE) {
+                        const int v_local = idx / DV;
+                        const int d       = idx % DV;
+                        const int kv_idx  = kv_start + v_local;
+                        if (kv_idx < N_kv) {
+                            const ptrdiff_t gi = (ptrdiff_t)kv_head_idx * strides.v_stride_head
+                                               + (ptrdiff_t)kv_idx * strides.v_stride_seq + d;
+                            shV[v_local * DV + d] = load_as_float<KVType>(&V[gi]);
+                        } else {
+                            shV[v_local * DV + d] = 0.0f;
                         }
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
 
-                        float dot = 0.0f;
-                        // #pragma unroll // Removed to reduce JIT time
-                        for (int d = 0; d < DQK; ++d) {
-                            dot += shQ[q_local * DQK + d] * shK[k * DQK + d];
-                        }
-                        float logit = scale * dot;
+                    // ========================================================
+                    // Per-row attention: each subgroup handles one query row
+                    // Inactive rows skip math but still hit barriers
+                    // ========================================================
+                    if (active_row) {
+                        const int split = kv_start / BK;
 
-                        if (mask != nullptr) {
-                            int global_k = kv_start + k;
-                            if (global_k < N_kv) {
-                                logit += load_as_float<MaskT>(&mask[q_idx * mask_stride + global_k]);
-                            } else {
-                                logit = -1.0e20f;  // Masked out
+                        // Compute Q @ K^T for this KV chunk
+                        // Each lane computes partial dot over its D-slice,
+                        // then subgroup reduce to get full dot product
+                        float m_split = -1.0e20f;
+
+                        for (int k = 0; k < kv_chunk; ++k) {
+                            float partial_dot = 0.0f;
+                            #pragma unroll
+                            for (int di = 0; di < DK_PER_THREAD; ++di) {
+                                const int d = lane + di * SG_SIZE;
+                                partial_dot += shQ[row_in_wg * DQK + d] * shK[k * DQK + d];
                             }
+                            // Subgroup reduce to get full dot product
+                            float dot = warp_reduce_sum<SG_SIZE>(partial_dot);
+
+                            float logit = scale * dot;
+
+                            // Apply mask
+                            if (mask != nullptr) {
+                                const int global_k = kv_start + k;
+                                if (global_k < N_kv) {
+                                    logit += load_as_float<MaskT>(&mask[q_idx * mask_stride + global_k]);
+                                } else {
+                                    logit = -1.0e20f;
+                                }
+                            }
+
+                            // Online softmax: compute exp and accumulate P*V
+                            // All lanes have the same logit after the reduce
+                            float m_new = sycl::fmax(m_curr, logit);
+
+                            // Rescale previous accumulator
+                            float alpha_prev = sycl::exp(m_curr - m_new);
+                            #pragma unroll
+                            for (int i = 0; i < D_PER_THREAD; ++i) {
+                                acc[i] *= alpha_prev;
+                            }
+                            l_curr *= alpha_prev;
+
+                            float exp_val = sycl::exp(sycl::fmax(logit - m_new, -20.0f));
+                            l_curr += exp_val;
+
+                            // Accumulate P * V (each lane handles its D-slice)
+                            #pragma unroll
+                            for (int i = 0; i < D_PER_THREAD; ++i) {
+                                const int d = lane + i * SG_SIZE;
+                                acc[i] += exp_val * shV[k * DV + d];
+                            }
+
+                            m_curr = m_new;
                         }
-                        logits[k] = logit;
-                        m_split   = sycl::fmax(m_split, logit);
-                    }
 
-                    // Sinks (first split only)
-                    if (split == 0 && sinks != nullptr) {
-                        float sink_val = sinks[head_idx];
-                        m_split        = sycl::fmax(m_split, sink_val);
-                    }
-
-                    // Online softmax combine with previous splits
-                    float m_prev     = m_curr;
-                    float m_new      = sycl::fmax(m_prev, m_split);
-                    float alpha_prev = sycl::exp(m_prev - m_new);
-
-                    // Scale previous accumulators
-                    // #pragma unroll // Removed to reduce JIT time
-                    for (int d = 0; d < DV; ++d) {
-                        acc[d] *= alpha_prev;
-                    }
-
-                    // Compute exp and accumulate PV
-                    float l_split = 0.0f;
-                    // #pragma unroll // Removed to reduce JIT time
-                    for (int k = 0; k < BK; ++k) {
-                        if (k >= kv_chunk)
-                            continue;
-
-                        float exp_val = sycl::exp(sycl::fmax(logits[k] - m_new, -20.0f));
-                        // Reuse logits register
-                        l_split += exp_val;
-                        // #pragma unroll // Removed to reduce JIT time
-                        for (int d = 0; d < DV; ++d) {
-                            acc[d] += exp_val * shV[k * DV + d];
+                        // Handle attention sinks (first tile only)
+                        if (split == 0 && sinks != nullptr) {
+                            float sink_val = sinks[head_idx];
+                            float m_new    = sycl::fmax(m_curr, sink_val);
+                            float alpha_prev = sycl::exp(m_curr - m_new);
+                            #pragma unroll
+                            for (int i = 0; i < D_PER_THREAD; ++i) {
+                                acc[i] *= alpha_prev;
+                            }
+                            l_curr = l_curr * alpha_prev + sycl::exp(sycl::fmax(sink_val - m_new, -20.0f));
+                            m_curr = m_new;
                         }
                     }
 
-                    // Add sink contribution (first split)
-                    if (split == 0 && sinks != nullptr) {
-                        float sink_val = sinks[head_idx];
-                        l_split += sycl::exp(sycl::fmax(sink_val - m_new, -20.0f));
+                    it.barrier(sycl::access::fence_space::local_space);
+                }  // end KV blocks
+
+                // ============================================================
+                // Final normalization and store
+                // Each lane writes its D-slice of the output
+                // ============================================================
+                if (active_row) {
+                    const float inv_l = 1.0f / (l_curr > 1e-10f ? l_curr : 1.0f);
+                    #pragma unroll
+                    for (int i = 0; i < D_PER_THREAD; ++i) {
+                        const int d = lane + i * SG_SIZE;
+                        const ptrdiff_t o_idx = (ptrdiff_t)head_idx * strides.o_stride_head
+                                              + (ptrdiff_t)q_idx * strides.o_stride_seq + d;
+                        O[o_idx] = acc[i] * inv_l;
                     }
-
-                    // Update running stats
-                    m_curr = m_new;
-                    l_curr = l_curr * alpha_prev + l_split;
                 }
-                it.barrier(sycl::access::fence_space::local_space);
-            }  // end splits
-
-            // Final normalization and store
-            const int local_row = it.get_local_id(0);
-            for (int q_local = local_row; q_local < BQ; q_local += WG_M) {
-                int q_idx = q_start + q_local;
-                if (q_idx >= N) {
-                    continue;
-                }
-
-                float inv_l = 1.0f / (l_curr > 1e-10f ? l_curr : 1.0f);
-#pragma unroll
-                for (int d = 0; d < DV; ++d) {
-                    ptrdiff_t o_idx =
-                        (ptrdiff_t) head_idx * strides.o_stride_head + (ptrdiff_t) q_idx * strides.o_stride_seq + d;
-                    O[o_idx] = acc[d] * inv_l;
-                }
-            }
-        });
-    });
+            });  // end parallel_for
+    });  // end submit
 }
 
 #endif  // GGML_SYCL_FATTN_FUSED_HPP
