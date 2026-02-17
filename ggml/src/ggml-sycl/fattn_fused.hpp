@@ -3,6 +3,10 @@
 // Each subgroup handles one query row; threads within a subgroup split the
 // head dimension (D) to reduce register pressure from ~160 to ~24 regs/thread.
 // Graph-compatible, no oneMKL dependency.
+//
+// Optimizations:
+// - Q loaded directly into registers (no SLM for Q, saves ROWS_PER_WG*DQK*4 bytes)
+// - K/V stored as float in SLM for reliable alignment on all Intel architectures
 
 #ifndef GGML_SYCL_FATTN_FUSED_HPP
 #define GGML_SYCL_FATTN_FUSED_HPP
@@ -20,10 +24,12 @@ constexpr int FATTN_ROWS_PER_WG     = 32;
 constexpr int FATTN_MAX_HEAD_SIZE   = 128;
 
 // Compute shared memory size needed (in bytes)
+// Only K and V in SLM; Q is in registers
 inline size_t fattn_fused_shmem_size(int DQK, int DV, int rows_per_wg, int BK) {
-    size_t size = rows_per_wg * DQK;  // shQ
-    size += BK * DQK;                  // shK
-    size += BK * DV;                   // shV
+    (void)rows_per_wg;
+    size_t size = 0;
+    size += BK * DQK;  // shK
+    size += BK * DV;   // shV
     return size * sizeof(float);
 }
 
@@ -59,9 +65,10 @@ template <> inline float load_as_float<sycl::ext::oneapi::bfloat16>(const sycl::
 //   dim 1 = lane within subgroup (fast-varying → maps to subgroup lanes)
 //
 // Each thread owns:
-//   acc[DV / SG_SIZE]   (e.g. 128/16 = 8 floats)
-//   m_curr, l_curr      (2 floats)
-// Total: ~10 registers (was ~160)
+//   regQ[DQK / SG_SIZE]  (Q row in registers, loaded once)
+//   acc[DV / SG_SIZE]    (e.g. 128/16 = 8 floats)
+//   m_curr, l_curr       (2 floats)
+// Total: ~18 registers for DQK=DV=128
 template <typename QType, typename KVType, typename MaskT, int DQK, int DV,
           int SG_SIZE = 16, int ROWS_PER_WG = FATTN_ROWS_PER_WG, int BK = FATTN_BK>
 inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
@@ -91,15 +98,14 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
     const int num_q_blocks = (N + ROWS_PER_WG - 1) / ROWS_PER_WG;
 
     // Work-group: dim0 = ROWS_PER_WG (rows/subgroups), dim1 = SG_SIZE (lanes)
-    // dim1 varies fastest in SYCL linearization, so consecutive linear IDs
-    // share the same row → one subgroup = one query row
     sycl::range<2> global(num_q_blocks * ROWS_PER_WG, n_heads * SG_SIZE);
     sycl::range<2> local(ROWS_PER_WG, SG_SIZE);
 
-    const size_t shmem_elems = fattn_fused_shmem_size(DQK, DV, ROWS_PER_WG, BK) / sizeof(float);
+    // SLM: only K and V tiles (Q is in registers)
+    constexpr size_t shmem_floats = BK * DQK + BK * DV;
 
     stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<float, 1> shmem_acc(sycl::range<1>(shmem_elems), cgh);
+        sycl::local_accessor<float, 1> shmem_acc(sycl::range<1>(shmem_floats), cgh);
 
         cgh.parallel_for(
             sycl::nd_range<2>(global, local),
@@ -110,7 +116,7 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                 const int lane        = it.get_local_id(1);   // 0..SG_SIZE-1
                 const int q_block_idx = it.get_group(0);
                 const int head_idx    = it.get_group(1);
-                const int lid         = it.get_local_linear_id(); // row_in_wg * SG_SIZE + lane
+                const int lid         = it.get_local_linear_id();
 
                 const int q_start = q_block_idx * ROWS_PER_WG;
 
@@ -123,10 +129,27 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                 const bool active_row  = (q_idx < N);
                 const int  kv_head_idx = head_idx / gqa_ratio;
 
-                // Partition shared memory
-                float * shQ = shmem;                           // [ROWS_PER_WG][DQK]
-                float * shK = shQ + ROWS_PER_WG * DQK;        // [BK][DQK]
-                float * shV = shK + BK * DQK;                 // [BK][DV]
+                // Partition shared memory: K and V only (no Q)
+                float * shK = shmem;                // [BK][DQK]
+                float * shV = shK + BK * DQK;      // [BK][DV]
+
+                // ============================================================
+                // Load Q directly into registers (each lane loads its D-slice)
+                // Each lane needs DK_PER_THREAD elements, loaded once and
+                // reused across all KV tiles. Saves ROWS_PER_WG*DQK*4 SLM.
+                // ============================================================
+                float regQ[DK_PER_THREAD];
+                #pragma unroll
+                for (int i = 0; i < DK_PER_THREAD; ++i) {
+                    if (active_row) {
+                        const int d = lane + i * SG_SIZE;
+                        const ptrdiff_t gi = (ptrdiff_t)head_idx * strides.q_stride_head
+                                           + (ptrdiff_t)q_idx * strides.q_stride_seq + d;
+                        regQ[i] = load_as_float<QType>(&Q[gi]);
+                    } else {
+                        regQ[i] = 0.0f;
+                    }
+                }
 
                 // Thread-local accumulators (D-split)
                 float acc[D_PER_THREAD];
@@ -136,23 +159,6 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                 }
                 float m_curr = -1.0e20f;
                 float l_curr = 0.0f;
-
-                // ============================================================
-                // Load Q tile into SLM (cooperative across entire workgroup)
-                // ============================================================
-                for (int idx = lid; idx < ROWS_PER_WG * DQK; idx += WG_SIZE) {
-                    const int q_local = idx / DQK;
-                    const int d       = idx % DQK;
-                    const int qi      = q_start + q_local;
-                    if (qi < N) {
-                        const ptrdiff_t gi = (ptrdiff_t)head_idx * strides.q_stride_head
-                                           + (ptrdiff_t)qi * strides.q_stride_seq + d;
-                        shQ[q_local * DQK + d] = load_as_float<QType>(&Q[gi]);
-                    } else {
-                        shQ[q_local * DQK + d] = 0.0f;
-                    }
-                }
-                it.barrier(sycl::access::fence_space::local_space);
 
                 // ============================================================
                 // Loop over KV blocks
@@ -197,11 +203,12 @@ inline void ggml_sycl_op_flash_attn_fused(sycl::queue *                stream,
                         const int split = kv_start / BK;
 
                         for (int k = 0; k < kv_chunk; ++k) {
+                            // Q@K^T dot product: Q from registers, K from SLM
                             float partial_dot = 0.0f;
                             #pragma unroll
                             for (int di = 0; di < DK_PER_THREAD; ++di) {
                                 const int d = lane + di * SG_SIZE;
-                                partial_dot += shQ[row_in_wg * DQK + d] * shK[k * DQK + d];
+                                partial_dot += regQ[di] * shK[k * DQK + d];
                             }
                             float dot = warp_reduce_sum<SG_SIZE>(partial_dot);
 
