@@ -92,7 +92,46 @@
     LD_LIBRARY_PATH=~/igc_workspace/build/IGC/Release:$LD_LIBRARY_PATH \
       ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p "type_a=q8_0"
     ```
-  - Test: `./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p "type_a=q8_0"`
+    - Test: `./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p "type_a=q8_0"`
+
+## SYCL MUL_MAT Path Logging and XMX Int8 (Feb 2026)
+
+### Path Discovery
+- Added logging in `ggml_sycl_mul_mat()` to show which implementation is selected:
+  - `ggml_sycl: MUL_MAT DMMV ne=[...] type=...` - Dequantize + mul_mat_vec
+  - `ggml_sycl: MUL_MAT MMVQ ne=[...] type=...` - Vector quantization mul_mat
+  - `ggml_sycl: MUL_MAT MMQ ne=[...] type=...` - Matrix multiplication with quantization
+  - `ggml_sycl: MUL_MAT XMX ne=[...] type=...` - XMX hardware accelerated GEMM (F32/F16)
+  - `ggml_sycl: MUL_MAT XMX_INT8 ne=[...] type=...` - XMX int8 GEMM (quantized types)
+  - `ggml_sycl: MUL_MAT MKL ne=[...] type=...` - oneMKL fallback
+- Also logs MUL_MAT_ID paths: `TILED` (MoE tiled) or `MMQ` (MoE MMQ)
+
+### Key Finding: MMQ Row Guard
+- MMQ path is guarded by `MMQ_MIN_NROWS=128` in matmul.cpp
+- When batch size < 128, MMQ is disabled and falls through to XMX path
+- XMX path only supports F32/F16 - for quantized types it falls back to MKL
+- This explains Perfetto showing `gemm_kernel` (MKL) for q8_0 at small batch sizes
+
+### XMX Int8 Support (Opt-in)
+- XMX int8 kernels exist in `mmq_xmx_int8.cpp` but were not wired up
+- Now connected via `ggml_sycl_op_mul_mat_xmx()` for q8_0, q4_0, q4_1, q5_0, q5_1, q8_1
+- Enable with: `GGML_SYCL_XMX_INT8=1 ./build-sycl/bin/llama-bench ...`
+- Currently causes hangs on some configs - use at your own risk
+- Without the flag, falls back to MKL (original behavior)
+
+### MUL_MAT_ID XMX Env Flag
+- Set `GGML_SYCL_MUL_MAT_ID_XMX=1` to bypass Xe2 tiled workaround
+- Allows testing MMQ path for MoE (requires patched IGC to avoid AddRequiredMemoryFences crash)
+- Default behavior: Xe2 always uses TILED path to avoid IGC crash
+
+### Testing Path Selection
+```bash
+# Run benchmark - logs show path per operation
+./build-sycl/bin/llama-bench -m model.gguf -n 32 -p 32 --split-mode layer --tensor-split 1,1 2>&1 | grep "MUL_MAT"
+
+# Single device, no split (simpler paths)
+./build-sycl/bin/llama-bench -m model.gguf -n 16 -p 16 --split-mode none
+```
 
 ## SYCL Flash Attention hsk=40 Investigation (Feb 2026)
 

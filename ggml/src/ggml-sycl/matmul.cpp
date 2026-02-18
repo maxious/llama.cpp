@@ -55,6 +55,7 @@
 #include "ggml-sycl/gemm_xmx.hpp"
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/itt_annotations.hpp"
+#include "ggml-sycl/mmq_xmx_int8.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/quantize.hpp"
@@ -1126,6 +1127,18 @@ static void ggml_sycl_op_mul_mat_xmx(ggml_backend_sycl_context & ctx,
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
         launch_gemm_xmx_f16_f16(stream, (const sycl::half *) src1_ddf_i, (const sycl::half *) src0_dd_i,
                                 (sycl::half *) dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc);
+    } else if (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 ||
+               src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_1) {
+        // XMX int8 path for quantized types (opt-in via env var, can cause hangs on some configs)
+        static bool enable_xmx_int8 = getenv("GGML_SYCL_XMX_INT8") != nullptr;
+        if (enable_xmx_int8 && has_int8_xmx_support(stream)) {
+            ggml_sycl_op_mul_mat_q_xmx_int8(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low,
+                                            row_high, src1_ncols, src1_padded_row_size, stream);
+        } else {
+            // Fallback to oneMKL (original behavior before this change)
+            ggml_sycl_op_mul_mat_sycl(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low,
+                                      row_high, src1_ncols, src1_padded_row_size, stream);
+        }
     } else {
         // Fallback to oneMKL for unsupported types (mixed, etc.)
         // Note: This fallback is NOT graph-compatible.
@@ -1283,7 +1296,6 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     use_mul_mat_q                   = use_mul_mat_q && (src0->ne[1] >= MMQ_MIN_NROWS);
     use_mul_mat_q                   = use_mul_mat_q && (src1->ne[1] >= MMQ_MIN_NROWS);
 
-
     // Dispatch becomes obscure with the reorder, MMVQ when the reorder optimization
     // is enabled takes precedence over DMMV, the current if-else implementation
     // requires disabling DMMV if both conditions are met
@@ -1317,26 +1329,42 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     } else if (use_dequantize_mul_mat_vec) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::DMMV);
         GGML_SYCL_ITT_OP(dmmv);
+        fprintf(stderr, "ggml_sycl: MUL_MAT DMMV ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
+                dst->ne[3], ggml_type_name(src0->type));
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);
     } else if (use_mul_mat_vec_q) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
         ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
         if (extra && extra->optimized_feature.reorder) {
             GGML_SYCL_ITT_OP(mmvq_reorder);
+            fprintf(stderr, "ggml_sycl: MUL_MAT MMVQ_REORDER ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1],
+                    dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
             ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         } else {
             GGML_SYCL_ITT_OP(mmvq);
+            fprintf(stderr, "ggml_sycl: MUL_MAT MMVQ ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1],
+                    dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         }
     } else if (use_mul_mat_q) {
         GGML_SYCL_ITT_MUL_MAT_MMQ(quantized);
+        fprintf(stderr, "ggml_sycl: MUL_MAT MMQ ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
+                dst->ne[3], ggml_type_name(src0->type));
         ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
     } else {
         if (xmx_gemm_available(ctx.stream())) {
+            // Note: XMX path supports F32, F16, and now Q8_0/Q4_0/etc via int8 XMX
             GGML_SYCL_ITT_MUL_MAT_XMX(f32);
+            bool is_quant =
+                (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 ||
+                 src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_1);
+            fprintf(stderr, "ggml_sycl: MUL_MAT %s ne=[%ld,%ld,%ld,%ld] type=%s\n", is_quant ? "XMX_INT8" : "XMX",
+                    dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
             ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_xmx);
         } else {
             GGML_SYCL_ITT_MUL_MAT_MKL(f32);
+            fprintf(stderr, "ggml_sycl: MUL_MAT MKL ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
+                    dst->ne[3], ggml_type_name(src0->type));
             ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);
         }
     }
@@ -1860,14 +1888,20 @@ void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) tr
     // Use tiled path on Xe2 to work around IGC compiler crash in AddRequiredMemoryFences pass.
     // The MMQ kernels trigger a bug in IGC's SLM fence insertion when compiled as part of the
     // MUL_MAT_ID SPIR-V module (same kernels work fine in the MUL_MAT path).
-    const bool use_tiled = ctx.force_graph_compatible ||
-                           ggml_sycl_info().devices[ctx.device].arch == SYCL_ARCH_INTEL_XE2;
+    // Set GGML_SYCL_MUL_MAT_ID_XMX=1 to force XMX path (requires patched IGC to avoid crashes).
+    static bool enable_xmx = getenv("GGML_SYCL_MUL_MAT_ID_XMX") != nullptr;
+    const bool  use_tiled =
+        !enable_xmx && (ctx.force_graph_compatible || ggml_sycl_info().devices[ctx.device].arch == SYCL_ARCH_INTEL_XE2);
     if (use_tiled) {
         GGML_SYCL_ITT_MUL_MAT_ID_TILED(moe);
+        fprintf(stderr, "ggml_sycl: MUL_MAT_ID TILED ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1],
+                dst->ne[2], dst->ne[3], ggml_type_name(dst->src[0]->type));
         ggml_sycl_mul_mat_id_tiled(ctx, dst);
         return;
     }
     GGML_SYCL_ITT_MUL_MAT_ID_MMQ(moe);
+    fprintf(stderr, "ggml_sycl: MUL_MAT_ID MMQ ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
+            dst->ne[3], ggml_type_name(dst->src[0]->type));
 
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
     const ggml_tensor *  src0 = dst->src[0];
