@@ -61,6 +61,7 @@ static void mmq_q8_0_xmx_kernel(const block_q8_0 * __restrict__ vx,
                                 const void * __restrict__ vy,
                                 float * __restrict__ dst,
                                 const int                K,
+                                const int                K_padded,
                                 const int                M,
                                 const int                N,
                                 const sycl::nd_item<2> & item_ct1,
@@ -79,7 +80,8 @@ static void mmq_q8_0_xmx_kernel(const block_q8_0 * __restrict__ vx,
     const int sg_starty = item_ct1.get_group(1) * TN;
     const int lane_id   = sg.get_local_id()[0];
 
-    const int           K_blocks = K / 32;
+    // K_blocks is based on padded K for scale array stride
+    const int           K_blocks = K_padded / 32;
     const sycl::half2 * ds_ptr   = (const sycl::half2 *) vy;
     const int8_t *      qs_ptr   = (const int8_t *) (ds_ptr + N * K_blocks);
 
@@ -108,10 +110,12 @@ static void mmq_q8_0_xmx_kernel(const block_q8_0 * __restrict__ vx,
         sycl::group_barrier(item_ct1.get_group());
 
         for (int i = 0; i < TM; i++) {
-            float   scale_a = (float) vx[(sg_startx + i) * K_blocks + k_tile].d;
+            // scale_a uses K_blocks from src0 (already correct)
+            float   scale_a = (float) vx[(sg_startx + i) * (K / 32) + k_tile].d;
             int32_t val     = slm_tile[i * TN + lane_id];
             // Only accumulate if this lane is within bounds
             if (sg_starty + lane_id < N) {
+                // scale_b uses K_blocks from padded src1
                 float scale_b = (float) ds_ptr[(sg_starty + lane_id) * K_blocks + k_tile][0];
                 acc[i] += (float) val * scale_a * scale_b;
             }
@@ -131,6 +135,7 @@ static void mmq_q4_0_xmx_kernel(const block_q4_0 * __restrict__ vx,
                                 const void * __restrict__ vy,
                                 float * __restrict__ dst,
                                 const int                K,
+                                const int                K_padded,
                                 const int                M,
                                 const int                N,
                                 const sycl::nd_item<2> & item_ct1,
@@ -150,7 +155,7 @@ static void mmq_q4_0_xmx_kernel(const block_q4_0 * __restrict__ vx,
     const int lane_id   = sg.get_local_id()[0];
     const int sg_size   = sg.get_max_local_range()[0];
 
-    const int           K_blocks = K / QK4_0;
+    const int           K_blocks = K_padded / 32;
     const sycl::half2 * ds_ptr   = (const sycl::half2 *) vy;
     const int8_t *      qs_ptr   = (const int8_t *) (ds_ptr + N * K_blocks);
 
@@ -163,7 +168,7 @@ static void mmq_q4_0_xmx_kernel(const block_q4_0 * __restrict__ vx,
             int j   = (idx * 2) % TK / 2;
             int row = sg_startx + i;
             if (row < M) {
-                const block_q4_0 * block  = &vx[row * K_blocks + k_tile * (TK / QK4_0)];
+                const block_q4_0 * block  = &vx[row * (K / QK4_0) + k_tile * (TK / QK4_0)];
                 uint8_t            qs_val = block->qs[j];
                 slm_A[idx * 2 + 0]        = (int8_t) ((qs_val >> 0) & 0x0F) - 8;
                 slm_A[idx * 2 + 1]        = (int8_t) ((qs_val >> 4) & 0x0F) - 8;
@@ -196,7 +201,7 @@ static void mmq_q4_0_xmx_kernel(const block_q4_0 * __restrict__ vx,
         for (int i = 0; i < TM; i++) {
             int row = sg_startx + i;
             if (row < M) {
-                const block_q4_0 * block   = &vx[row * K_blocks + k_tile * (TK / QK4_0)];
+                const block_q4_0 * block   = &vx[row * (K / QK4_0) + k_tile * (TK / QK4_0)];
                 float              scale_a = (float) block->d;
                 float   scale_b = (float) ds_ptr[(sg_starty + lane_id) * K_blocks + k_tile * (TK / QK4_0)][0];
                 int32_t val     = slm_tile[i * TN + lane_id];
@@ -220,6 +225,7 @@ static void mmq_q4_1_xmx_kernel(const block_q4_1 * __restrict__ vx,
                                 const void * __restrict__ vy,
                                 float * __restrict__ dst,
                                 const int                K,
+                                const int                K_padded,
                                 const int                M,
                                 const int                N,
                                 const sycl::nd_item<2> & item_ct1,
@@ -239,7 +245,7 @@ static void mmq_q4_1_xmx_kernel(const block_q4_1 * __restrict__ vx,
     const int lane_id   = sg.get_local_id()[0];
     const int sg_size   = sg.get_max_local_range()[0];
 
-    const int           K_blocks = K / QK4_1;
+    const int           K_blocks = K_padded / 32;
     const sycl::half2 * ds_ptr   = (const sycl::half2 *) vy;
     const int8_t *      qs_ptr   = (const int8_t *) (ds_ptr + N * K_blocks);
 
@@ -252,7 +258,7 @@ static void mmq_q4_1_xmx_kernel(const block_q4_1 * __restrict__ vx,
             int j   = (idx * 2) % TK / 2;
             int row = sg_startx + i;
             if (row < M) {
-                const block_q4_1 * block  = &vx[row * K_blocks + k_tile * (TK / QK4_1)];
+                const block_q4_1 * block  = &vx[row * (K / QK4_0) + k_tile * (TK / QK4_1)];
                 uint8_t            qs_val = block->qs[j];
                 slm_A[idx * 2 + 0]        = (int8_t) ((qs_val >> 0) & 0x0F);
                 slm_A[idx * 2 + 1]        = (int8_t) ((qs_val >> 4) & 0x0F);
@@ -285,7 +291,7 @@ static void mmq_q4_1_xmx_kernel(const block_q4_1 * __restrict__ vx,
         for (int i = 0; i < TM; i++) {
             int row = sg_startx + i;
             if (row < M) {
-                const block_q4_1 * block   = &vx[row * K_blocks + k_tile * (TK / QK4_1)];
+                const block_q4_1 * block   = &vx[row * (K / QK4_0) + k_tile * (TK / QK4_1)];
                 const sycl::half2  dm      = block->dm;
                 float              d       = (float) dm[0];
                 float              m       = (float) dm[1];
@@ -311,6 +317,7 @@ static void mmq_q5_0_xmx_kernel(const block_q5_0 * __restrict__ vx,
                                 const void * __restrict__ vy,
                                 float * __restrict__ dst,
                                 const int                K,
+                                const int                K_padded,
                                 const int                M,
                                 const int                N,
                                 const sycl::nd_item<2> & item_ct1,
@@ -330,7 +337,7 @@ static void mmq_q5_0_xmx_kernel(const block_q5_0 * __restrict__ vx,
     const int lane_id   = sg.get_local_id()[0];
     const int sg_size   = sg.get_max_local_range()[0];
 
-    const int           K_blocks = K / QK5_0;
+    const int           K_blocks = K_padded / 32;
     const sycl::half2 * ds_ptr   = (const sycl::half2 *) vy;
     const int8_t *      qs_ptr   = (const int8_t *) (ds_ptr + N * K_blocks);
 
@@ -343,7 +350,7 @@ static void mmq_q5_0_xmx_kernel(const block_q5_0 * __restrict__ vx,
             int j   = (idx * 2) % TK / 2;
             int row = sg_startx + i;
             if (row < M) {
-                const block_q5_0 * block = &vx[row * K_blocks + k_tile * (TK / QK5_0)];
+                const block_q5_0 * block = &vx[row * (K / QK5_0) + k_tile * (TK / QK5_0)];
                 const uint8_t *    qs    = block->qs;
                 const uint32_t     qh    = *(const uint32_t *) block->qh;
 
@@ -382,7 +389,7 @@ static void mmq_q5_0_xmx_kernel(const block_q5_0 * __restrict__ vx,
         for (int i = 0; i < TM; i++) {
             int row = sg_startx + i;
             if (row < M) {
-                const block_q5_0 * block   = &vx[row * K_blocks + k_tile * (TK / QK5_0)];
+                const block_q5_0 * block   = &vx[row * (K / QK5_0) + k_tile * (TK / QK5_0)];
                 float              scale_a = (float) block->d;
                 float   scale_b = (float) ds_ptr[(sg_starty + lane_id) * K_blocks + k_tile * (TK / QK5_0)][0];
                 int32_t val     = slm_tile[i * TN + lane_id];
@@ -406,6 +413,7 @@ static void mmq_q5_1_xmx_kernel(const block_q5_1 * __restrict__ vx,
                                 const void * __restrict__ vy,
                                 float * __restrict__ dst,
                                 const int                K,
+                                const int                K_padded,
                                 const int                M,
                                 const int                N,
                                 const sycl::nd_item<2> & item_ct1,
@@ -425,7 +433,7 @@ static void mmq_q5_1_xmx_kernel(const block_q5_1 * __restrict__ vx,
     const int lane_id   = sg.get_local_id()[0];
     const int sg_size   = sg.get_max_local_range()[0];
 
-    const int           K_blocks = K / QK5_1;
+    const int           K_blocks = K_padded / 32;
     const sycl::half2 * ds_ptr   = (const sycl::half2 *) vy;
     const int8_t *      qs_ptr   = (const int8_t *) (ds_ptr + N * K_blocks);
 
@@ -438,7 +446,7 @@ static void mmq_q5_1_xmx_kernel(const block_q5_1 * __restrict__ vx,
             int j   = (idx * 2) % TK / 2;
             int row = sg_startx + i;
             if (row < M) {
-                const block_q5_1 * block = &vx[row * K_blocks + k_tile * (TK / QK5_1)];
+                const block_q5_1 * block = &vx[row * (K / QK4_0) + k_tile * (TK / QK5_1)];
                 const uint8_t *    qs    = block->qs;
                 const uint32_t     qh    = *(const uint32_t *) block->qh;
 
@@ -477,7 +485,7 @@ static void mmq_q5_1_xmx_kernel(const block_q5_1 * __restrict__ vx,
         for (int i = 0; i < TM; i++) {
             int row = sg_startx + i;
             if (row < M) {
-                const block_q5_1 * block   = &vx[row * K_blocks + k_tile * (TK / QK5_1)];
+                const block_q5_1 * block   = &vx[row * (K / QK4_0) + k_tile * (TK / QK5_1)];
                 const sycl::half2  dm      = block->dm;
                 float              d       = (float) dm[0];
                 float              m       = (float) dm[1];
@@ -503,6 +511,7 @@ static void mmq_q8_1_xmx_kernel(const block_q8_1 * __restrict__ vx,
                                 const void * __restrict__ vy,
                                 float * __restrict__ dst,
                                 const int                K,
+                                const int                K_padded,
                                 const int                M,
                                 const int                N,
                                 const sycl::nd_item<2> & item_ct1,
@@ -522,7 +531,7 @@ static void mmq_q8_1_xmx_kernel(const block_q8_1 * __restrict__ vx,
     const int lane_id   = sg.get_local_id()[0];
     const int sg_size   = sg.get_max_local_range()[0];
 
-    const int           K_blocks = K / QK8_1;
+    const int           K_blocks = K_padded / 32;
     const sycl::half2 * ds_ptr   = (const sycl::half2 *) vy;
     const int8_t *      qs_ptr   = (const int8_t *) (ds_ptr + N * K_blocks);
 
@@ -549,7 +558,7 @@ static void mmq_q8_1_xmx_kernel(const block_q8_1 * __restrict__ vx,
         sycl::group_barrier(item_ct1.get_group());
 
         for (int i = 0; i < TM; i++) {
-            const sycl::half2 ds      = vx[(sg_startx + i) * K_blocks + k_tile].ds;
+            const sycl::half2 ds      = vx[(sg_startx + i) * (K / 32) + k_tile].ds;
             float             scale_a = (float) ds[0];
             float             scale_b = (float) ds_ptr[(sg_starty + lane_id) * K_blocks + k_tile][0];
             int32_t           val     = slm_tile[i * TN + lane_id];
