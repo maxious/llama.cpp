@@ -67,8 +67,8 @@ static void mmq_q8_0_xmx_kernel(const block_q8_0 * __restrict__ vx,
                                 int32_t *                slm_tile) {
     const auto sg = item_ct1.get_sub_group();
 
-    joint_matrix<sub_group, int8_t, use::a, TM, TK, layout::row_major>        matA;
-    joint_matrix<sub_group, int8_t, use::b, TK, TN, layout::ext_intel_packed> matB;
+    joint_matrix<sub_group, int8_t, use::a, TM, TK, layout::row_major> matA;
+    joint_matrix<sub_group, int8_t, use::b, TK, TN, layout::row_major> matB;
 
     float acc[TM];
     for (int i = 0; i < TM; i++) {
@@ -88,12 +88,15 @@ static void mmq_q8_0_xmx_kernel(const block_q8_0 * __restrict__ vx,
         auto           pA =
             sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(pA_raw);
 
-        const int8_t * pB_raw = qs_ptr + (k_tile * TK / 4) * (N * 4) + sg_starty * 4;
+        // Row-major layout: B is stored as [K][N], stride = N
+        // Offset: (k_tile * TK) * N + (sg_starty / sg_size) * TN
+        const int      sg_size = sg.get_max_local_range()[0];
+        const int8_t * pB_raw  = qs_ptr + (k_tile * TK) * N + (sg_starty / sg_size) * TN;
         auto           pB =
             sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(pB_raw);
 
         joint_matrix_load(sg, matA, pA, K_blocks * 34);
-        joint_matrix_load(sg, matB, pB, N * 4);
+        joint_matrix_load(sg, matB, pB, N);  // stride = N for row_major
 
         joint_matrix<sub_group, int32_t, use::accumulator, TM, TN> matC;
         joint_matrix_fill(sg, matC, 0);
@@ -106,9 +109,12 @@ static void mmq_q8_0_xmx_kernel(const block_q8_0 * __restrict__ vx,
 
         for (int i = 0; i < TM; i++) {
             float   scale_a = (float) vx[(sg_startx + i) * K_blocks + k_tile].d;
-            float   scale_b = (float) ds_ptr[(sg_starty + lane_id) * K_blocks + k_tile][0];
             int32_t val     = slm_tile[i * TN + lane_id];
-            acc[i] += (float) val * scale_a * scale_b;
+            // Only accumulate if this lane is within bounds
+            if (sg_starty + lane_id < N) {
+                float scale_b = (float) ds_ptr[(sg_starty + lane_id) * K_blocks + k_tile][0];
+                acc[i] += (float) val * scale_a * scale_b;
+            }
         }
         sycl::group_barrier(item_ct1.get_group());
     }
@@ -131,8 +137,8 @@ static void mmq_q4_0_xmx_kernel(const block_q4_0 * __restrict__ vx,
                                 int32_t *                slm_tile) {
     const auto sg = item_ct1.get_sub_group();
 
-    joint_matrix<sub_group, int8_t, use::a, TM, TK, layout::row_major>        matA;
-    joint_matrix<sub_group, int8_t, use::b, TK, TN, layout::ext_intel_packed> matB;
+    joint_matrix<sub_group, int8_t, use::a, TM, TK, layout::row_major> matA;
+    joint_matrix<sub_group, int8_t, use::b, TK, TN, layout::row_major> matB;
 
     float acc[TM];
     for (int i = 0; i < TM; i++) {
@@ -142,6 +148,7 @@ static void mmq_q4_0_xmx_kernel(const block_q4_0 * __restrict__ vx,
     const int sg_startx = item_ct1.get_group(0) * TM;
     const int sg_starty = item_ct1.get_group(1) * TN;
     const int lane_id   = sg.get_local_id()[0];
+    const int sg_size   = sg.get_max_local_range()[0];
 
     const int           K_blocks = K / QK4_0;
     const sycl::half2 * ds_ptr   = (const sycl::half2 *) vy;
@@ -171,10 +178,11 @@ static void mmq_q4_0_xmx_kernel(const block_q4_0 * __restrict__ vx,
             sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(slm_A);
         joint_matrix_load(sg, matA, pA, TK);
 
-        const int8_t * pB_raw = qs_ptr + (k_tile * TK / 4) * (N * 4) + sg_starty * 4;
+        // Row-major layout: B is stored as [K][N], stride = N
+        const int8_t * pB_raw = qs_ptr + (k_tile * TK) * N + (sg_starty / sg_size) * TN;
         auto           pB =
             sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(pB_raw);
-        joint_matrix_load(sg, matB, pB, N * 4);
+        joint_matrix_load(sg, matB, pB, N);  // stride = N for row_major
 
         joint_matrix<sub_group, int32_t, use::accumulator, TM, TN> matC;
         joint_matrix_fill(sg, matC, 0);
@@ -192,7 +200,9 @@ static void mmq_q4_0_xmx_kernel(const block_q4_0 * __restrict__ vx,
                 float              scale_a = (float) block->d;
                 float   scale_b = (float) ds_ptr[(sg_starty + lane_id) * K_blocks + k_tile * (TK / QK4_0)][0];
                 int32_t val     = slm_tile[i * TN + lane_id];
-                acc[i] += (float) val * scale_a * scale_b;
+                if (sg_starty + lane_id < N) {
+                    acc[i] += (float) val * scale_a * scale_b;
+                }
             }
         }
         sycl::group_barrier(item_ct1.get_group());
@@ -216,8 +226,8 @@ static void mmq_q4_1_xmx_kernel(const block_q4_1 * __restrict__ vx,
                                 int32_t *                slm_tile) {
     const auto sg = item_ct1.get_sub_group();
 
-    joint_matrix<sub_group, int8_t, use::a, TM, TK, layout::row_major>        matA;
-    joint_matrix<sub_group, int8_t, use::b, TK, TN, layout::ext_intel_packed> matB;
+    joint_matrix<sub_group, int8_t, use::a, TM, TK, layout::row_major> matA;
+    joint_matrix<sub_group, int8_t, use::b, TK, TN, layout::row_major> matB;
 
     float acc[TM];
     for (int i = 0; i < TM; i++) {
@@ -227,6 +237,7 @@ static void mmq_q4_1_xmx_kernel(const block_q4_1 * __restrict__ vx,
     const int sg_startx = item_ct1.get_group(0) * TM;
     const int sg_starty = item_ct1.get_group(1) * TN;
     const int lane_id   = sg.get_local_id()[0];
+    const int sg_size   = sg.get_max_local_range()[0];
 
     const int           K_blocks = K / QK4_1;
     const sycl::half2 * ds_ptr   = (const sycl::half2 *) vy;
@@ -256,10 +267,11 @@ static void mmq_q4_1_xmx_kernel(const block_q4_1 * __restrict__ vx,
             sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(slm_A);
         joint_matrix_load(sg, matA, pA, TK);
 
-        const int8_t * pB_raw = qs_ptr + (k_tile * TK / 4) * (N * 4) + sg_starty * 4;
+        // Row-major layout: B is stored as [K][N], stride = N
+        const int8_t * pB_raw = qs_ptr + (k_tile * TK) * N + (sg_starty / sg_size) * TN;
         auto           pB =
             sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(pB_raw);
-        joint_matrix_load(sg, matB, pB, N * 4);
+        joint_matrix_load(sg, matB, pB, N);  // stride = N for row_major
 
         joint_matrix<sub_group, int32_t, use::accumulator, TM, TN> matC;
         joint_matrix_fill(sg, matC, 0);
@@ -305,8 +317,8 @@ static void mmq_q5_0_xmx_kernel(const block_q5_0 * __restrict__ vx,
                                 int32_t *                slm_tile) {
     const auto sg = item_ct1.get_sub_group();
 
-    joint_matrix<sub_group, int8_t, use::a, TM, TK, layout::row_major>        matA;
-    joint_matrix<sub_group, int8_t, use::b, TK, TN, layout::ext_intel_packed> matB;
+    joint_matrix<sub_group, int8_t, use::a, TM, TK, layout::row_major> matA;
+    joint_matrix<sub_group, int8_t, use::b, TK, TN, layout::row_major> matB;
 
     float acc[TM];
     for (int i = 0; i < TM; i++) {
@@ -316,6 +328,7 @@ static void mmq_q5_0_xmx_kernel(const block_q5_0 * __restrict__ vx,
     const int sg_startx = item_ct1.get_group(0) * TM;
     const int sg_starty = item_ct1.get_group(1) * TN;
     const int lane_id   = sg.get_local_id()[0];
+    const int sg_size   = sg.get_max_local_range()[0];
 
     const int           K_blocks = K / QK5_0;
     const sycl::half2 * ds_ptr   = (const sycl::half2 *) vy;
@@ -351,10 +364,11 @@ static void mmq_q5_0_xmx_kernel(const block_q5_0 * __restrict__ vx,
             sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(slm_A);
         joint_matrix_load(sg, matA, pA, TK);
 
-        const int8_t * pB_raw = qs_ptr + (k_tile * TK / 4) * (N * 4) + sg_starty * 4;
+        // Row-major layout: B is stored as [K][N], stride = N
+        const int8_t * pB_raw = qs_ptr + (k_tile * TK) * N + (sg_starty / sg_size) * TN;
         auto           pB =
             sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(pB_raw);
-        joint_matrix_load(sg, matB, pB, N * 4);
+        joint_matrix_load(sg, matB, pB, N);  // stride = N for row_major
 
         joint_matrix<sub_group, int32_t, use::accumulator, TM, TN> matC;
         joint_matrix_fill(sg, matC, 0);
@@ -372,7 +386,9 @@ static void mmq_q5_0_xmx_kernel(const block_q5_0 * __restrict__ vx,
                 float              scale_a = (float) block->d;
                 float   scale_b = (float) ds_ptr[(sg_starty + lane_id) * K_blocks + k_tile * (TK / QK5_0)][0];
                 int32_t val     = slm_tile[i * TN + lane_id];
-                acc[i] += (float) val * scale_a * scale_b;
+                if (sg_starty + lane_id < N) {
+                    acc[i] += (float) val * scale_a * scale_b;
+                }
             }
         }
         sycl::group_barrier(item_ct1.get_group());
@@ -396,8 +412,8 @@ static void mmq_q5_1_xmx_kernel(const block_q5_1 * __restrict__ vx,
                                 int32_t *                slm_tile) {
     const auto sg = item_ct1.get_sub_group();
 
-    joint_matrix<sub_group, int8_t, use::a, TM, TK, layout::row_major>        matA;
-    joint_matrix<sub_group, int8_t, use::b, TK, TN, layout::ext_intel_packed> matB;
+    joint_matrix<sub_group, int8_t, use::a, TM, TK, layout::row_major> matA;
+    joint_matrix<sub_group, int8_t, use::b, TK, TN, layout::row_major> matB;
 
     float acc[TM];
     for (int i = 0; i < TM; i++) {
@@ -407,6 +423,7 @@ static void mmq_q5_1_xmx_kernel(const block_q5_1 * __restrict__ vx,
     const int sg_startx = item_ct1.get_group(0) * TM;
     const int sg_starty = item_ct1.get_group(1) * TN;
     const int lane_id   = sg.get_local_id()[0];
+    const int sg_size   = sg.get_max_local_range()[0];
 
     const int           K_blocks = K / QK5_1;
     const sycl::half2 * ds_ptr   = (const sycl::half2 *) vy;
@@ -442,10 +459,11 @@ static void mmq_q5_1_xmx_kernel(const block_q5_1 * __restrict__ vx,
             sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(slm_A);
         joint_matrix_load(sg, matA, pA, TK);
 
-        const int8_t * pB_raw = qs_ptr + (k_tile * TK / 4) * (N * 4) + sg_starty * 4;
+        // Row-major layout: B is stored as [K][N], stride = N
+        const int8_t * pB_raw = qs_ptr + (k_tile * TK) * N + (sg_starty / sg_size) * TN;
         auto           pB =
             sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(pB_raw);
-        joint_matrix_load(sg, matB, pB, N * 4);
+        joint_matrix_load(sg, matB, pB, N);  // stride = N for row_major
 
         joint_matrix<sub_group, int32_t, use::accumulator, TM, TN> matC;
         joint_matrix_fill(sg, matC, 0);
@@ -491,8 +509,8 @@ static void mmq_q8_1_xmx_kernel(const block_q8_1 * __restrict__ vx,
                                 int32_t *                slm_tile) {
     const auto sg = item_ct1.get_sub_group();
 
-    joint_matrix<sub_group, int8_t, use::a, TM, TK, layout::row_major>        matA;
-    joint_matrix<sub_group, int8_t, use::b, TK, TN, layout::ext_intel_packed> matB;
+    joint_matrix<sub_group, int8_t, use::a, TM, TK, layout::row_major> matA;
+    joint_matrix<sub_group, int8_t, use::b, TK, TN, layout::row_major> matB;
 
     float acc[TM];
     for (int i = 0; i < TM; i++) {
@@ -502,6 +520,7 @@ static void mmq_q8_1_xmx_kernel(const block_q8_1 * __restrict__ vx,
     const int sg_startx = item_ct1.get_group(0) * TM;
     const int sg_starty = item_ct1.get_group(1) * TN;
     const int lane_id   = sg.get_local_id()[0];
+    const int sg_size   = sg.get_max_local_range()[0];
 
     const int           K_blocks = K / QK8_1;
     const sycl::half2 * ds_ptr   = (const sycl::half2 *) vy;
@@ -512,12 +531,13 @@ static void mmq_q8_1_xmx_kernel(const block_q8_1 * __restrict__ vx,
         auto           pA =
             sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(pA_raw);
 
-        const int8_t * pB_raw = qs_ptr + (k_tile * TK / 4) * (N * 4) + sg_starty * 4;
+        // Row-major layout: B is stored as [K][N], stride = N
+        const int8_t * pB_raw = qs_ptr + (k_tile * TK) * N + (sg_starty / sg_size) * TN;
         auto           pB =
             sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(pB_raw);
 
         joint_matrix_load(sg, matA, pA, K_blocks * 36);
-        joint_matrix_load(sg, matB, pB, N * 4);
+        joint_matrix_load(sg, matB, pB, N);  // stride = N for row_major
 
         joint_matrix<sub_group, int32_t, use::accumulator, TM, TN> matC;
         joint_matrix_fill(sg, matC, 0);
@@ -533,7 +553,9 @@ static void mmq_q8_1_xmx_kernel(const block_q8_1 * __restrict__ vx,
             float             scale_a = (float) ds[0];
             float             scale_b = (float) ds_ptr[(sg_starty + lane_id) * K_blocks + k_tile][0];
             int32_t           val     = slm_tile[i * TN + lane_id];
-            acc[i] += (float) val * scale_a * scale_b;
+            if (sg_starty + lane_id < N) {
+                acc[i] += (float) val * scale_a * scale_b;
+            }
         }
         sycl::group_barrier(item_ct1.get_group());
     }

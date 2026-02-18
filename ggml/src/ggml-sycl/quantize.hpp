@@ -166,12 +166,10 @@ template <int ElementsPerWI> struct quantize_q8_1_for_xmx {
             ds_ptr[scale_offset] = sycl::half2(sycl::half(d), sycl::half(sum));
         }
 
-        // Store quantized value in VNNI layout
-        constexpr int VNNI       = 4;
-        const int     vnni_row   = k_global / VNNI;
-        const int     vnni_col   = batch_idx * VNNI + (k_global % VNNI);
-        const size_t  scale_size = (size_t) N * K_blocks * sizeof(sycl::half2);
-        const size_t  quant_off  = scale_size + (size_t) vnni_row * N * VNNI + vnni_col;
+        // Store quantized value in row-major layout: [K][N]
+        // quant_ptr[k_global][batch_idx] = quantized
+        const size_t scale_size = (size_t) N * K_blocks * sizeof(sycl::half2);
+        const size_t quant_off  = scale_size + (size_t) k_global * N + batch_idx;
 
         auto quant_ptr       = (int8_t *) q8_tensor;
         quant_ptr[quant_off] = quantized;
