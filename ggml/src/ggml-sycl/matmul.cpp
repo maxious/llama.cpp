@@ -29,6 +29,7 @@
 #include <limits>
 #include <regex>
 #include <sycl/sycl.hpp>
+#include <type_traits>
 #include <vector>
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
 #    include <sycl/ext/oneapi/experimental/async_alloc/async_alloc.hpp>

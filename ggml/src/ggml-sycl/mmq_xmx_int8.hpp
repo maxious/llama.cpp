@@ -64,6 +64,7 @@ static void mmq_q8_0_xmx_kernel(const block_q8_0 * __restrict__ vx,
                                 const int                K_padded,
                                 const int                M,
                                 const int                N,
+                                const int                ldc,
                                 const sycl::nd_item<2> & item_ct1,
                                 int32_t *                slm_tile) {
     const auto sg = item_ct1.get_sub_group();
@@ -125,7 +126,7 @@ static void mmq_q8_0_xmx_kernel(const block_q8_0 * __restrict__ vx,
 
     for (int i = 0; i < TM; i++) {
         if (sg_startx + i < M && sg_starty + lane_id < N) {
-            dst[(sg_startx + i) * N + sg_starty + lane_id] = acc[i];
+            dst[(sg_startx + i) * ldc + sg_starty + lane_id] = acc[i];
         }
     }
 }
@@ -138,6 +139,7 @@ static void mmq_q4_0_xmx_kernel(const block_q4_0 * __restrict__ vx,
                                 const int                K_padded,
                                 const int                M,
                                 const int                N,
+                                const int                ldc,
                                 const sycl::nd_item<2> & item_ct1,
                                 int32_t *                slm_tile) {
     const auto sg = item_ct1.get_sub_group();
@@ -215,7 +217,7 @@ static void mmq_q4_0_xmx_kernel(const block_q4_0 * __restrict__ vx,
 
     for (int i = 0; i < TM; i++) {
         if (sg_startx + i < M && sg_starty + lane_id < N) {
-            dst[(sg_startx + i) * N + sg_starty + lane_id] = acc[i];
+            dst[(sg_startx + i) * ldc + sg_starty + lane_id] = acc[i];
         }
     }
 }
@@ -228,6 +230,7 @@ static void mmq_q4_1_xmx_kernel(const block_q4_1 * __restrict__ vx,
                                 const int                K_padded,
                                 const int                M,
                                 const int                N,
+                                const int                ldc,
                                 const sycl::nd_item<2> & item_ct1,
                                 int32_t *                slm_tile) {
     const auto sg = item_ct1.get_sub_group();
@@ -307,7 +310,7 @@ static void mmq_q4_1_xmx_kernel(const block_q4_1 * __restrict__ vx,
 
     for (int i = 0; i < TM; i++) {
         if (sg_startx + i < M && sg_starty + lane_id < N) {
-            dst[(sg_startx + i) * N + sg_starty + lane_id] = acc[i];
+            dst[(sg_startx + i) * ldc + sg_starty + lane_id] = acc[i];
         }
     }
 }
@@ -320,6 +323,7 @@ static void mmq_q5_0_xmx_kernel(const block_q5_0 * __restrict__ vx,
                                 const int                K_padded,
                                 const int                M,
                                 const int                N,
+                                const int                ldc,
                                 const sycl::nd_item<2> & item_ct1,
                                 int32_t *                slm_tile) {
     const auto sg = item_ct1.get_sub_group();
@@ -403,7 +407,7 @@ static void mmq_q5_0_xmx_kernel(const block_q5_0 * __restrict__ vx,
 
     for (int i = 0; i < TM; i++) {
         if (sg_startx + i < M && sg_starty + lane_id < N) {
-            dst[(sg_startx + i) * N + sg_starty + lane_id] = acc[i];
+            dst[(sg_startx + i) * ldc + sg_starty + lane_id] = acc[i];
         }
     }
 }
@@ -416,6 +420,7 @@ static void mmq_q5_1_xmx_kernel(const block_q5_1 * __restrict__ vx,
                                 const int                K_padded,
                                 const int                M,
                                 const int                N,
+                                const int                ldc,
                                 const sycl::nd_item<2> & item_ct1,
                                 int32_t *                slm_tile) {
     const auto sg = item_ct1.get_sub_group();
@@ -501,7 +506,7 @@ static void mmq_q5_1_xmx_kernel(const block_q5_1 * __restrict__ vx,
 
     for (int i = 0; i < TM; i++) {
         if (sg_startx + i < M && sg_starty + lane_id < N) {
-            dst[(sg_startx + i) * N + sg_starty + lane_id] = acc[i];
+            dst[(sg_startx + i) * ldc + sg_starty + lane_id] = acc[i];
         }
     }
 }
@@ -514,6 +519,7 @@ static void mmq_q8_1_xmx_kernel(const block_q8_1 * __restrict__ vx,
                                 const int                K_padded,
                                 const int                M,
                                 const int                N,
+                                const int                ldc,
                                 const sycl::nd_item<2> & item_ct1,
                                 int32_t *                slm_tile) {
     const auto sg = item_ct1.get_sub_group();
@@ -571,7 +577,7 @@ static void mmq_q8_1_xmx_kernel(const block_q8_1 * __restrict__ vx,
 
     for (int i = 0; i < TM; i++) {
         if (sg_startx + i < M && sg_starty + lane_id < N) {
-            dst[(sg_startx + i) * N + sg_starty + lane_id] = acc[i];
+            dst[(sg_startx + i) * ldc + sg_starty + lane_id] = acc[i];
         }
     }
 }

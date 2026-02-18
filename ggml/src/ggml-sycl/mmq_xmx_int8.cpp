@@ -68,6 +68,7 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
 
     // Get matrix dimensions
     const int64_t ne00 = src0->ne[0];
+    const int64_t ne0  = dst->ne[0];  // Output stride (leading dimension)
 
     // Calculate grid dimensions
     // Use src1_ncols instead of ne11 to handle column striding for multi-device
@@ -75,6 +76,7 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
     const int64_t N        = src1_ncols;
     const int64_t K        = ne00;
     const int64_t K_padded = src1_padded_row_size;  // For correct scale array stride
+    const int     ldc      = ne0;                   // Output stride
 
     const int64_t nblocks_m = (M + TM - 1) / TM;
     const int64_t nblocks_n = (N + TN - 1) / TN;
@@ -93,7 +95,7 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
                         [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
                             mmq_q8_0_xmx_kernel<8, 16, 32>(
                                 (const block_q8_0 *) src0_dd_i, (const block_q8_1 *) src1_ddq_i, dst_dd_i, K, K_padded,
-                                M, N, item_ct1, slm_tile.get_multi_ptr<access::decorated::no>().get());
+                                M, N, ldc, item_ct1, slm_tile.get_multi_ptr<access::decorated::no>().get());
                         });
                 });
             }
@@ -107,9 +109,9 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
                         nd_range<2>({ static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size) },
                                     { static_cast<size_t>(1), static_cast<size_t>(sg_size) }),
                         [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
-                            mmq_q4_0_xmx_kernel<8, 16, 32>((const block_q4_0 *) src0_dd_i,
-                                                           (const block_q8_1 *) src1_ddq_i, dst_dd_i, K, K_padded, M, N, item_ct1,
-                                                           slm_tile.get_multi_ptr<access::decorated::no>().get());
+                            mmq_q4_0_xmx_kernel<8, 16, 32>(
+                                (const block_q4_0 *) src0_dd_i, (const block_q8_1 *) src1_ddq_i, dst_dd_i, K, K_padded,
+                                M, N, ldc, item_ct1, slm_tile.get_multi_ptr<access::decorated::no>().get());
                         });
                 });
             }
@@ -123,9 +125,9 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
                         nd_range<2>({ static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size) },
                                     { static_cast<size_t>(1), static_cast<size_t>(sg_size) }),
                         [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
-                            mmq_q4_1_xmx_kernel<8, 16, 32>((const block_q4_1 *) src0_dd_i,
-                                                           (const block_q8_1 *) src1_ddq_i, dst_dd_i, K, K_padded, M, N, item_ct1,
-                                                           slm_tile.get_multi_ptr<access::decorated::no>().get());
+                            mmq_q4_1_xmx_kernel<8, 16, 32>(
+                                (const block_q4_1 *) src0_dd_i, (const block_q8_1 *) src1_ddq_i, dst_dd_i, K, K_padded,
+                                M, N, ldc, item_ct1, slm_tile.get_multi_ptr<access::decorated::no>().get());
                         });
                 });
             }
@@ -139,9 +141,9 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
                         nd_range<2>({ static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size) },
                                     { static_cast<size_t>(1), static_cast<size_t>(sg_size) }),
                         [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
-                            mmq_q5_0_xmx_kernel<8, 16, 32>((const block_q5_0 *) src0_dd_i,
-                                                           (const block_q8_1 *) src1_ddq_i, dst_dd_i, K, K_padded, M, N, item_ct1,
-                                                           slm_tile.get_multi_ptr<access::decorated::no>().get());
+                            mmq_q5_0_xmx_kernel<8, 16, 32>(
+                                (const block_q5_0 *) src0_dd_i, (const block_q8_1 *) src1_ddq_i, dst_dd_i, K, K_padded,
+                                M, N, ldc, item_ct1, slm_tile.get_multi_ptr<access::decorated::no>().get());
                         });
                 });
             }
@@ -155,9 +157,9 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
                         nd_range<2>({ static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size) },
                                     { static_cast<size_t>(1), static_cast<size_t>(sg_size) }),
                         [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
-                            mmq_q5_1_xmx_kernel<8, 16, 32>((const block_q5_1 *) src0_dd_i,
-                                                           (const block_q8_1 *) src1_ddq_i, dst_dd_i, K, K_padded, M, N, item_ct1,
-                                                           slm_tile.get_multi_ptr<access::decorated::no>().get());
+                            mmq_q5_1_xmx_kernel<8, 16, 32>(
+                                (const block_q5_1 *) src0_dd_i, (const block_q8_1 *) src1_ddq_i, dst_dd_i, K, K_padded,
+                                M, N, ldc, item_ct1, slm_tile.get_multi_ptr<access::decorated::no>().get());
                         });
                 });
             }
@@ -171,9 +173,9 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
                         nd_range<2>({ static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size) },
                                     { static_cast<size_t>(1), static_cast<size_t>(sg_size) }),
                         [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
-                            mmq_q8_1_xmx_kernel<8, 16, 32>((const block_q8_1 *) src0_dd_i,
-                                                           (const block_q8_1 *) src1_ddq_i, dst_dd_i, K, K_padded, M, N, item_ct1,
-                                                           slm_tile.get_multi_ptr<access::decorated::no>().get());
+                            mmq_q8_1_xmx_kernel<8, 16, 32>(
+                                (const block_q8_1 *) src0_dd_i, (const block_q8_1 *) src1_ddq_i, dst_dd_i, K, K_padded,
+                                M, N, ldc, item_ct1, slm_tile.get_multi_ptr<access::decorated::no>().get());
                         });
                 });
             }
