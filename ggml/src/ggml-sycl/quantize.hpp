@@ -19,14 +19,16 @@
 
 #pragma once
 
-#include <sycl/nd_item.hpp>
-
 #include "ggml-sycl/dpct/helper.hpp"
+
+#include <sycl/nd_item.hpp>
 
 template <int ElementsPerWI>
 __dpct_inline__ static void quantize_q8_1_impl(const float * __restrict__ x,
-                                               sycl::vec<int8_t, ElementsPerWI> & quantized_values, float & d,
-                                               float & sum, const sycl::nd_item<1> & it) {
+                                               sycl::vec<int8_t, ElementsPerWI> & quantized_values,
+                                               float &                            d,
+                                               float &                            sum,
+                                               const sycl::nd_item<1> &           it) {
     auto subgroup_id = it.get_group(0);
     auto wi_id       = it.get_local_id(0);
 
@@ -61,8 +63,11 @@ template <int ElementsPerWI> struct no_quantize_q8_1 {
 };
 
 template <int ElementsPerWI> struct quantize_and_reorder_q8_1_soa {
-    __dpct_inline__ void operator()(const float * __restrict__ x, void * reordered_q8_tensor, const int kx,
-                                    const int kx_padded, const sycl::nd_item<1> & it) const {
+    __dpct_inline__ void operator()(const float * __restrict__ x,
+                                    void *                   reordered_q8_tensor,
+                                    const int                kx,
+                                    const int                kx_padded,
+                                    const sycl::nd_item<1> & it) const {
         /*
         Quantizes and reorders the resultant q8 tensor in a per row fashion
         Each sub-group calculates one quant block. i.e. QK8_1 quant values and the d and sum values
@@ -92,7 +97,10 @@ template <int ElementsPerWI> struct quantize_and_reorder_q8_1_soa {
 };
 
 template <int ElementsPerWI> struct quantize_q8_1 {
-    __dpct_inline__ void operator()(const float * __restrict__ x, void * q8_tensor, const int kx, const int kx_padded,
+    __dpct_inline__ void operator()(const float * __restrict__ x,
+                                    void *                   q8_tensor,
+                                    const int                kx,
+                                    const int                kx_padded,
                                     const sycl::nd_item<1> & it) const {
         auto subgroup_id = it.get_group(0);
         auto wi_id       = it.get_local_id(0);
@@ -117,8 +125,65 @@ template <int ElementsPerWI> struct quantize_q8_1 {
     }
 };
 
+template <int ElementsPerWI> struct quantize_q8_1_for_xmx {
+    __dpct_inline__ void operator()(const float * __restrict__ x,
+                                    void *                   q8_tensor,
+                                    const int                kx,
+                                    const int                kx_padded,
+                                    const sycl::nd_item<1> & it) const {
+        auto subgroup_id = it.get_group(0);
+        auto wi_id       = it.get_local_id(0);
+
+        const int num_blocks_per_row = kx / QK8_1;
+        const int K_blocks           = kx_padded / QK8_1;
+        const int num_groups         = it.get_group_range(0);
+        const int N                  = num_groups / num_blocks_per_row;
+
+        const int batch_idx = subgroup_id / num_blocks_per_row;
+        const int k_block   = subgroup_id % num_blocks_per_row;
+
+        // Read from B matrix in row-major: B[k][n] = x[n * K + k]
+        // k = k_block * QK8_1 + wi_id, n = batch_idx
+        const int   k_global     = k_block * QK8_1 + wi_id;
+        const int   input_offset = batch_idx * kx + k_global;
+        const float val          = x[input_offset];
+
+        // Compute scale for this block (need to reduce over all 32 values)
+        float amax = sycl::fabs(val);
+        float sum  = val;
+        amax       = sycl::reduce_over_group(it.get_sub_group(), amax, sycl::maximum<float>());
+        sum        = sycl::reduce_over_group(it.get_sub_group(), sum, sycl::plus<float>());
+        float d    = amax == 0 ? 1 : amax / 127;
+
+        int8_t quantized = (int8_t) sycl::round(val / d);
+        d                = amax == 0 ? 0 : d;
+
+        // Store scale
+        const size_t scale_offset = (size_t) batch_idx * K_blocks + k_block;
+
+        auto ds_ptr = (sycl::half2 *) q8_tensor;
+        if (wi_id == 0) {
+            ds_ptr[scale_offset] = sycl::half2(sycl::half(d), sycl::half(sum));
+        }
+
+        // Store quantized value in VNNI layout
+        constexpr int VNNI       = 4;
+        const int     vnni_row   = k_global / VNNI;
+        const int     vnni_col   = batch_idx * VNNI + (k_global % VNNI);
+        const size_t  scale_size = (size_t) N * K_blocks * sizeof(sycl::half2);
+        const size_t  quant_off  = scale_size + (size_t) vnni_row * N * VNNI + vnni_col;
+
+        auto quant_ptr       = (int8_t *) q8_tensor;
+        quant_ptr[quant_off] = quantized;
+    }
+};
+
 template <template <int> typename quantize_f>
-void quantize_row_q8_1_sycl(const float * x, void * vy, const int kx, const int ky, const int kx_padded,
+void quantize_row_q8_1_sycl(const float *   x,
+                            void *          vy,
+                            const int       kx,
+                            const int       ky,
+                            const int       kx_padded,
                             dpct::queue_ptr stream) {
     static_assert(QK8_1 % WARP_SIZE == 0);
     auto local_range      = std::size_t(WARP_SIZE);

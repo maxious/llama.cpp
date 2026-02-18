@@ -17,6 +17,12 @@
 - **Goal**: Confirm scaling efficiency on larger models (Llama-3-8B or 70B).
 - **Strategy**: Run benchmarks on larger models. Ensure P2P is active and effective.
 
+## XMX Peak Performance Notes
+
+- Intel Xe-HPG (ACM-G10) peak XMX throughput per clock: FP16/BF16 65536 ops, INT8 131072 ops, INT4/INT2 262144 ops.
+- 2.1 GHz example peak (XMX Matrix engine): FP16/BF16 137.6 TFLOPS, INT8 275.2 TOPS, INT4 550.4 TOPS.
+- Vector (non-XMX) peak at 2.1 GHz for comparison: FP16 39.32 TFLOPS, FP32 19.66 TFLOPS.
+
 ## Project Notes
 
 - For SYCL builds, use `./build-sycl.sh` which configures `build-sycl/` and builds via CMake (`cmake --build`), not Ninja.
