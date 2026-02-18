@@ -29,6 +29,7 @@
 #include <iostream>
 #include <limits>
 #include <regex>
+#include <string>
 #include <sycl/sycl.hpp>
 #include <vector>
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
@@ -83,10 +84,31 @@ static void ggml_sycl_set_main_device(const int main_device) try {
     std::exit(1);
 }
 
+static std::string ggml_sycl_op_stats_key(const ggml_tensor * dst) {
+    std::string key = ggml_op_name(dst->op);
+    key += " type=";
+    key += ggml_type_name(dst->type);
+    key += " ne=[";
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        key += std::to_string(dst->ne[i]);
+        if (i + 1 < GGML_MAX_DIMS) {
+            key += ",";
+        }
+    }
+    key += "]";
+    return key;
+}
+
 static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {
     if (!g_sycl_loaded) {
         return false;
     }
+
+    const bool want_stats = ctx.enable_op_stats && !ctx.force_graph_compatible;
+    const bool want_timing = want_stats && ctx.enable_op_timing;
+    const auto start_time = want_timing ? std::chrono::high_resolution_clock::now()
+                                        : std::chrono::high_resolution_clock::time_point{};
+    const std::string stats_key = want_stats ? ggml_sycl_op_stats_key(dst) : std::string{};
 
     if (dst->src[0] != nullptr && ggml_backend_buffer_is_sycl_split(dst->src[0]->buffer)) {
         ggml_sycl_set_peer_access(dst->src[1]->ne[1], ctx.device);
@@ -375,6 +397,15 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             break;
         default:
             return false;
+    }
+
+    if (want_stats) {
+        double duration_ms = -1.0;
+        if (want_timing) {
+            const auto end_time = std::chrono::high_resolution_clock::now();
+            duration_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+        }
+        ctx.record_op_stat(stats_key, duration_ms);
     }
 
     return true;
@@ -1790,6 +1821,11 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
         GGML_LOG_ERROR("%s: error: failed to allocate context\n", __func__);
         return nullptr;
     };
+
+    const char * op_stats_env = getenv("GGML_SYCL_OP_STATS");
+    ctx->enable_op_stats = (op_stats_env != nullptr && strcmp(op_stats_env, "1") == 0);
+    const char * op_timing_env = getenv("GGML_SYCL_OP_STATS_TIMING");
+    ctx->enable_op_timing = (op_timing_env != nullptr && strcmp(op_timing_env, "1") == 0);
 
     ggml_backend_t sycl_backend =
         new ggml_backend{ /* .guid    = */ ggml_backend_sycl_guid(),

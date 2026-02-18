@@ -18,11 +18,14 @@
 #include "presets.hpp"
 #include "sycl_hw.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <string>
+#include <vector>
 
 #if GGML_SYCL_DNNL
 #    include "dnnl.hpp"
@@ -431,9 +434,58 @@ struct ggml_backend_sycl_context {
     bool enable_op_stats  = false;
     bool enable_op_timing = false;
 
-    void record_op_stat(const std::string &, double) {}
+    struct op_stat_entry {
+        uint64_t count = 0;
+        double   total_ms = 0.0;
+        double   min_ms = std::numeric_limits<double>::max();
+        double   max_ms = 0.0;
+    };
 
-    void print_op_stats() {}
+    std::map<std::string, op_stat_entry> op_stats;
+
+    void record_op_stat(const std::string & key, double duration_ms) {
+        if (!enable_op_stats) {
+            return;
+        }
+
+        auto & entry = op_stats[key];
+        entry.count++;
+        if (enable_op_timing && duration_ms >= 0.0) {
+            entry.total_ms += duration_ms;
+            entry.min_ms = std::min(entry.min_ms, duration_ms);
+            entry.max_ms = std::max(entry.max_ms, duration_ms);
+        }
+    }
+
+    void print_op_stats() {
+        if (!enable_op_stats || op_stats.empty()) {
+            return;
+        }
+
+        std::vector<std::pair<std::string, op_stat_entry>> entries(op_stats.begin(), op_stats.end());
+        std::sort(entries.begin(), entries.end(), [](const auto & a, const auto & b) {
+            if (a.second.total_ms == b.second.total_ms) {
+                return a.second.count > b.second.count;
+            }
+            return a.second.total_ms > b.second.total_ms;
+        });
+
+        std::fprintf(stderr, "\n[SYCL OP STATS]%s\n", enable_op_timing ? " (timing)" : "");
+        for (const auto & item : entries) {
+            const auto & entry = item.second;
+            if (enable_op_timing && entry.count > 0) {
+                const double avg_ms = entry.total_ms / static_cast<double>(entry.count);
+                std::fprintf(stderr,
+                             "%s: count=%" PRIu64 " total=%.3fms avg=%.3fms min=%.3fms max=%.3fms\n",
+                             item.first.c_str(), entry.count, entry.total_ms, avg_ms,
+                             entry.min_ms == std::numeric_limits<double>::max() ? 0.0 : entry.min_ms,
+                             entry.max_ms);
+            } else {
+                std::fprintf(stderr, "%s: count=%" PRIu64 "\n", item.first.c_str(), entry.count);
+            }
+        }
+        std::fprintf(stderr, "\n");
+    }
 };
 
 // common device functions
