@@ -15,7 +15,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -1895,7 +1897,16 @@ void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) tr
     // MUL_MAT_ID SPIR-V module (same kernels work fine in the MUL_MAT path).
     // Set GGML_SYCL_MUL_MAT_ID_XMX=1 to force XMX path (requires patched IGC to avoid crashes).
     static bool enable_xmx = getenv("GGML_SYCL_MUL_MAT_ID_XMX") != nullptr;
-    const bool  use_tiled =
+    // Auto-enable on known good systems (e.g., hostname 'futaba' has patched IGC)
+    if (!enable_xmx) {
+        char hostname[256];
+        if (gethostname(hostname, sizeof(hostname)) == 0) {
+            if (strcmp(hostname, "futaba") == 0) {
+                enable_xmx = true;
+            }
+        }
+    }
+    const bool use_tiled =
         !enable_xmx && (ctx.force_graph_compatible || ggml_sycl_info().devices[ctx.device].arch == SYCL_ARCH_INTEL_XE2);
     if (use_tiled) {
         GGML_SYCL_ITT_MUL_MAT_ID_TILED(moe);
