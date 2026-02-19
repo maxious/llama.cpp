@@ -185,4 +185,139 @@ inline void launch_gemm_tiled_indirect_q8_0(sycl::queue *      stream,
     });
 }
 
+// =============================================================================
+// Fused all-experts GEMM kernel for MUL_MAT_ID (MoE expert dispatch)
+// =============================================================================
+// Processes ALL experts in a single kernel launch, eliminating per-expert
+// kernel submission overhead (e.g., 48 launches → 1 for GLM-4).
+//
+// Grid: (max_M, grid_n, n_experts)
+// - group(0) = A row index (m)
+// - group(1) = N tile index
+// - group(2) = expert index
+//
+// Inactive experts (count=0) exit immediately after one global read.
+// Wider tiles (N_DST=8, N_SG=4) increase work per subgroup for better efficiency.
+
+constexpr int Q8_0_FUSED_N_DST = 8;
+constexpr int Q8_0_FUSED_N_SG  = 4;
+
+template <int SG_SIZE, int N_DST, int N_SG, int NB>
+inline void gemm_q8_0_f32_sg_kernel_fused(
+    sycl::nd_item<3>           it,
+    const float * __restrict__ A,              // src1_packed [total_rows x K]
+    const char * __restrict__  B_base,         // base weight pointer (all experts)
+    float * __restrict__       C,              // dst_packed [total_rows x N]
+    const int * __restrict__   counts,         // expert counts [n_experts]
+    const int * __restrict__   offsets,        // expert offsets [n_experts]
+    const size_t               expert_stride,  // bytes between experts in B
+    const int                  N,
+    const int                  K,
+    const int                  lda,
+    const int                  ldb,
+    const int                  ldc) {
+
+    const int expert_id = it.get_group(2);
+    const int M = counts[expert_id];
+    if (M <= 0) return;
+
+    const int m = it.get_group(0);
+    if (m >= M) return;
+
+    const int offset = offsets[expert_id];
+    const float *      A_ptr = A + offset * lda;
+    float *            C_ptr = C + offset * ldc;
+    const block_q8_0 * B     = (const block_q8_0 *)(B_base + expert_id * expert_stride);
+
+    sycl::sub_group sg      = it.get_sub_group();
+    const int       sg_id   = sg.get_group_id()[0];
+    const int       lane_id = sg.get_local_id()[0];
+
+    const int first_col = (it.get_group(1) * N_SG + sg_id) * N_DST;
+    if (first_col >= N) return;
+
+    const int nb = ldb / QK8_0;
+    const float * y = A_ptr + m * lda;
+
+    constexpr int LANES_PER_BLOCK = SG_SIZE / (QK8_0 / NB);
+    const int     ix = lane_id / (QK8_0 / NB);
+    const int     il = lane_id % (QK8_0 / NB);
+
+    const float * yb = y + ix * QK8_0 + il * NB;
+
+    float yl[NB];
+    float sumf[N_DST] = { 0.0f };
+
+    for (int ib = ix; ib < nb; ib += LANES_PER_BLOCK) {
+        for (int i = 0; i < NB; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (int col = 0; col < N_DST; ++col) {
+            const int global_col = first_col + col;
+            if (global_col < N) {
+                const block_q8_0 & blk = B[global_col * nb + ib];
+                const int8_t *     qs  = blk.qs + il * NB;
+                const float        d   = static_cast<float>(*(const sycl::half *) &blk.d);
+
+                float sumq = 0.0f;
+                for (int i = 0; i < NB; ++i) {
+                    sumq += (float) qs[i] * yl[i];
+                }
+                sumf[col] += sumq * d;
+            }
+        }
+
+        yb += LANES_PER_BLOCK * QK8_0;
+    }
+
+    for (int col = 0; col < N_DST; ++col) {
+        const float tot = sycl::reduce_over_group(sg, sumf[col], sycl::plus<float>());
+
+        const int global_col = first_col + col;
+        if (lane_id == 0 && global_col < N) {
+            C_ptr[m * ldc + global_col] = tot;
+        }
+    }
+}
+
+// Single-launch fused expert GEMM for Q8_0
+// Replaces n_experts separate kernel launches with one 3D dispatch.
+inline void launch_gemm_fused_experts_q8_0(sycl::queue * stream,
+                                           const float * A,              // src1_packed [total_rows x K]
+                                           const char *  B_base,         // base weight pointer
+                                           float *       C,              // dst_packed [total_rows x N]
+                                           const int *   counts,         // expert counts [n_experts]
+                                           const int *   expert_offsets, // expert offsets [n_experts]
+                                           const size_t  expert_stride,  // bytes between experts
+                                           const int     n_experts,
+                                           const int     max_M,
+                                           const int     N,
+                                           const int     K,
+                                           const int     lda,
+                                           const int     ldb,
+                                           const int     ldc) {
+    constexpr int SG_SIZE = Q8_0_SG_SIZE;
+    constexpr int N_DST   = Q8_0_FUSED_N_DST;
+    constexpr int N_SG    = Q8_0_FUSED_N_SG;
+    constexpr int NB      = Q8_0_NB;
+    constexpr int WG_SIZE = N_SG * SG_SIZE;
+
+    const int cols_per_wg = N_SG * N_DST;
+    const int grid_n      = (N + cols_per_wg - 1) / cols_per_wg;
+
+    sycl::range<3> global(max_M, grid_n * WG_SIZE, n_experts);
+    sycl::range<3> local(1, WG_SIZE, 1);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(global, local),
+            [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                gemm_q8_0_f32_sg_kernel_fused<SG_SIZE, N_DST, N_SG, NB>(
+                    it, A, B_base, C, counts, expert_offsets, expert_stride,
+                    N, K, lda, ldb, ldc);
+            });
+    });
+}
+
 #endif  // GGML_SYCL_GEMM_Q8_0_F32_TILED_HPP

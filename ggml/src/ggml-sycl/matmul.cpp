@@ -1803,6 +1803,12 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
     // Use XMX indirect GEMM for F32/F16/BF16 when hardware supports it
     const bool use_xmx_indirect = xmx_gemm_available(stream);
 
+    // Q8_0: use fused all-experts kernel (single launch instead of n_experts launches)
+    if (src0->type == GGML_TYPE_Q8_0) {
+        launch_gemm_fused_experts_q8_0(stream, src1_packed_f32, (const char *) src0_base, dst_packed,
+                                       dev_expert_counts.get(), dev_expert_offsets.get(),
+                                       expert_stride, n_experts, total_rows, N_local, K, K, K, N_local);
+    } else {
     for (int i = 0; i < n_experts; ++i) {
         if (src0->type == GGML_TYPE_F16) {
             const sycl::half * weights = (const sycl::half *) ((const char *) src0_base + i * expert_stride);
@@ -1828,28 +1834,16 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
                                                     total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
             }
         } else if (src0->type == GGML_TYPE_MXFP4) {
-            // MXFP4 weights with fused dequantization + F16 activations
-            // ldb = K (the full K dimension, used for block indexing: K/32 blocks per row)
             const block_mxfp4 * weights = (const block_mxfp4 *) ((const char *) src0_base + i * expert_stride);
             launch_gemm_tiled_indirect_mxfp4_f16(stream, src1_packed_f16, weights, dst_packed,
                                                  dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
-                                                 total_rows,  // max_M
+                                                 total_rows,
                                                  N_local, K, 1.0f, 0.0f, K, K, N_local);
         } else if (src0->type == GGML_TYPE_Q4_0) {
-            // Q4_0 weights with fused dequantization
-            // ldb = K (used for block indexing: K/QK4_0 blocks per row)
             const block_q4_0 * weights = (const block_q4_0 *) ((const char *) src0_base + i * expert_stride);
             launch_gemm_tiled_indirect_q4_0(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
                                             dev_expert_offsets.get() + i,
-                                            total_rows,  // max_M
-                                            N_local, K, 1.0f, 0.0f, K, K, N_local);
-        } else if (src0->type == GGML_TYPE_Q8_0) {
-            // Q8_0 weights with fused dequantization
-            // ldb = K (used for block indexing: K/QK8_0 blocks per row)
-            const block_q8_0 * weights = (const block_q8_0 *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_q8_0(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
-                                            dev_expert_offsets.get() + i,
-                                            total_rows,  // max_M
+                                            total_rows,
                                             N_local, K, 1.0f, 0.0f, K, K, N_local);
         } else if (src0->type == GGML_TYPE_Q2_K) {
             const block_q2_K * weights = (const block_q2_K *) ((const char *) src0_base + i * expert_stride);
@@ -1889,6 +1883,7 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
             }
         }
     }
+    } // else (non-Q8_0 types)
 
     stream->submit([&](sycl::handler & cgh) {
         char *             dst_data    = (char *) dst->data;
