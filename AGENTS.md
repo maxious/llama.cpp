@@ -130,8 +130,61 @@
 - XMX int8 kernels exist in `mmq_xmx_int8.cpp` but were not wired up
 - Now connected via `ggml_sycl_op_mul_mat_xmx()` for q8_0, q4_0, q4_1, q5_0, q5_1, q8_1
 - Enable with: `GGML_SYCL_XMX_INT8=1 ./build-sycl/bin/llama-bench ...`
-- Currently causes hangs on some configs - use at your own risk
 - Without the flag, falls back to MKL (original behavior)
+
+#### XMX Int8 Performance (Feb 2026)
+
+All 37/37 tests pass with optimized defaults. Performance varies by problem size:
+
+**Canonical benchmark (K=2048, M=2048, N=128):**
+
+| Variant | Config | GFLOPS | vs v1 | vs MKL |
+|---------|--------|--------|-------|--------|
+| v1 (legacy) | N_SG=1 | 460 | 1.0x | 0.05x |
+| v2 | N_SG=8, TILES_N=0 | 1026 | 2.2x | 0.11x |
+| v3 | N_SG=8, TILES_N=2 | 1928 | 4.2x | 0.20x |
+| v4 (prefetch) | N_SG=8, TILES_N=2, PREFETCH=1 | 1928 | 4.2x | 0.20x |
+| v5 (col_major B) | N_SG=8, TILES_N=2, COLMAJOR=1 | 2096 | 4.6x | 0.22x |
+| MKL baseline | - | 9476 | 20.6x | 1.0x |
+
+**Large problem (K=4096, M=4096, N=256):**
+
+| Variant | Config | GFLOPS | vs MKL |
+|---------|--------|--------|--------|
+| v3 | N_SG=8, TILES_N=2 | 2323 | 0.14x |
+| v3 | N_SG=8, TILES_N=4 | 2631 | 0.16x |
+| v5 (col_major B) | N_SG=8, TILES_N=2, COLMAJOR=1 | 2755 | 0.16x |
+| v5 (col_major B) | N_SG=8, TILES_N=4, COLMAJOR=1 | 3240 | 0.19x |
+| MKL baseline | - | 16834 | 1.0x |
+
+**Key Optimizations:**
+- **v2**: Multiple subgroups per workgroup (N_SG=8) sharing B tile, reducing barriers from 3→2 workgroup barriers per K tile
+- **v3**: N-dimension expansion (TILES_N=2) — load A once from SLM, reuse across multiple B tiles, getting TILES_N× A data reuse
+- **v4**: v3 + L1 prefetch hints for next K tile's blocks using `sycl::ext::oneapi::experimental::prefetch`. Negligible benefit — hardware prefetcher already handles sequential block access effectively.
+- **v5**: col_major B layout in SLM — stores each block_q8_1's qs[32] contiguously as one column of B, then uses `joint_matrix_load` with `layout::col_major`. Eliminates the per-byte scatter-transpose from [block][qs] → [K][N], enabling vectorized 4-byte SLM writes instead of 4 scattered byte writes. ~15-25% improvement over v3.
+
+**Optimal NSG/TILES_N by problem shape:**
+- Small N (≤128): NSG=8, TILES_N=2 is best
+- Large N (≥256): NSG=8, TILES_N=4 is best (more N-reuse)
+- Small M (≤512): NSG=4 can beat NSG=8 (fewer idle subgroups at tile boundaries)
+
+**Tuning Knobs (environment variables):**
+- `GGML_SYCL_XMX_INT8_NSG` — subgroups per workgroup (default: 8)
+- `GGML_SYCL_XMX_INT8_TILES_N` — N tiles per subgroup (default: 2)
+
+**Remaining Gap Analysis:**
+The ~5x gap vs MKL is due to per-byte scatter-gather from quantized block AoS structures through SLM. Even with col_major B (v5), A tiles still require scatter loads. MKL operates on dequantized contiguous F32 data via optimized microkernels. The strategic value of XMX int8 is enabling SYCL graphs for quantized models (which MKL doesn't support).
+
+**Potential further optimizations:**
+- col_major A: apply same trick to A tiles (store block_q8_0.qs[] contiguously, use col_major joint_matrix_load for matA)
+- Accumulator-direct scales: use joint_matrix_apply to apply scales directly in accumulator registers, avoiding SLM C round-trip
+- Adaptive tile selection: auto-select NSG/TILES_N based on M/N dimensions at runtime
+- Wider vector stores: use 8-byte or 16-byte SLM writes for B data (sycl::vec<int8_t, 8> or vec<int8_t, 16>)
+
+**Test:**
+```bash
+GGML_SYCL_XMX_INT8=1 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q8_0"
+```
 
 ### MUL_MAT_ID XMX Env Flag
 - Set `GGML_SYCL_MUL_MAT_ID_XMX=1` to bypass Xe2 tiled workaround

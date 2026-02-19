@@ -16,7 +16,7 @@
 using namespace sycl;
 using namespace sycl::ext::oneapi::experimental::matrix;
 
-// Get the v2/v3 kernel N_SG setting (0 or 1 = use legacy v1 kernel)
+// Get the N_SG setting (subgroups per workgroup, default 8)
 static int get_xmx_int8_nsg() {
     static int nsg = -1;
     if (nsg < 0) {
@@ -30,7 +30,7 @@ static int get_xmx_int8_nsg() {
     return nsg;
 }
 
-// Get TILES_N setting (how many TN-wide N tiles per subgroup; 0 = v2 path, >0 = v3)
+// Get TILES_N setting (how many TN-wide N tiles per subgroup, default 2)
 static int get_xmx_int8_tiles_n() {
     static int tn = -1;
     if (tn < 0) {
@@ -44,42 +44,17 @@ static int get_xmx_int8_tiles_n() {
     return tn;
 }
 
-// Helper to launch v2 kernel (M-only expansion)
-template <int N_SG>
-static void launch_q8_0_v2(const char * src0_dd_i, const char * src1_ddq_i, float * dst_dd_i,
-                           int64_t K, int64_t K_padded, int64_t M, int64_t N, int ldc,
-                           const dpct::queue_ptr & stream) {
-    constexpr int TM = 8, TN = 16, TK = 32;
-    const int64_t nblocks_m = (M + TM * N_SG - 1) / (TM * N_SG);
-    const int64_t nblocks_n = (N + TN - 1) / TN;
-
-    const int slm_bytes = TK * TN + N_SG * TM * TK + N_SG * TM * TN * (int) sizeof(int32_t);
-
-    stream->submit([&](handler & cgh) {
-        sycl::local_accessor<int8_t, 1> slm(range<1>(slm_bytes), cgh);
-        cgh.parallel_for(
-            nd_range<2>({ static_cast<size_t>(nblocks_m * N_SG), static_cast<size_t>(nblocks_n * 16) },
-                        { static_cast<size_t>(N_SG), static_cast<size_t>(16) }),
-            [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
-                mmq_q8_0_xmx_kernel_v2<TM, TN, TK, N_SG>(
-                    (const block_q8_0 *) src0_dd_i, (const block_q8_1 *) src1_ddq_i, dst_dd_i,
-                    K, K_padded, M, N, ldc, item_ct1,
-                    slm.get_multi_ptr<access::decorated::no>().get());
-            });
-    });
-}
-
-// Helper to launch v3 kernel (M + N expansion)
+// Helper to launch q8_0 kernel (col_major B, multi-subgroup)
 template <int N_SG, int TILES_N>
-static void launch_q8_0_v3(const char * src0_dd_i, const char * src1_ddq_i, float * dst_dd_i,
-                           int64_t K, int64_t K_padded, int64_t M, int64_t N, int ldc,
-                           const dpct::queue_ptr & stream) {
+static void launch_q8_0(const char * src0_dd_i, const char * src1_ddq_i, float * dst_dd_i,
+                        int64_t K, int64_t K_padded, int64_t M, int64_t N, int ldc,
+                        const dpct::queue_ptr & stream) {
     constexpr int TM = 8, TN = 16, TK = 32;
     const int64_t nblocks_m = (M + TM * N_SG - 1) / (TM * N_SG);
     const int64_t nblocks_n = (N + TN * TILES_N - 1) / (TN * TILES_N);
 
-    // SLM: TILES_N * B[TK*TN] + N_SG * A[TM*TK] + N_SG * C[TM*TN*4]
-    const int slm_bytes = TILES_N * TK * TN + N_SG * TM * TK + N_SG * TM * TN * (int) sizeof(int32_t);
+    // SLM: B[TILES_N*TN*TK] + N_SG*A[TM*TK] + N_SG*C[TM*TN*4]
+    const int slm_bytes = TILES_N * TN * TK + N_SG * TM * TK + N_SG * TM * TN * (int) sizeof(int32_t);
 
     stream->submit([&](handler & cgh) {
         sycl::local_accessor<int8_t, 1> slm(range<1>(slm_bytes), cgh);
@@ -87,7 +62,7 @@ static void launch_q8_0_v3(const char * src0_dd_i, const char * src1_ddq_i, floa
             nd_range<2>({ static_cast<size_t>(nblocks_m * N_SG), static_cast<size_t>(nblocks_n * 16) },
                         { static_cast<size_t>(N_SG), static_cast<size_t>(16) }),
             [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
-                mmq_q8_0_xmx_kernel_v3<TM, TN, TK, N_SG, TILES_N>(
+                mmq_q8_0_xmx_kernel<TM, TN, TK, N_SG, TILES_N>(
                     (const block_q8_0 *) src0_dd_i, (const block_q8_1 *) src1_ddq_i, dst_dd_i,
                     K, K_padded, M, N, ldc, item_ct1,
                     slm.get_multi_ptr<access::decorated::no>().get());
@@ -95,16 +70,16 @@ static void launch_q8_0_v3(const char * src0_dd_i, const char * src1_ddq_i, floa
     });
 }
 
-// Dispatch v3 for a given N_SG, switching on TILES_N
+// Dispatch for a given N_SG, switching on TILES_N
 template <int N_SG>
-static bool try_launch_q8_0_v3(int tiles_n, const char * src0_dd_i, const char * src1_ddq_i,
-                               float * dst_dd_i, int64_t K, int64_t K_padded, int64_t M,
-                               int64_t N, int ldc, const dpct::queue_ptr & stream) {
+static bool try_launch_q8_0(int tiles_n, const char * src0_dd_i, const char * src1_ddq_i,
+                            float * dst_dd_i, int64_t K, int64_t K_padded, int64_t M,
+                            int64_t N, int ldc, const dpct::queue_ptr & stream) {
     switch (tiles_n) {
-        case 1: launch_q8_0_v3<N_SG, 1>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
-        case 2: launch_q8_0_v3<N_SG, 2>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
-        case 4: launch_q8_0_v3<N_SG, 4>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
-        case 8: launch_q8_0_v3<N_SG, 8>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        case 1: launch_q8_0<N_SG, 1>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        case 2: launch_q8_0<N_SG, 2>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        case 4: launch_q8_0<N_SG, 4>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        case 8: launch_q8_0<N_SG, 8>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
         default: return false;
     }
 }
@@ -152,53 +127,29 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
     const int64_t K_padded = src1_padded_row_size;
     const int     ldc      = ne0;
 
-    const int nsg     = get_xmx_int8_nsg();
-    const int tiles_n = get_xmx_int8_tiles_n();
+    const int nsg      = get_xmx_int8_nsg();
+    const int tiles_n  = get_xmx_int8_tiles_n();
 
     // Use optimized multi-subgroup kernel for Q8_0 when nsg > 1
     if (nsg > 1 && TM == 8 && TN == 16 && TK == 32 && src0->type == GGML_TYPE_Q8_0) {
-        // v3 path: expand both M and N dimensions
         if (tiles_n > 0) {
             bool ok = false;
             switch (nsg) {
-                case 2: ok = try_launch_q8_0_v3<2>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
-                case 4: ok = try_launch_q8_0_v3<4>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
-                case 8: ok = try_launch_q8_0_v3<8>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
+                case 2: ok = try_launch_q8_0<2>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
+                case 4: ok = try_launch_q8_0<4>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
+                case 8: ok = try_launch_q8_0<8>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
             }
             if (ok) return;
         }
-
-        // v2 fallback: expand M only
-        switch (nsg) {
-            case 2: launch_q8_0_v2<2>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return;
-            case 4: launch_q8_0_v2<4>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return;
-            case 8: launch_q8_0_v2<8>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return;
-        }
     }
 
-    // Legacy v1 path
+    // Legacy single-subgroup path for other quant types
     const int64_t nblocks_m = (M + TM - 1) / TM;
     const int64_t nblocks_n = (N + TN - 1) / TN;
     const int sg_size = 16;
     const int slm_size = TM * TN + (TM * TK + TK * TN + 3) / 4;
 
     switch (src0->type) {
-        case GGML_TYPE_Q8_0:
-            if (TM == 8 && TN == 16 && TK == 32) {
-                stream->submit([&](handler & cgh) {
-                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(slm_size), cgh);
-                    cgh.parallel_for(
-                        nd_range<2>({ static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size) },
-                                    { static_cast<size_t>(1), static_cast<size_t>(sg_size) }),
-                        [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
-                            mmq_q8_0_xmx_kernel<8, 16, 32>(
-                                (const block_q8_0 *) src0_dd_i, (const block_q8_1 *) src1_ddq_i, dst_dd_i, K, K_padded,
-                                M, N, ldc, item_ct1, slm_tile.get_multi_ptr<access::decorated::no>().get());
-                        });
-                });
-            }
-            break;
-
         case GGML_TYPE_Q4_0:
             if (TM == 8 && TN == 16 && TK == 32) {
                 stream->submit([&](handler & cgh) {
