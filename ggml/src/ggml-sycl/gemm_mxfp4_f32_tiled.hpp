@@ -588,4 +588,173 @@ inline void launch_gemm_tiled_indirect_mxfp4_f16(sycl::queue *       stream,
     });
 }
 
+// =============================================================================
+// Direct-IDs GEMM kernel for MUL_MAT_ID (zero-overhead expert dispatch)
+// =============================================================================
+// Eliminates ALL pack/unpack overhead by reading ids, src1, and writing dst
+// directly in-kernel. Modeled after the Q8_0 direct-ids kernel.
+//
+// Grid: (total_rows, grid_n)
+// - group(0) = token index (flat index into ids tensor)
+// - group(1) = N tile index
+//
+// Each workgroup:
+// 1. Reads ids[iid1 * ids_nb1 + id * ids_nb0] to find expert_id
+// 2. Reads src1 row directly via strides (F32, no packing)
+// 3. Computes MXFP4 dot product with expert weights
+// 4. Writes to dst directly via strides (no unpacking)
+
+constexpr int MXFP4_FUSED_N_DST = 8;
+constexpr int MXFP4_FUSED_N_SG  = 4;
+
+template <int SG_SIZE, int N_DST, int N_SG, int NB>
+inline void gemm_mxfp4_f32_sg_kernel_direct(
+    sycl::nd_item<2>           it,
+    const char * __restrict__  src1_data,     // raw src1 tensor data
+    const char * __restrict__  B_base,        // weight base pointer (all experts)
+    char * __restrict__        dst_data,      // raw dst tensor data
+    const char * __restrict__  ids_data,      // expert ids tensor data
+    const int                  n_ids,         // ids->ne[0]
+    const size_t               ids_nb0,       // ids->nb[0]
+    const size_t               ids_nb1,       // ids->nb[1]
+    const int64_t              ne11,          // src1->ne[1]
+    const size_t               src1_nb1,      // src1->nb[1]
+    const size_t               src1_nb2,      // src1->nb[2]
+    const size_t               dst_nb1,       // dst->nb[1]
+    const size_t               dst_nb2,       // dst->nb[2]
+    const size_t               expert_stride, // bytes between experts in B (src0->nb[2])
+    const int                  N,             // output dim (src0->ne[1])
+    const int                  K,             // input dim (src0->ne[0])
+    const int                  N_local,       // local N for this device (= N if no split)
+    const int64_t              row_low) {     // first row this device handles
+
+    // Decompose flat token index to (id, iid1)
+    const int token_idx = it.get_group(0);
+    const int id   = token_idx % n_ids;
+    const int iid1 = token_idx / n_ids;
+
+    // Read expert assignment from ids tensor
+    const int32_t expert_id = *(const int32_t *)(ids_data + iid1 * ids_nb1 + id * ids_nb0);
+
+    // Subgroup info
+    sycl::sub_group sg      = it.get_sub_group();
+    const int       sg_id   = sg.get_group_id()[0];
+    const int       lane_id = sg.get_local_id()[0];
+
+    const int first_col = (it.get_group(1) * N_SG + sg_id) * N_DST;
+    if (first_col >= N_local) return;
+
+    // Source row: src1[i11 * nb11 + i12 * nb12] where i11 = id % ne11, i12 = iid1
+    const int64_t i11 = id % ne11;
+    const int64_t i12 = iid1;
+    const float * y = (const float *)(src1_data + i11 * src1_nb1 + i12 * src1_nb2);
+
+    // Weight pointer for this expert
+    const block_mxfp4 * B = (const block_mxfp4 *)(B_base + expert_id * expert_stride);
+    const int nb = K / QK_MXFP4;
+
+    // Each lane handles NB=16 elements (half a block).
+    // lane/2 = block offset, lane%2 = first or second half (0..15 or 16..31).
+    constexpr int LANES_PER_BLOCK = SG_SIZE / (QK_MXFP4 / NB);
+    const int     ix = lane_id / (QK_MXFP4 / NB);
+    const int     il = lane_id % (QK_MXFP4 / NB);
+    const int     elem_offset = il * NB;  // 0 or 16
+
+    const float * yb = y + ix * QK_MXFP4 + elem_offset;
+
+    float sumf[N_DST] = { 0.0f };
+
+    for (int ib = ix; ib < nb; ib += LANES_PER_BLOCK) {
+        // Load activation slice
+        float yl[NB];
+        for (int i = 0; i < NB; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (int col = 0; col < N_DST; ++col) {
+            const int local_col = first_col + col;
+            if (local_col < N_local) {
+                const int global_col = (int)row_low + local_col;
+                const block_mxfp4 & blk = B[global_col * nb + ib];
+                const float d = ggml_sycl_e8m0_to_fp32(blk.e);
+
+                float partial = 0.0f;
+                for (int i = 0; i < NB; ++i) {
+                    const int idx = elem_offset + i;
+                    uint8_t q4;
+                    if (idx < 16) {
+                        q4 = blk.qs[idx] & 0x0F;
+                    } else {
+                        q4 = blk.qs[idx - 16] >> 4;
+                    }
+                    partial += yl[i] * (d * static_cast<float>(kvalues_mxfp4[q4]) * 0.5f);
+                }
+                sumf[col] += partial;
+            }
+        }
+
+        yb += LANES_PER_BLOCK * QK_MXFP4;
+    }
+
+    // Destination: dst[id * nb1 + iid1 * nb2 + col * sizeof(float)]
+    // col in global space = row_low + local_col
+    float * dst_row = (float *)(dst_data + id * dst_nb1 + iid1 * dst_nb2);
+
+    for (int col = 0; col < N_DST; ++col) {
+        const float tot = sycl::reduce_over_group(sg, sumf[col], sycl::plus<float>());
+
+        const int local_col = first_col + col;
+        if (lane_id == 0 && local_col < N_local) {
+            const int global_col = (int)row_low + local_col;
+            dst_row[global_col] = tot;
+        }
+    }
+}
+
+// Launch direct-ids MXFP4 GEMM - zero pack/unpack overhead
+// Reads ids tensor in-kernel, accesses src1 and dst directly via strides.
+inline void launch_gemm_direct_ids_mxfp4(sycl::queue *  stream,
+                                         const char *   src1_data,     // raw src1 tensor data
+                                         const char *   B_base,        // weight base pointer
+                                         char *         dst_data,      // raw dst tensor data
+                                         const char *   ids_data,      // expert ids tensor data
+                                         const int      n_ids,         // ids->ne[0]
+                                         const int      n_batches,     // ids->ne[1]
+                                         const size_t   ids_nb0,       // ids->nb[0]
+                                         const size_t   ids_nb1,       // ids->nb[1]
+                                         const int64_t  ne11,          // src1->ne[1]
+                                         const size_t   src1_nb1,      // src1->nb[1]
+                                         const size_t   src1_nb2,      // src1->nb[2]
+                                         const size_t   dst_nb1,       // dst->nb[1]
+                                         const size_t   dst_nb2,       // dst->nb[2]
+                                         const size_t   expert_stride, // bytes between experts (src0->nb[2])
+                                         const int      N,             // output dim
+                                         const int      K,             // input dim
+                                         const int      N_local,       // local N for this device
+                                         const int64_t  row_low) {     // first row for this device
+    constexpr int SG_SIZE = MXFP4_SG_SIZE;
+    constexpr int N_DST   = MXFP4_FUSED_N_DST;
+    constexpr int N_SG    = MXFP4_FUSED_N_SG;
+    constexpr int NB_Q    = MXFP4_NB;
+    constexpr int WG_SIZE = N_SG * SG_SIZE;
+
+    const int total_rows  = n_ids * n_batches;
+    const int cols_per_wg = N_SG * N_DST;
+    const int grid_n      = (N_local + cols_per_wg - 1) / cols_per_wg;
+
+    sycl::range<2> global(total_rows, grid_n * WG_SIZE);
+    sycl::range<2> local(1, WG_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                gemm_mxfp4_f32_sg_kernel_direct<SG_SIZE, N_DST, N_SG, NB_Q>(
+                    it, src1_data, B_base, dst_data, ids_data,
+                    n_ids, ids_nb0, ids_nb1, ne11, src1_nb1, src1_nb2,
+                    dst_nb1, dst_nb2, expert_stride, N, K, N_local, row_low);
+            });
+    });
+}
+
 #endif  // GGML_SYCL_GEMM_MXFP4_F32_TILED_HPP

@@ -1333,7 +1333,7 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     } else if (use_dequantize_mul_mat_vec) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::DMMV);
         GGML_SYCL_ITT_OP(dmmv);
-        fprintf(stderr, "ggml_sycl: MUL_MAT DMMV ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
+        GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT DMMV ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
                 dst->ne[3], ggml_type_name(src0->type));
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);
     } else if (use_mul_mat_vec_q) {
@@ -1341,18 +1341,18 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
         if (extra && extra->optimized_feature.reorder) {
             GGML_SYCL_ITT_OP(mmvq_reorder);
-            fprintf(stderr, "ggml_sycl: MUL_MAT MMVQ_REORDER ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1],
+            GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT MMVQ_REORDER ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1],
                     dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
             ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         } else {
             GGML_SYCL_ITT_OP(mmvq);
-            fprintf(stderr, "ggml_sycl: MUL_MAT MMVQ ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1],
+            GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT MMVQ ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1],
                     dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         }
     } else if (use_mul_mat_q) {
         GGML_SYCL_ITT_MUL_MAT_MMQ(quantized);
-        fprintf(stderr, "ggml_sycl: MUL_MAT MMQ ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
+        GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT MMQ ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
                 dst->ne[3], ggml_type_name(src0->type));
         ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
     } else {
@@ -1364,7 +1364,7 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                  src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_1 ||
                  src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K ||
                  src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K);
-            fprintf(stderr, "ggml_sycl: MUL_MAT %s ne=[%ld,%ld,%ld,%ld] type=%s\n", is_quant ? "XMX_INT8" : "XMX",
+            GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT %s ne=[%ld,%ld,%ld,%ld] type=%s\n", is_quant ? "XMX_INT8" : "XMX",
                     dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
             if (is_quant) {
                 ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_xmx);
@@ -1373,7 +1373,7 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             }
         } else {
             GGML_SYCL_ITT_MUL_MAT_MKL(f32);
-            fprintf(stderr, "ggml_sycl: MUL_MAT MKL ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
+            GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT MKL ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
                     dst->ne[3], ggml_type_name(src0->type));
             ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);
         }
@@ -1688,23 +1688,35 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
     }
 
     // =========================================================================
-    // Q8_0 FAST PATH: Direct-IDs kernel (zero pack/unpack overhead)
+    // Direct-IDs FAST PATH: Single kernel, zero pack/unpack overhead.
     // Reads ids tensor in-kernel, accesses src1 and dst directly via strides.
     // Eliminates: count/scan/pack kernels + packed buffers + unpack kernel.
     // =========================================================================
-    if (src0->type == GGML_TYPE_Q8_0) {
-        launch_gemm_direct_ids_q8_0(stream,
-                                    (const char *) src1->data,
-                                    (const char *) src0->data,
-                                    (char *) dst->data,
-                                    (const char *) ids->data,
-                                    n_ids, n_batches,
-                                    ids->nb[0], ids->nb[1],
-                                    src1->ne[1], src1->nb[1], src1->nb[2],
-                                    dst->nb[1], dst->nb[2],
-                                    expert_stride, N, K, N_local, row_low);
-        return;  // No unpack needed - wrote directly to dst
+    #define LAUNCH_DIRECT_IDS(launch_fn) do { \
+        launch_fn(stream,                     \
+                  (const char *) src1->data,  \
+                  (const char *) src0->data,  \
+                  (char *) dst->data,         \
+                  (const char *) ids->data,   \
+                  n_ids, n_batches,            \
+                  ids->nb[0], ids->nb[1],      \
+                  src1->ne[1], src1->nb[1], src1->nb[2], \
+                  dst->nb[1], dst->nb[2],      \
+                  expert_stride, N, K, N_local, row_low); \
+        return; \
+    } while (0)
+
+    switch (src0->type) {
+        case GGML_TYPE_Q8_0:  LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_q8_0);
+        case GGML_TYPE_Q4_K:  LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_q4_K);
+        case GGML_TYPE_Q5_K:  LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_q5_K);
+        case GGML_TYPE_Q6_K:  LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_q6_K);
+        case GGML_TYPE_MXFP4: LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_mxfp4);
+        case GGML_TYPE_BF16:  LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_bf16);
+        default: break;  // Fall through to generic path
     }
+
+    #undef LAUNCH_DIRECT_IDS
 
     // =========================================================================
     // Generic path: count/scan/pack → GEMM → unpack (all other types)
