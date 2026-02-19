@@ -23,6 +23,14 @@
 - 2.1 GHz example peak (XMX Matrix engine): FP16/BF16 137.6 TFLOPS, INT8 275.2 TOPS, INT4 550.4 TOPS.
 - Vector (non-XMX) peak at 2.1 GHz for comparison: FP16 39.32 TFLOPS, FP32 19.66 TFLOPS.
 
+## Intel Battlemage (Xe2) XVE Architecture Notes
+
+- Reference: https://chipsandcheese.com/p/intels-battlemage-architecture
+- Concurrency: XMX units operate alongside vector (FP) and scalar (INT/EM) units, allowing the XVE to execute different instruction types concurrently.
+- Thread Management: XVEs manage multiple threads (up to eight), switching between them to maintain high execution unit utilization.
+- Each Xe-core has 8 XVEs. A subgroup of 16 threads runs across 8 XVEs (2 threads per XVE).
+- To fully utilize an Xe-core, multiple subgroups should run concurrently (up to 8 threads per XVE = 4 subgroups of 16).
+
 ## Project Notes
 
 - For SYCL builds, use `./build-sycl.sh` which configures `build-sycl/` and builds via CMake (`cmake --build`), not Ninja.

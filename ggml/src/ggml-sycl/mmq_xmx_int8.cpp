@@ -16,6 +16,99 @@
 using namespace sycl;
 using namespace sycl::ext::oneapi::experimental::matrix;
 
+// Get the v2/v3 kernel N_SG setting (0 or 1 = use legacy v1 kernel)
+static int get_xmx_int8_nsg() {
+    static int nsg = -1;
+    if (nsg < 0) {
+        const char * env = getenv("GGML_SYCL_XMX_INT8_NSG");
+        nsg = env ? atoi(env) : 8;
+        if (nsg != 0 && nsg != 1 && nsg != 2 && nsg != 4 && nsg != 8) {
+            fprintf(stderr, "ggml_sycl: GGML_SYCL_XMX_INT8_NSG=%d invalid, must be 0,1,2,4,8. Using 4.\n", nsg);
+            nsg = 4;
+        }
+    }
+    return nsg;
+}
+
+// Get TILES_N setting (how many TN-wide N tiles per subgroup; 0 = v2 path, >0 = v3)
+static int get_xmx_int8_tiles_n() {
+    static int tn = -1;
+    if (tn < 0) {
+        const char * env = getenv("GGML_SYCL_XMX_INT8_TILES_N");
+        tn = env ? atoi(env) : 2;
+        if (tn != 0 && tn != 1 && tn != 2 && tn != 4 && tn != 8) {
+            fprintf(stderr, "ggml_sycl: GGML_SYCL_XMX_INT8_TILES_N=%d invalid, must be 0,1,2,4,8. Using 4.\n", tn);
+            tn = 4;
+        }
+    }
+    return tn;
+}
+
+// Helper to launch v2 kernel (M-only expansion)
+template <int N_SG>
+static void launch_q8_0_v2(const char * src0_dd_i, const char * src1_ddq_i, float * dst_dd_i,
+                           int64_t K, int64_t K_padded, int64_t M, int64_t N, int ldc,
+                           const dpct::queue_ptr & stream) {
+    constexpr int TM = 8, TN = 16, TK = 32;
+    const int64_t nblocks_m = (M + TM * N_SG - 1) / (TM * N_SG);
+    const int64_t nblocks_n = (N + TN - 1) / TN;
+
+    const int slm_bytes = TK * TN + N_SG * TM * TK + N_SG * TM * TN * (int) sizeof(int32_t);
+
+    stream->submit([&](handler & cgh) {
+        sycl::local_accessor<int8_t, 1> slm(range<1>(slm_bytes), cgh);
+        cgh.parallel_for(
+            nd_range<2>({ static_cast<size_t>(nblocks_m * N_SG), static_cast<size_t>(nblocks_n * 16) },
+                        { static_cast<size_t>(N_SG), static_cast<size_t>(16) }),
+            [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
+                mmq_q8_0_xmx_kernel_v2<TM, TN, TK, N_SG>(
+                    (const block_q8_0 *) src0_dd_i, (const block_q8_1 *) src1_ddq_i, dst_dd_i,
+                    K, K_padded, M, N, ldc, item_ct1,
+                    slm.get_multi_ptr<access::decorated::no>().get());
+            });
+    });
+}
+
+// Helper to launch v3 kernel (M + N expansion)
+template <int N_SG, int TILES_N>
+static void launch_q8_0_v3(const char * src0_dd_i, const char * src1_ddq_i, float * dst_dd_i,
+                           int64_t K, int64_t K_padded, int64_t M, int64_t N, int ldc,
+                           const dpct::queue_ptr & stream) {
+    constexpr int TM = 8, TN = 16, TK = 32;
+    const int64_t nblocks_m = (M + TM * N_SG - 1) / (TM * N_SG);
+    const int64_t nblocks_n = (N + TN * TILES_N - 1) / (TN * TILES_N);
+
+    // SLM: TILES_N * B[TK*TN] + N_SG * A[TM*TK] + N_SG * C[TM*TN*4]
+    const int slm_bytes = TILES_N * TK * TN + N_SG * TM * TK + N_SG * TM * TN * (int) sizeof(int32_t);
+
+    stream->submit([&](handler & cgh) {
+        sycl::local_accessor<int8_t, 1> slm(range<1>(slm_bytes), cgh);
+        cgh.parallel_for(
+            nd_range<2>({ static_cast<size_t>(nblocks_m * N_SG), static_cast<size_t>(nblocks_n * 16) },
+                        { static_cast<size_t>(N_SG), static_cast<size_t>(16) }),
+            [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
+                mmq_q8_0_xmx_kernel_v3<TM, TN, TK, N_SG, TILES_N>(
+                    (const block_q8_0 *) src0_dd_i, (const block_q8_1 *) src1_ddq_i, dst_dd_i,
+                    K, K_padded, M, N, ldc, item_ct1,
+                    slm.get_multi_ptr<access::decorated::no>().get());
+            });
+    });
+}
+
+// Dispatch v3 for a given N_SG, switching on TILES_N
+template <int N_SG>
+static bool try_launch_q8_0_v3(int tiles_n, const char * src0_dd_i, const char * src1_ddq_i,
+                               float * dst_dd_i, int64_t K, int64_t K_padded, int64_t M,
+                               int64_t N, int ldc, const dpct::queue_ptr & stream) {
+    switch (tiles_n) {
+        case 1: launch_q8_0_v3<N_SG, 1>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        case 2: launch_q8_0_v3<N_SG, 2>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        case 4: launch_q8_0_v3<N_SG, 4>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        case 8: launch_q8_0_v3<N_SG, 8>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        default: return false;
+    }
+}
+
 void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
                                      const ggml_tensor *         src0,
                                      const ggml_tensor *         src1,
@@ -31,13 +124,13 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
                                      const dpct::queue_ptr &     stream) {
     static bool first_call = true;
     if (first_call) {
-        fprintf(stderr, "ggml_sycl: Using INT8 XMX MMQ kernel for src0->type=%d\n", (int) src0->type);
+        fprintf(stderr, "ggml_sycl: Using INT8 XMX MMQ kernel for src0->type=%d (N_SG=%d, TILES_N=%d)\n",
+                (int) src0->type, get_xmx_int8_nsg(), get_xmx_int8_tiles_n());
         first_call = false;
     }
 
     // Check if device supports INT8 XMX
     if (!has_int8_xmx_support(stream)) {
-        // Fall back to regular MMQ if INT8 XMX is not supported
         ggml_sycl_op_mul_mat_q(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low, row_high,
                                src1_ncols, src1_padded_row_size, stream);
         return;
@@ -51,25 +144,44 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
 
     // Get matrix dimensions
     const int64_t ne00 = src0->ne[0];
-    const int64_t ne0  = dst->ne[0];  // Output stride (leading dimension)
+    const int64_t ne0  = dst->ne[0];
 
-    // Calculate grid dimensions
     const int64_t M        = row_high - row_low;
     const int64_t N        = src1_ncols;
     const int64_t K        = ne00;
-    const int64_t K_padded = src1_padded_row_size;  // For correct scale array stride
-    const int     ldc      = ne0;                   // Output stride
+    const int64_t K_padded = src1_padded_row_size;
+    const int     ldc      = ne0;
 
+    const int nsg     = get_xmx_int8_nsg();
+    const int tiles_n = get_xmx_int8_tiles_n();
+
+    // Use optimized multi-subgroup kernel for Q8_0 when nsg > 1
+    if (nsg > 1 && TM == 8 && TN == 16 && TK == 32 && src0->type == GGML_TYPE_Q8_0) {
+        // v3 path: expand both M and N dimensions
+        if (tiles_n > 0) {
+            bool ok = false;
+            switch (nsg) {
+                case 2: ok = try_launch_q8_0_v3<2>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
+                case 4: ok = try_launch_q8_0_v3<4>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
+                case 8: ok = try_launch_q8_0_v3<8>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
+            }
+            if (ok) return;
+        }
+
+        // v2 fallback: expand M only
+        switch (nsg) {
+            case 2: launch_q8_0_v2<2>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return;
+            case 4: launch_q8_0_v2<4>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return;
+            case 8: launch_q8_0_v2<8>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return;
+        }
+    }
+
+    // Legacy v1 path
     const int64_t nblocks_m = (M + TM - 1) / TM;
     const int64_t nblocks_n = (N + TN - 1) / TN;
-
     const int sg_size = 16;
-
-    // SLM layout: [TM * TN int32_t for accumulator] [TM * TK int8_t for matA] [TK * TN int8_t for matB]
-    // Total int32_t count: TM*TN + ceil((TM*TK + TK*TN) / 4)
     const int slm_size = TM * TN + (TM * TK + TK * TN + 3) / 4;
 
-    // Launch kernel based on quantization type
     switch (src0->type) {
         case GGML_TYPE_Q8_0:
             if (TM == 8 && TN == 16 && TK == 32) {
@@ -168,7 +280,6 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
             break;
 
         default:
-            // Fall back to regular MMQ for unsupported quantization types
             ggml_sycl_op_mul_mat_q(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low, row_high,
                                    src1_ncols, src1_padded_row_size, stream);
             break;

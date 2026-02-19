@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <time.h>
 #include <vector>
 
 struct matmul_case {
@@ -196,6 +197,62 @@ static ggml_type parse_type(const char * value) {
     std::abort();
 }
 
+static double run_bench(const matmul_case & test_case, ggml_backend_t backend, int warmup, int iters) {
+    ggml_init_params params = {
+        /* .mem_size = */ ggml_tensor_overhead() * 64 + ggml_graph_overhead(),
+        /* .mem_base = */ NULL,
+        /* .no_alloc = */ true,
+    };
+
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "failed to init context\n");
+        return -1.0;
+    }
+
+    ggml_tensor * a = nullptr;
+    ggml_tensor * b = nullptr;
+    ggml_tensor * out = build_graph(ctx, test_case, &a, &b);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        fprintf(stderr, "failed to allocate tensors for backend\n");
+        ggml_free(ctx);
+        return -1.0;
+    }
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    init_tensor_uniform(a);
+    init_tensor_uniform(b);
+
+    // Warmup
+    for (int i = 0; i < warmup; ++i) {
+        ggml_backend_graph_compute(backend, gf);
+    }
+
+    // Benchmark
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < iters; ++i) {
+        ggml_backend_graph_compute(backend, gf);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    double avg_ms = elapsed_ms / iters;
+
+    // Compute GFLOPS: 2*M*N*K flops per matmul
+    double flops = 2.0 * test_case.m * test_case.n * test_case.k;
+    double gflops = (flops / (avg_ms / 1000.0)) / 1e9;
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+
+    return avg_ms;
+}
+
 int main(int argc, char ** argv) {
     const char * backend_name = "SYCL0";
     int64_t k = 128;
@@ -204,6 +261,9 @@ int main(int argc, char ** argv) {
     ggml_type type_a = GGML_TYPE_Q8_0;
     bool set_xmx_int8 = true;
     bool set_debug = false;
+    bool bench_mode = false;
+    int bench_warmup = 5;
+    int bench_iters = 20;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
@@ -220,10 +280,16 @@ int main(int argc, char ** argv) {
             set_xmx_int8 = false;
         } else if (strcmp(argv[i], "--debug") == 0) {
             set_debug = true;
+        } else if (strcmp(argv[i], "--bench") == 0) {
+            bench_mode = true;
+        } else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
+            bench_warmup = std::strtol(argv[++i], nullptr, 10);
+        } else if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
+            bench_iters = std::strtol(argv[++i], nullptr, 10);
         } else {
             fprintf(stderr,
                     "Usage: %s [--backend SYCL0] [--k 128] [--m 64] [--n 64] [--type-a q8_0|q4_0|q4_1|q5_0|q5_1|q8_1] "
-                    "[--no-xmx-int8] [--debug]\n",
+                    "[--no-xmx-int8] [--debug] [--bench] [--warmup 5] [--iters 20]\n",
                     argv[0]);
             return 1;
         }
@@ -264,6 +330,26 @@ int main(int argc, char ** argv) {
     srand(0);
 
     matmul_case test_case = {k, m, n, type_a};
+
+    if (bench_mode) {
+        printf("Benchmarking K=%ld M=%ld N=%ld type_a=%s (warmup=%d, iters=%d)...\n",
+               test_case.k, test_case.m, test_case.n,
+               ggml_type_name(test_case.type_a), bench_warmup, bench_iters);
+
+        double avg_ms = run_bench(test_case, backend, bench_warmup, bench_iters);
+        double flops = 2.0 * test_case.m * test_case.n * test_case.k;
+        double gflops = (flops / (avg_ms / 1000.0)) / 1e9;
+
+        printf("  avg: %.3f ms  (%.2f GFLOPS)\n", avg_ms, gflops);
+
+        if (ggml_is_quantized(type_a)) {
+            ggml_quantize_free();
+        }
+        ggml_backend_free(backend_cpu);
+        ggml_backend_free(backend);
+        return 0;
+    }
+
     printf("Testing K=%ld M=%ld N=%ld type_a=%s... ",
            test_case.k,
            test_case.m,
