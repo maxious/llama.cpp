@@ -1656,9 +1656,7 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
             (ggml_backend_sycl_split_buffer_type_context *) src0->buffer->buft->context;
         auto & tensor_split = buft_ctx->tensor_split;
 
-        // Calculate row range for this device
-        // Matches logic in ggml_sycl_op_mul_mat
-        const int64_t rounding = 1;  // MUL_MAT_ID supports arbitrary N usually, but let's check alignment
+        const int64_t rounding = 1;
 
         if (ctx.device != 0) {
             row_low = N * tensor_split[ctx.device];
@@ -1674,25 +1672,49 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
             }
         }
 
-        // Ensure valid range
         if (row_low >= row_high) {
-            // No work for this device
-            // We must still participate in any collective ops if they existed, but here we just return?
-            // Wait, we need to ensure stream state is valid.
             return;
         }
 
         N_local = row_high - row_low;
     }
 
+    queue_ptr stream = ctx.stream();
+
+    // Expert stride: bytes between experts in weight tensor
+    size_t expert_stride = src0->nb[2];
+    if (split) {
+        expert_stride = N_local * ggml_row_size(src0->type, K);
+    }
+
+    // =========================================================================
+    // Q8_0 FAST PATH: Direct-IDs kernel (zero pack/unpack overhead)
+    // Reads ids tensor in-kernel, accesses src1 and dst directly via strides.
+    // Eliminates: count/scan/pack kernels + packed buffers + unpack kernel.
+    // =========================================================================
+    if (src0->type == GGML_TYPE_Q8_0) {
+        launch_gemm_direct_ids_q8_0(stream,
+                                    (const char *) src1->data,
+                                    (const char *) src0->data,
+                                    (char *) dst->data,
+                                    (const char *) ids->data,
+                                    n_ids, n_batches,
+                                    ids->nb[0], ids->nb[1],
+                                    src1->ne[1], src1->nb[1], src1->nb[2],
+                                    dst->nb[1], dst->nb[2],
+                                    expert_stride, N, K, N_local, row_low);
+        return;  // No unpack needed - wrote directly to dst
+    }
+
+    // =========================================================================
+    // Generic path: count/scan/pack → GEMM → unpack (all other types)
+    // =========================================================================
+
     // Allocate temp buffers
-    // 1. Expert counts and offsets
     ggml_sycl_pool_alloc<int> dev_expert_counts(ctx.pool(), n_experts);
     ggml_sycl_pool_alloc<int> dev_expert_offsets(ctx.pool(), n_experts);
     ggml_sycl_pool_alloc<int> dev_row_dst_index(ctx.pool(), total_rows);
 
-    // 2. Packed buffers
-    // src1 is broadcast/shared, so it's full size. Use F16 pack only for MXFP4 path.
     const bool                       use_f16_pack = (src0->type == GGML_TYPE_MXFP4);
     ggml_sycl_pool_alloc<float>      dev_src1_packed_f32(ctx.pool());
     ggml_sycl_pool_alloc<sycl::half> dev_src1_packed_f16(ctx.pool());
@@ -1701,16 +1723,11 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
     } else {
         dev_src1_packed_f32.alloc(total_rows * ne10);
     }
-    // dst is split if N is split. We compute [N_local, total_rows].
-    // dev_dst_packed stores the partial result for this device.
     ggml_sycl_pool_alloc<char>             dev_dst_packed(ctx.pool(), sizeof(float) * total_rows * N_local);
     ggml_sycl_pool_alloc<mmid_row_mapping> dev_dst_mapping(ctx.pool(), total_rows);
 
-    queue_ptr stream = ctx.stream();
-
     // Zero counts
     stream->memset(dev_expert_counts.get(), 0, n_experts * sizeof(int));
-    // Initialize mapping with -1 to catch invalid/skipped rows
     stream->memset(dev_dst_mapping.get(), -1, total_rows * sizeof(mmid_row_mapping));
 
     // Launch Count
@@ -1766,35 +1783,6 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
             });
     });
 
-    // Adjust stride for weights: if split, each expert is smaller [K, N_local]
-    // If src0 buffer is split, it is compacted. So stride is K * N_local * sizeof(type).
-    // src0->nb[2] usually reflects the FULL stride if not adjusted?
-    // Wait, ggml split buffer type adjusts the tensor shape/stride?
-    // ggml_backend_sycl_buffer_type splits the storage.
-    // But tensor dimensions in `src0` might still reflect the full tensor if not reshaped?
-    // In `MUL_MAT`, it uses `src0_dd` allocation which is compact.
-    // Here `src0->data` is used.
-    // If `src0` is a view on a split buffer, `src0->data` points to device memory.
-    // We assume `src0` describes the FULL tensor, but `src0->data` points to the LOCAL slice?
-    // No, standard GGML split logic:
-    // The backend receives the full tensor struct, but `data` points to the split buffer.
-    // We need to calculate the correct offset between experts.
-    // Expert size in bytes = K * N_local * type_size.
-
-    size_t expert_stride = src0->nb[2];
-    if (split) {
-        // If split, the buffer is compact on device.
-        // Stride is derived from N_local.
-        // Assuming row-major [Expert, N, K] or [Expert, K, N]?
-        // src0 is [K, N, Experts].
-        // Stride nb[2] is stride between experts.
-        // nb[0] = type_size
-        // nb[1] = K * type_size
-        // nb[2] = N * K * type_size
-        // If split, N becomes N_local.
-        expert_stride = N_local * ggml_row_size(src0->type, K);
-    }
-
     const float *      src0_base       = (const float *) src0->data;
     const float *      src1_packed_f32 = dev_src1_packed_f32.get();
     const sycl::half * src1_packed_f16 = dev_src1_packed_f16.get();
@@ -1803,12 +1791,7 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
     // Use XMX indirect GEMM for F32/F16/BF16 when hardware supports it
     const bool use_xmx_indirect = xmx_gemm_available(stream);
 
-    // Q8_0: use fused all-experts kernel (single launch instead of n_experts launches)
-    if (src0->type == GGML_TYPE_Q8_0) {
-        launch_gemm_fused_experts_q8_0(stream, src1_packed_f32, (const char *) src0_base, dst_packed,
-                                       dev_expert_counts.get(), dev_expert_offsets.get(),
-                                       expert_stride, n_experts, total_rows, N_local, K, K, K, N_local);
-    } else {
+    {
     for (int i = 0; i < n_experts; ++i) {
         if (src0->type == GGML_TYPE_F16) {
             const sycl::half * weights = (const sycl::half *) ((const char *) src0_base + i * expert_stride);
@@ -1883,7 +1866,7 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
             }
         }
     }
-    } // else (non-Q8_0 types)
+    } // per-expert loop
 
     stream->submit([&](sycl::handler & cgh) {
         char *             dst_data    = (char *) dst->data;
