@@ -114,16 +114,14 @@ inline void gemm_xmx_kernel(
             shA[tile_m * XMX_A_STRIDE + tile_k] = xmx_bfloat16(val);
         }
         
-        // === Load B tile: coalesced along K for transpose_B ===
-        // When transpose_B: B is [N,K] row-major. Threads iterate (k,n) with n
-        // varying fastest. Each thread loads B[n, k] = B[global_n * ldb + global_k].
-        // For consecutive thread indices, global_n increments by 1, so loads are
-        // at stride-1 (contiguous) along the K dimension within each row — coalesced.
-        // Store as [BK x BN] row-major in SLM for joint_matrix row-major load.
+        // === Load B tile into SLM as [BK x BN] ===
+        // When transpose_B: B is [N,K] row-major, so B[n,k] = B[n * ldb + k].
+        // Iterate with k varying fastest so consecutive threads access
+        // consecutive K elements within the same row — coalesced reads.
         constexpr int B_TILE_ELEMS = XMX_BK * XMX_BN;
         for (int idx = lid; idx < B_TILE_ELEMS; idx += XMX_WG_SIZE) {
-            const int tile_k = idx / XMX_BN;
-            const int tile_n = idx % XMX_BN;
+            const int tile_n = idx / XMX_BK;
+            const int tile_k = idx % XMX_BK;
             const int global_k = k_base + tile_k;
             const int global_n = col_base + tile_n;
             
@@ -321,22 +319,21 @@ inline void gemm_xmx_f16_kernel(
             shA[tile_m * XMX_A_STRIDE + tile_k] = val;
         }
         
-        // === Load B tile [BN x BK] -> store as [BK x BN] ===
+        // === Load B tile into SLM as [BK x BN] ===
+        // Iterate with k varying fastest for coalesced reads when transpose_B
         constexpr int B_TILE_ELEMS = XMX_BK * XMX_BN;
         for (int idx = lid; idx < B_TILE_ELEMS; idx += XMX_WG_SIZE) {
-            const int tile_k = idx / XMX_BN;
-            const int tile_n = idx % XMX_BN;
+            const int tile_n = idx / XMX_BK;
+            const int tile_k = idx % XMX_BK;
             const int global_k = k_base + tile_k;
             const int global_n = col_base + tile_n;
             
             sycl::half val = sycl::half(0.0f);
             if constexpr (transpose_B) {
-                // B^T: input B is [N,K] row-major
                 if (global_n < N && global_k < K) {
                     val = B[global_n * ldb + global_k];
                 }
             } else {
-                // No transpose: B is [K,N] row-major
                 if (global_k < K && global_n < N) {
                     val = B[global_k * ldb + global_n];
                 }
@@ -506,11 +503,11 @@ inline void gemm_xmx_f16_f16_kernel(
             shA[tile_m * XMX_A_STRIDE + tile_k] = val;
         }
         
-        // Load B tile
+        // Load B tile — k varies fastest for coalesced reads when transpose_B
         constexpr int B_TILE_ELEMS = XMX_BK * XMX_BN;
         for (int idx = lid; idx < B_TILE_ELEMS; idx += XMX_WG_SIZE) {
-            const int tile_k = idx / XMX_BN;
-            const int tile_n = idx % XMX_BN;
+            const int tile_n = idx / XMX_BK;
+            const int tile_k = idx % XMX_BK;
             const int global_k = k_base + tile_k;
             const int global_n = col_base + tile_n;
             
@@ -698,8 +695,8 @@ inline void gemm_xmx_kernel_indirect(
 
         constexpr int B_TILE_ELEMS = XMX_BK * XMX_BN;
         for (int idx = lid; idx < B_TILE_ELEMS; idx += XMX_WG_SIZE) {
-            const int tile_k = idx / XMX_BN;
-            const int tile_n = idx % XMX_BN;
+            const int tile_n = idx / XMX_BK;
+            const int tile_k = idx % XMX_BK;
             const int global_k = k_base + tile_k;
             const int global_n = col_base + tile_n;
 
@@ -878,10 +875,10 @@ inline void launch_gemm_xmx_indirect_f32_f16(
                     shA[tile_m * XMX_A_STRIDE + tile_k] = xmx_bfloat16(val);
                 }
 
-                // Load B (F16) -> BF16
+                // Load B (F16) -> BF16 — k varies fastest for coalesced reads
                 constexpr int B_TILE_ELEMS = XMX_BK * XMX_BN;
                 for (int idx = lid; idx < B_TILE_ELEMS; idx += XMX_WG_SIZE) {
-                    const int tile_k = idx / XMX_BN, tile_n = idx % XMX_BN;
+                    const int tile_n = idx / XMX_BK, tile_k = idx % XMX_BK;
                     const int gk = k_base + tile_k, gn = col_base + tile_n;
                     float val = 0.0f;
                     if constexpr (transpose_B) {
@@ -1009,10 +1006,10 @@ inline void launch_gemm_xmx_indirect_f32_bf16(
                     shA[tile_m * XMX_A_STRIDE + tile_k] = xmx_bfloat16(val);
                 }
 
-                // Load B (BF16) -> BF16 (native, zero conversion)
+                // Load B (BF16) -> BF16 — k varies fastest for coalesced reads
                 constexpr int B_TILE_ELEMS = XMX_BK * XMX_BN;
                 for (int idx = lid; idx < B_TILE_ELEMS; idx += XMX_WG_SIZE) {
-                    const int tile_k = idx / XMX_BN, tile_n = idx % XMX_BN;
+                    const int tile_n = idx / XMX_BK, tile_k = idx % XMX_BK;
                     const int gk = k_base + tile_k, gn = col_base + tile_n;
                     xmx_bfloat16 val = xmx_bfloat16(0.0f);
                     if constexpr (transpose_B) {
