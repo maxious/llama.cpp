@@ -1133,9 +1133,9 @@ static void ggml_sycl_op_mul_mat_xmx(ggml_backend_sycl_context & ctx,
     } else if (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 ||
                src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_1 ||
                src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) {
-        // XMX int8 path for quantized types (opt-in via env var, can cause hangs on some configs)
-        static bool enable_xmx_int8 = getenv("GGML_SYCL_XMX_INT8") != nullptr;
-        if (enable_xmx_int8 && has_int8_xmx_support(stream)) {
+        // XMX int8 path for quantized types (disable with GGML_SYCL_XMX_INT8=0)
+        static bool disable_xmx_int8 = (getenv("GGML_SYCL_XMX_INT8") && std::string(getenv("GGML_SYCL_XMX_INT8")) == "0");
+        if (!disable_xmx_int8 && has_int8_xmx_support(stream)) {
             ggml_sycl_op_mul_mat_q_xmx_int8(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low,
                                             row_high, src1_ncols, src1_padded_row_size, stream);
         } else {
