@@ -416,13 +416,22 @@ struct ggml_backend_sycl_context {
     std::map<int, std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>> per_device_exec_graphs;
     bool multi_device_graphs_initialized = false;
 
-    // Graph cache: maps topology hash -> executable graph
+    // Graph cache: maps topology hash -> executable graph (for fully-compatible graphs)
     // This allows reusing graphs when the same topology is encountered again
     std::map<uint64_t, std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>> graph_cache;
     // Pointer hash cache: maps topology hash -> USM pointer hash from last recording
     // Used for three-tier cache lookup: pure replay / re-record+update / full record+finalize
     std::map<uint64_t, uint64_t> graph_pointer_hashes;
     static constexpr size_t MAX_GRAPH_CACHE_SIZE = 8;  // Limit cache to prevent memory bloat
+
+    // Segmented graph cache: for graphs with immediate-mode nodes, we cache
+    // per-segment executable graphs keyed by (topology_hash, segment_index).
+    // Each segment is a contiguous range of graph-compatible nodes.
+    struct segment_cache_entry {
+        std::vector<std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>> segment_graphs;
+        uint64_t pointer_hash = 0;
+    };
+    std::map<uint64_t, segment_cache_entry> segmented_graph_cache;
 
     // Dedicated graph execution queue with no_immediate_command_list property.
     // Intel discrete GPUs require this for efficient ext_oneapi_graph() submission.

@@ -1234,8 +1234,63 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                        const ggml_tensor *         src1,
                        ggml_tensor *               dst) {
     if (ctx.force_graph_compatible) {
+        // Graph-safe dispatch: use the same fast kernel paths as normal dispatch
+        // (DMMV, MMVQ, MMQ, XMX) but never fall through to oneMKL (graph-incompatible).
+        // Reordering is already disabled by should_reorder_tensor() checking force_graph_compatible.
+        // Q5_0/Q8_0 nodes are handled by segmented execution (node_needs_immediate_mode) and
+        // won't reach here during graph recording.
+
+        const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
+
+        // F16 permuted/non-contiguous single-batch paths use custom kernels (graph-safe)
+        if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) &&
+            src1->ne[1] == 1 && src0->ne[3] == 1 && src1->ne[3] == 1) {
+            ggml_sycl_mul_mat_vec_p021(ctx, src0, src1, dst);
+            return;
+        }
+        if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) &&
+            !ggml_is_transposed(src1) && src1->ne[1] == 1 && src1->ne[3] == 1) {
+            ggml_sycl_mul_mat_vec_nc(ctx, src0, src1, dst);
+            return;
+        }
+
+        // Check standard fast paths (same logic as normal dispatch, minus reorder)
+        bool use_dequantize_mul_mat_vec_g = can_use_dequantize_mul_mat_vec(src0, src1, dst);
+        bool use_mul_mat_vec_q_g          = can_use_mul_mat_vec_q(src0, src1, dst);
+        bool use_mul_mat_q_g =
+            ggml_sycl_supports_mmq(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+        use_mul_mat_q_g = use_mul_mat_q_g && (src0->type != GGML_TYPE_IQ2_XXS);
+#ifdef SYCL_USE_XMX
+        use_mul_mat_q_g = use_mul_mat_q_g && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
+#endif
+        constexpr int64_t MMQ_MIN_NROWS_G = 128;
+        use_mul_mat_q_g = use_mul_mat_q_g && (src0->ne[1] >= MMQ_MIN_NROWS_G);
+        use_mul_mat_q_g = use_mul_mat_q_g && (src1->ne[1] >= MMQ_MIN_NROWS_G);
+        // Belt-and-suspenders: exclude Q5_0/Q8_0 from MMQ during graph recording
+        // (they should already be segmented out, but guard against edge cases)
+        use_mul_mat_q_g = use_mul_mat_q_g && (src0->type != GGML_TYPE_Q5_0) && (src0->type != GGML_TYPE_Q8_0);
+
+        if (use_dequantize_mul_mat_vec_g) {
+            GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT DMMV [graph] ne=[%ld,%ld,%ld,%ld] type=%s\n",
+                    dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
+            ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);
+            return;
+        }
+        if (use_mul_mat_vec_q_g) {
+            GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT MMVQ [graph] ne=[%ld,%ld,%ld,%ld] type=%s\n",
+                    dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
+            ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
+            return;
+        }
+        if (use_mul_mat_q_g) {
+            GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT MMQ [graph] ne=[%ld,%ld,%ld,%ld] type=%s\n",
+                    dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
+            ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
+            return;
+        }
+
+        // XMX path (F32/F16/quantized via int8)
         if (xmx_gemm_available(ctx.stream())) {
-            // Check if types are supported by XMX kernels
             bool xmx_types = false;
             if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
                 xmx_types = true;
@@ -1249,6 +1304,10 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 return;
             }
         }
+
+        // Last resort: tiled GEMM (graph-compatible but slower)
+        GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT TILED [graph fallback] ne=[%ld,%ld,%ld,%ld] type=%s\n",
+                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
         GGML_SYCL_ITT_MUL_MAT_TILED(f32);
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_tiled);
         return;

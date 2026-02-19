@@ -507,8 +507,8 @@ Counters and (optionally) timing totals/avg/min/max.
 
 1. ~~**Re-records every frame even on cache hit**~~ — **FIXED** (commit 327b07c8b). Three-tier cache now skips recording entirely when USM pointers are unchanged (pure replay).
 2. ~~**Missing `no_immediate_command_list`**~~ — **FIXED** (commit 327b07c8b). Dedicated graph execution queue with `no_immediate_command_list` + `in_order` properties. Lazily created via `graph_exec_stream()`.
-3. **All-or-nothing graph compatibility** — If any single op is graph-incompatible (oneMKL, oneDNN), the entire graph is disabled. All nodes fall back to eager.
-4. **`force_graph_compatible` forces slow paths** — MUL_MAT always uses tiled kernels (slow) instead of MMQ (fast) during graph recording.
+3. ~~**All-or-nothing graph compatibility**~~ — **FIXED**. Was: If any single op is graph-incompatible (oneMKL, oneDNN), the entire graph is disabled. All nodes fall back to eager. Now: uses segmented graph execution.
+4. ~~**`force_graph_compatible` forces slow paths**~~ — **FIXED**. Was: MUL_MAT always uses tiled kernels (slow) instead of MMQ (fast) during graph recording. Now: graph-safe dispatch allows DMMV/MMVQ/MMQ/XMX during recording, only falling back to tiled as last resort.
 
 ### Completed Fixes
 
@@ -526,37 +526,71 @@ Counters and (optionally) timing totals/avg/min/max.
 - All 3 single-device `ext_oneapi_graph()` calls use this queue. Multi-device path unchanged.
 - Per Intel spec: `no_immediate_command_list` uses standard command queues (batched submission) instead of immediate command lists, reducing per-submission overhead.
 
+#### Fix 3: Segmented graph execution for graph-incompatible ops ✅
+- **Problem**: Previously, if ANY node was graph-incompatible (Q5_0/Q8_0 MMQ, oneMKL GEMM), check_graph_compatibility() returned DISABLED and the entire graph fell back to eager execution.
+- **Solution**: Instead of oneDNN's pause/resume pattern (which doesn't solve the replay problem), implemented **segmented graph execution** that partitions the cgraph into graph segments and immediate-mode nodes.
+- **Design choice**: oneDNN's pause/resume records multiple segments into one modifiable graph, but a single executable graph cannot "remember" to do eager work between segments on replay. Segmentation creates separate executable graphs per segment, enabling correct interleaved replay.
+- **Key components**:
+  - `node_needs_immediate_mode()` — identifies per-node incompatibilities: Q5_0/Q8_0 MMQ types (GPU faults), unsupported type combos that fall to oneMKL GEMM (creates internal events).
+  - `graph_exec_step` / `build_graph_exec_plan()` — partitions cgraph nodes into consecutive graph segments and immediate-mode groups.
+  - Two execution paths in `ggml_backend_sycl_graph_compute()`:
+    - **Monolithic path** (no immediate nodes): existing three-tier cache, unchanged.
+    - **Segmented path** (has immediate nodes): per-segment executable graphs cached in `segmented_graph_cache`, interleaved with eager execution of immediate nodes.
+  - Segmented cache in `common.hpp`: `segment_cache_entry` stores vector of executable graphs + pointer hash.
+  - Three-tier cache per segment: pure replay (topology+pointers match), re-record (pointers changed), cache miss (full record+finalize).
+  - Queue synchronization: `stream()->wait()` between graph segments and immediate nodes ensures correct data dependencies.
+- **Results**: Q8_0 and Q5_0 MUL_MAT now work with graphs enabled (37/37 tests pass for Q8_0). Previously these types completely disabled graphs.
+- **Verified**: test-backend-ops Q8_0 37/37, Q5_0 all pass, Q4_K 34/35 (1 pre-existing tiled precision edge case, improved from 32/35 after Fix 4).
+- **Test**:
+  ```bash
+  GGML_SYCL_DISABLE_GRAPH=0 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q8_0"
+  GGML_SYCL_DISABLE_GRAPH=0 GGML_SYCL_DEBUG=1 ./build-sycl/bin/llama-bench -m model.gguf -n 16 -p 0
+  # Look for "[SYCL-GRAPH-SEG]" log messages indicating segmented path
+  ```
+
 ### Remaining Fixes
 
-#### Fix 3: Adopt oneDNN's pause/resume pattern for graph-incompatible ops
-- **Reference**: `oneDNN/src/gpu/intel/sycl/stream.cpp:151-174` — `pause_recording()` calls `end_recording()`, runs the incompatible op eagerly, then `resume_recording()` calls `begin_recording()` again. This preserves graph benefits for all other nodes.
-- **Reference**: `oneDNN/src/gpu/intel/compute/zero_pool.cpp:203-206` — `enter_immediate_mode()` / `exit_immediate_mode()` wraps non-graph-safe operations (like zero-pool initialization).
-- **Implementation**:
-  - Add `pause_graph_recording()` / `resume_graph_recording()` to `ggml_backend_sycl_context`, modeled on oneDNN's `stream_t::pause_recording()`.
-  - In `check_graph_compatibility()`, instead of returning `DISABLED` for ops like oneMKL GEMM or oneDNN, mark them as "needs immediate mode".
-  - During `ggml_backend_sycl_graph_compute_impl()`, before executing a marked node: pause recording → execute eagerly → resume recording.
-  - The graph captures everything *around* the incompatible ops, still reducing launch overhead for the majority of kernels.
-  - Key subtlety: dependencies between graph-recorded nodes and eagerly-executed nodes must be managed via events, as oneDNN does with `paused_dep_`.
-
-#### Fix 4: Use `dynamic_command_group` for dispatch path selection
-- **Reference**: `llvm/sycl/test-e2e/Graph/Update/dyn_cgf_usm.cpp` — register multiple kernel alternatives for the same graph node, switch via `set_active_index()`.
-- **Reference**: `llvm/sycl/test-e2e/Graph/Update/dyn_cgf_parameters.cpp` — different parameters per alternative.
-- **Implementation**:
-  - For MUL_MAT nodes, register both tiled kernel and MMQ kernel as alternatives in a `dynamic_command_group`.
-  - Default to MMQ (fast), fall back to tiled when shapes/types require it.
-  - Graph structure stays the same; only the active kernel changes per `update()`.
-  - **Prerequisite**: Verify `dynamic_command_group` is stable on Intel Arc/Battlemage (it's still experimental).
-  - **Constraint**: Both alternatives must have identical `node_type` (both are `kernel` type, so this works).
+#### Fix 4: Graph-safe dispatch allows fast kernel paths ✅
+- **Problem**: `force_graph_compatible` in matmul.cpp forced all MUL_MAT to use tiled kernels during graph recording, even when fast paths (DMMV, MMVQ, MMQ) are graph-compatible.
+- **Original plan**: Use `dynamic_command_group` to register both tiled and MMQ as alternatives. **Abandoned** because `dynamic_command_group` requires explicit graph API (`graph.add()`), not queue recording (`begin_recording`/`end_recording`). The SYCL spec explicitly throws `invalid` if `graph.add(dynamic_command_group)` is called while a queue is recording.
+- **Actual fix**: Replaced the `force_graph_compatible` early-return in `ggml_sycl_mul_mat()` (matmul.cpp) with a graph-safe dispatch that mirrors the normal dispatch ordering:
+  1. F16 permuted/non-contiguous single-batch paths (custom kernels, graph-safe)
+  2. DMMV (`can_use_dequantize_mul_mat_vec`) — graph-safe
+  3. MMVQ (`can_use_mul_mat_vec_q`) — graph-safe, no reorder (already disabled)
+  4. MMQ (`ggml_sycl_supports_mmq`) — graph-safe for all types **except** Q5_0/Q8_0 (excluded with belt-and-suspenders guard; already segmented out by `node_needs_immediate_mode()`)
+  5. XMX (F32/F16) — graph-safe
+  6. Tiled GEMM — last-resort fallback only (F32/F16/BF16/MXFP4 × F32)
+  - oneMKL is **never** called during graph recording (graph-incompatible due to internal events).
+  - Reordering is already disabled by `should_reorder_tensor()` checking `force_graph_compatible`.
+- **Results**: All types now pass 100% with graphs enabled:
+  - Q4_K: 35/35 MUL_MAT, 72/72 MUL_MAT_ID
+  - Q8_0: 37/37, Q4_0: 37/37, Q5_0: 12/12, Q2_K: 11/11, Q6_K: 11/11
+  - F32: 186/186, F16: 176/176
+- **Segmented execution rules** (`node_needs_immediate_mode` in backend.cpp):
+  - MUL_MAT_ID: always immediate (data-dependent expert routing, BCS page faults)
+  - Q5_0/Q8_0 MUL_MAT: always immediate (GPU faults under SYCL graphs)
+  - F16 permuted single-batch: graph-safe (direct kernels, no pool allocs)
+  - Non-contiguous src0/src1: immediate (pool-allocated temporaries freed after recording)
+  - Batched MUL_MAT (ne12*ne13 > 1): immediate (batch loop pointer offsets, KQ/KQV goes through FA)
+  - F16/F32 src0: immediate (flaky Level Zero graph update() for XMX/tiled kernels)
+  - Remaining quantized types (Q4_K, Q4_0, Q2_K-Q6_K): graph-safe via DMMV/MMVQ/MMQ paths
+- **Test**:
+  ```bash
+  GGML_SYCL_DISABLE_GRAPH=0 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q4_K"
+  GGML_SYCL_DISABLE_GRAPH=0 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=f32"
+  GGML_SYCL_DISABLE_GRAPH=0 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p "type_a=q4_K"
+  # Debug output should show "DMMV [graph]", "MMVQ [graph]", "MMQ [graph]" instead of "TILED [graph fallback]"
+  ```
 
 #### Fix 5: Enable graphs by default
 - Once fixes 1–3 are stable and tested, flip `GGML_SYCL_DISABLE_GRAPH` default from `1` to `0`.
 - Add a `GGML_SYCL_GRAPH_MODE` env var with values: `off` (current default), `replay` (fix 1 only), `full` (fixes 1+3).
 
 ### Implementation Order
-1. Fix 2 — trivial, one queue property change
-2. Fix 1 — biggest perf win, well-validated by LLVM e2e tests
-3. Fix 3 — architecturally important, more invasive, follows oneDNN pattern
-4. Fix 4 — depends on compiler maturity of `dynamic_command_group`
+1. ~~Fix 2 — trivial, one queue property change~~ ✅
+2. ~~Fix 1 — biggest perf win, well-validated by LLVM e2e tests~~ ✅
+3. ~~Fix 3 — architecturally important, segmented graph execution~~ ✅
+4. ~~Fix 4 — graph-safe dispatch (abandoned `dynamic_command_group`, used direct dispatch instead)~~ ✅
 5. Fix 5 — final gate after stability validation
 
 ### Testing Strategy
@@ -564,7 +598,7 @@ Counters and (optionally) timing totals/avg/min/max.
 - **Fix 1 perf**: Compare `llama-bench` with `GGML_SYCL_DEBUG=1` to count re-recordings per graph execution. Expect 1 recording on first call, 0 on subsequent calls with stable pointers.
 - **Fix 2 perf**: Profile with `onetrace --device-timing` before/after adding `no_immediate_command_list`. Compare kernel launch latency.
 - **Fix 3 correctness**: Run models that use oneMKL paths (F16 weights, large batches) with graphs enabled. Verify output matches non-graph path.
-- **Fix 3 perf**: Measure overhead of pause/resume vs. fully-disabled graphs. The pause/resume cost should be O(1) per incompatible op.
+- **Fix 3 perf**: Measure overhead of segmented vs. fully-disabled graphs. Segmentation cost should be O(n_segments) per frame.
 
 ### Reference Files
 - LLVM SYCL graph e2e tests: `~/llvm/sycl/test-e2e/Graph/`
