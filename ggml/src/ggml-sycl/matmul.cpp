@@ -1362,6 +1362,7 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             bool is_quant =
                 (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 ||
                  src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_1 ||
+                 src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K ||
                  src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K);
             fprintf(stderr, "ggml_sycl: MUL_MAT %s ne=[%ld,%ld,%ld,%ld] type=%s\n", is_quant ? "XMX_INT8" : "XMX",
                     dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
@@ -1799,20 +1800,33 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
     const sycl::half * src1_packed_f16 = dev_src1_packed_f16.get();
     float *            dst_packed      = (float *) dev_dst_packed.get();
 
+    // Use XMX indirect GEMM for F32/F16/BF16 when hardware supports it
+    const bool use_xmx_indirect = xmx_gemm_available(stream);
+
     for (int i = 0; i < n_experts; ++i) {
         if (src0->type == GGML_TYPE_F16) {
             const sycl::half * weights = (const sycl::half *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_f32_f16(stream, src1_packed_f32, weights, dst_packed,
-                                               dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
-                                               total_rows,  // max_M
-                                               N_local, K, 1.0f, 0.0f, K, K, N_local);
+            if (use_xmx_indirect) {
+                launch_gemm_xmx_indirect_f32_f16(stream, src1_packed_f32, weights, dst_packed,
+                                                 dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                                 total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+            } else {
+                launch_gemm_tiled_indirect_f32_f16(stream, src1_packed_f32, weights, dst_packed,
+                                                   dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                                   total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+            }
         } else if (src0->type == GGML_TYPE_BF16) {
             const sycl::ext::oneapi::bfloat16 * weights =
                 (const sycl::ext::oneapi::bfloat16 *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_f32_bf16(stream, src1_packed_f32, weights, dst_packed,
-                                                dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
-                                                total_rows,  // max_M
-                                                N_local, K, 1.0f, 0.0f, K, K, N_local);
+            if (use_xmx_indirect) {
+                launch_gemm_xmx_indirect_f32_bf16(stream, src1_packed_f32, weights, dst_packed,
+                                                  dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                                  total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+            } else {
+                launch_gemm_tiled_indirect_f32_bf16(stream, src1_packed_f32, weights, dst_packed,
+                                                    dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                                    total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+            }
         } else if (src0->type == GGML_TYPE_MXFP4) {
             // MXFP4 weights with fused dequantization + F16 activations
             // ldb = K (the full K dimension, used for block indexing: K/32 blocks per row)
@@ -1864,10 +1878,15 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
                                             N_local);
         } else {
             const float * weights = (const float *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
-                                       dev_expert_offsets.get() + i,
-                                       total_rows,  // max_M
-                                       N_local, K, 1.0f, 0.0f, K, K, N_local);
+            if (use_xmx_indirect) {
+                launch_gemm_xmx_indirect(stream, src1_packed_f32, weights, dst_packed,
+                                         dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                         total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+            } else {
+                launch_gemm_tiled_indirect(stream, src1_packed_f32, weights, dst_packed,
+                                           dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                           total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+            }
         }
     }
 
@@ -1897,28 +1916,19 @@ void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) tr
     // Use tiled path on Xe2 to work around IGC compiler crash in AddRequiredMemoryFences pass.
     // The MMQ kernels trigger a bug in IGC's SLM fence insertion when compiled as part of the
     // MUL_MAT_ID SPIR-V module (same kernels work fine in the MUL_MAT path).
-    // Set GGML_SYCL_MUL_MAT_ID_XMX=1 to force XMX path (requires patched IGC to avoid crashes).
-    static bool enable_xmx = getenv("GGML_SYCL_MUL_MAT_ID_XMX") != nullptr;
-    // Auto-enable on known good systems (e.g., hostname 'futaba' has patched IGC)
-    if (!enable_xmx) {
-        char hostname[256];
-        if (gethostname(hostname, sizeof(hostname)) == 0) {
-            if (strcmp(hostname, "futaba") == 0) {
-                enable_xmx = true;
-            }
-        }
-    }
+    // Set GGML_SYCL_MUL_MAT_ID_XMX=1 to force MMQ path (requires patched IGC to avoid crashes).
+    static const bool enable_mmq = getenv("GGML_SYCL_MUL_MAT_ID_XMX") != nullptr;
     const bool use_tiled =
-        !enable_xmx && (ctx.force_graph_compatible || ggml_sycl_info().devices[ctx.device].arch == SYCL_ARCH_INTEL_XE2);
+        !enable_mmq && (ctx.force_graph_compatible || ggml_sycl_info().devices[ctx.device].arch == SYCL_ARCH_INTEL_XE2);
     if (use_tiled) {
         GGML_SYCL_ITT_MUL_MAT_ID_TILED(moe);
-        fprintf(stderr, "ggml_sycl: MUL_MAT_ID TILED ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1],
+        GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT_ID TILED ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1],
                 dst->ne[2], dst->ne[3], ggml_type_name(dst->src[0]->type));
         ggml_sycl_mul_mat_id_tiled(ctx, dst);
         return;
     }
     GGML_SYCL_ITT_MUL_MAT_ID_MMQ(moe);
-    fprintf(stderr, "ggml_sycl: MUL_MAT_ID MMQ ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
+    GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT_ID MMQ ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
             dst->ne[3], ggml_type_name(dst->src[0]->type));
 
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
