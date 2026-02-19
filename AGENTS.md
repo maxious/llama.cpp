@@ -505,29 +505,28 @@ Counters and (optionally) timing totals/avg/min/max.
 
 ### Key Flaws Identified
 
-1. **Re-records every frame even on cache hit** — On cache hit (backend.cpp:1095–1105), still calls `begin_recording` → `compute_impl` → `end_recording` → `update()`. The recording overhead is paid every time; only finalization is skipped.
-2. **Missing `no_immediate_command_list`** — The Intel article and spec (`sycl_ext_intel_queue_immediate_command_list.asciidoc`) require this property on the graph execution queue for Intel discrete GPUs. Without it, each `ext_oneapi_graph` submission may use an immediate command list, losing batching benefits.
+1. ~~**Re-records every frame even on cache hit**~~ — **FIXED** (commit 327b07c8b). Three-tier cache now skips recording entirely when USM pointers are unchanged (pure replay).
+2. ~~**Missing `no_immediate_command_list`**~~ — **FIXED** (commit 327b07c8b). Dedicated graph execution queue with `no_immediate_command_list` + `in_order` properties. Lazily created via `graph_exec_stream()`.
 3. **All-or-nothing graph compatibility** — If any single op is graph-incompatible (oneMKL, oneDNN), the entire graph is disabled. All nodes fall back to eager.
 4. **`force_graph_compatible` forces slow paths** — MUL_MAT always uses tiled kernels (slow) instead of MMQ (fast) during graph recording.
 
-### Fixes, Ranked by Impact
+### Completed Fixes
 
-#### Fix 1: Skip re-recording when USM pointers unchanged (Biggest win)
-- **Reference**: `llvm/sycl/test-e2e/Graph/Inputs/repeated_exec.cpp` — when USM pointers don't change, just call `queue.ext_oneapi_graph(ExecGraph)` again with no re-recording or update.
-- **Reference**: `llvm/sycl/test-e2e/Graph/Inputs/whole_update_double_buffer.cpp` — when pointers change, build a second modifiable graph and call `ExecGraph.update(GraphB)` (whole-graph update, no re-finalization).
-- **Implementation**:
-  - Extend the topology hash to include USM data pointers (`tensor->data` for all src/dst tensors).
-  - Three-tier cache lookup: (a) topology+pointers match → pure replay, zero host overhead; (b) topology matches, pointers differ → re-record + `update()`; (c) topology differs → full re-record + finalize.
-  - This eliminates the per-frame recording cost for steady-state inference (token generation), where tensor shapes and buffer allocations are stable.
+#### Fix 1: Three-tier graph cache with pure replay ✅ (commit 327b07c8b)
+- Added `compute_cgraph_pointer_hash()` — FNV-1a hash of all USM `tensor->data` pointers.
+- Added `graph_pointer_hashes` map in `common.hpp` alongside `graph_cache`.
+- Three-tier cache lookup in single-device path:
+  - **Tier 1 (Pure replay)**: topology + pointers match → just `ext_oneapi_graph()`, no recording, no queue wait. ~10-15 µs per call.
+  - **Tier 2 (Re-record + update)**: topology match, pointers differ → `begin_recording` + `compute_impl` + `end_recording` + `update()`.
+  - **Tier 3 (Full record + finalize)**: cache miss → full pipeline with `finalize(updatable{})`.
+- **Verified**: Llama-3.2-1B Q4_K tg16 — 2 cache misses on startup, then 100% pure replay hits. test-backend-ops 35/35 MUL_MAT q4_K tests pass.
 
-#### Fix 2: Add `no_immediate_command_list` to graph execution queue (Trivial)
-- **Reference**: Intel article example creates a separate queue: `sycl::queue qexec{q.get_context(), q.get_device(), {sycl::property::queue::in_order{}, sycl::ext::intel::property::queue::no_immediate_command_list{}}};`
-- **Reference**: `llvm/sycl/doc/extensions/supported/sycl_ext_intel_queue_immediate_command_list.asciidoc` — "well-tested only on Intel Data Center Max Series GPUs (aka PVC). Use is not recommended for other Intel GPUs."
-- **Implementation**:
-  - Create a dedicated graph-execution queue in `ggml_backend_sycl_context` with `no_immediate_command_list` property.
-  - Use this queue only for `ext_oneapi_graph()` calls, not for regular kernel submissions.
-  - Gate behind PVC/discrete GPU detection since the spec says it's not recommended for other GPUs. On Arc/Battlemage, test whether it helps or hurts.
-  - Alternatively, add `no_immediate_command_list` to existing queues in `dpct::helper.hpp` `create_queue_impl()` when graph mode is enabled.
+#### Fix 2: Dedicated graph execution queue with `no_immediate_command_list` ✅ (commit 327b07c8b)
+- Added `graph_exec_stream()` method to `ggml_backend_sycl_context` that lazily creates a `sycl::queue` with `in_order` + `no_immediate_command_list` properties.
+- All 3 single-device `ext_oneapi_graph()` calls use this queue. Multi-device path unchanged.
+- Per Intel spec: `no_immediate_command_list` uses standard command queues (batched submission) instead of immediate command lists, reducing per-submission overhead.
+
+### Remaining Fixes
 
 #### Fix 3: Adopt oneDNN's pause/resume pattern for graph-incompatible ops
 - **Reference**: `oneDNN/src/gpu/intel/sycl/stream.cpp:151-174` — `pause_recording()` calls `end_recording()`, runs the incompatible op eagerly, then `resume_recording()` calls `begin_recording()` again. This preserves graph benefits for all other nodes.
