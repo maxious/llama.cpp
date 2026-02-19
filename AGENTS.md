@@ -492,3 +492,88 @@ What The Summary Includes
 Implementation label: xmx, fused, tiled, mkl.
 Parameters: dqk, dv, n, n_kv, heads, kv_heads, q/kv/out types, mask type, sinks, n_splits, graph vs eager, small batch.
 Counters and (optionally) timing totals/avg/min/max.
+
+## SYCL Graph Optimization Plan (Feb 2026)
+
+### Current State
+- SYCL graphs are implemented with queue recording (`begin_recording`/`end_recording`/`finalize`/`ext_oneapi_graph`).
+- Graph caching uses FNV-1a topology hashing (op, type, shape) with up to 8 cached executable graphs.
+- Whole-graph `update()` is used when `ext_oneapi_graph` aspect is supported; falls back to re-finalize.
+- `force_graph_compatible` flag forces graph-safe kernel paths (tiled instead of oneMKL, direct-ids instead of pack/unpack for MoE).
+- Graphs are **disabled by default** (`GGML_SYCL_DISABLE_GRAPH=1`).
+- Many bail-out heuristics in `check_graph_compatibility()`: n_nodes > 500, Q5_0/Q8_0 types, SET_ROWS with large VIEWs, unsupported MUL_MAT type combos.
+
+### Key Flaws Identified
+
+1. **Re-records every frame even on cache hit** — On cache hit (backend.cpp:1095–1105), still calls `begin_recording` → `compute_impl` → `end_recording` → `update()`. The recording overhead is paid every time; only finalization is skipped.
+2. **Missing `no_immediate_command_list`** — The Intel article and spec (`sycl_ext_intel_queue_immediate_command_list.asciidoc`) require this property on the graph execution queue for Intel discrete GPUs. Without it, each `ext_oneapi_graph` submission may use an immediate command list, losing batching benefits.
+3. **All-or-nothing graph compatibility** — If any single op is graph-incompatible (oneMKL, oneDNN), the entire graph is disabled. All nodes fall back to eager.
+4. **`force_graph_compatible` forces slow paths** — MUL_MAT always uses tiled kernels (slow) instead of MMQ (fast) during graph recording.
+
+### Fixes, Ranked by Impact
+
+#### Fix 1: Skip re-recording when USM pointers unchanged (Biggest win)
+- **Reference**: `llvm/sycl/test-e2e/Graph/Inputs/repeated_exec.cpp` — when USM pointers don't change, just call `queue.ext_oneapi_graph(ExecGraph)` again with no re-recording or update.
+- **Reference**: `llvm/sycl/test-e2e/Graph/Inputs/whole_update_double_buffer.cpp` — when pointers change, build a second modifiable graph and call `ExecGraph.update(GraphB)` (whole-graph update, no re-finalization).
+- **Implementation**:
+  - Extend the topology hash to include USM data pointers (`tensor->data` for all src/dst tensors).
+  - Three-tier cache lookup: (a) topology+pointers match → pure replay, zero host overhead; (b) topology matches, pointers differ → re-record + `update()`; (c) topology differs → full re-record + finalize.
+  - This eliminates the per-frame recording cost for steady-state inference (token generation), where tensor shapes and buffer allocations are stable.
+
+#### Fix 2: Add `no_immediate_command_list` to graph execution queue (Trivial)
+- **Reference**: Intel article example creates a separate queue: `sycl::queue qexec{q.get_context(), q.get_device(), {sycl::property::queue::in_order{}, sycl::ext::intel::property::queue::no_immediate_command_list{}}};`
+- **Reference**: `llvm/sycl/doc/extensions/supported/sycl_ext_intel_queue_immediate_command_list.asciidoc` — "well-tested only on Intel Data Center Max Series GPUs (aka PVC). Use is not recommended for other Intel GPUs."
+- **Implementation**:
+  - Create a dedicated graph-execution queue in `ggml_backend_sycl_context` with `no_immediate_command_list` property.
+  - Use this queue only for `ext_oneapi_graph()` calls, not for regular kernel submissions.
+  - Gate behind PVC/discrete GPU detection since the spec says it's not recommended for other GPUs. On Arc/Battlemage, test whether it helps or hurts.
+  - Alternatively, add `no_immediate_command_list` to existing queues in `dpct::helper.hpp` `create_queue_impl()` when graph mode is enabled.
+
+#### Fix 3: Adopt oneDNN's pause/resume pattern for graph-incompatible ops
+- **Reference**: `oneDNN/src/gpu/intel/sycl/stream.cpp:151-174` — `pause_recording()` calls `end_recording()`, runs the incompatible op eagerly, then `resume_recording()` calls `begin_recording()` again. This preserves graph benefits for all other nodes.
+- **Reference**: `oneDNN/src/gpu/intel/compute/zero_pool.cpp:203-206` — `enter_immediate_mode()` / `exit_immediate_mode()` wraps non-graph-safe operations (like zero-pool initialization).
+- **Implementation**:
+  - Add `pause_graph_recording()` / `resume_graph_recording()` to `ggml_backend_sycl_context`, modeled on oneDNN's `stream_t::pause_recording()`.
+  - In `check_graph_compatibility()`, instead of returning `DISABLED` for ops like oneMKL GEMM or oneDNN, mark them as "needs immediate mode".
+  - During `ggml_backend_sycl_graph_compute_impl()`, before executing a marked node: pause recording → execute eagerly → resume recording.
+  - The graph captures everything *around* the incompatible ops, still reducing launch overhead for the majority of kernels.
+  - Key subtlety: dependencies between graph-recorded nodes and eagerly-executed nodes must be managed via events, as oneDNN does with `paused_dep_`.
+
+#### Fix 4: Use `dynamic_command_group` for dispatch path selection
+- **Reference**: `llvm/sycl/test-e2e/Graph/Update/dyn_cgf_usm.cpp` — register multiple kernel alternatives for the same graph node, switch via `set_active_index()`.
+- **Reference**: `llvm/sycl/test-e2e/Graph/Update/dyn_cgf_parameters.cpp` — different parameters per alternative.
+- **Implementation**:
+  - For MUL_MAT nodes, register both tiled kernel and MMQ kernel as alternatives in a `dynamic_command_group`.
+  - Default to MMQ (fast), fall back to tiled when shapes/types require it.
+  - Graph structure stays the same; only the active kernel changes per `update()`.
+  - **Prerequisite**: Verify `dynamic_command_group` is stable on Intel Arc/Battlemage (it's still experimental).
+  - **Constraint**: Both alternatives must have identical `node_type` (both are `kernel` type, so this works).
+
+#### Fix 5: Enable graphs by default
+- Once fixes 1–3 are stable and tested, flip `GGML_SYCL_DISABLE_GRAPH` default from `1` to `0`.
+- Add a `GGML_SYCL_GRAPH_MODE` env var with values: `off` (current default), `replay` (fix 1 only), `full` (fixes 1+3).
+
+### Implementation Order
+1. Fix 2 — trivial, one queue property change
+2. Fix 1 — biggest perf win, well-validated by LLVM e2e tests
+3. Fix 3 — architecturally important, more invasive, follows oneDNN pattern
+4. Fix 4 — depends on compiler maturity of `dynamic_command_group`
+5. Fix 5 — final gate after stability validation
+
+### Testing Strategy
+- **Fix 1 correctness**: Run `test-backend-ops -b SYCL0` with `GGML_SYCL_DISABLE_GRAPH=0` and verify all ops pass.
+- **Fix 1 perf**: Compare `llama-bench` with `GGML_SYCL_DEBUG=1` to count re-recordings per graph execution. Expect 1 recording on first call, 0 on subsequent calls with stable pointers.
+- **Fix 2 perf**: Profile with `onetrace --device-timing` before/after adding `no_immediate_command_list`. Compare kernel launch latency.
+- **Fix 3 correctness**: Run models that use oneMKL paths (F16 weights, large batches) with graphs enabled. Verify output matches non-graph path.
+- **Fix 3 perf**: Measure overhead of pause/resume vs. fully-disabled graphs. The pause/resume cost should be O(1) per incompatible op.
+
+### Reference Files
+- LLVM SYCL graph e2e tests: `~/llvm/sycl/test-e2e/Graph/`
+- LLVM SYCL graph spec: `~/llvm/sycl/doc/extensions/experimental/sycl_ext_oneapi_graph.asciidoc`
+- LLVM immediate command list spec: `~/llvm/sycl/doc/extensions/supported/sycl_ext_intel_queue_immediate_command_list.asciidoc`
+- oneDNN pause/resume pattern: `~/oneDNN/src/gpu/intel/sycl/stream.cpp`
+- oneDNN immediate mode for zero pools: `~/oneDNN/src/gpu/intel/compute/zero_pool.cpp`
+- oneDNN graph-aware GEMM: `~/oneDNN/src/gpu/intel/gemm/jit.cpp:336`
+- Current graph implementation: `ggml/src/ggml-sycl/backend.cpp:595-1191`
+- Graph cache/context: `ggml/src/ggml-sycl/common.hpp:410-423`
+- Queue creation: `ggml/src/ggml-sycl/dpct/helper.hpp:786-810`

@@ -643,6 +643,30 @@ static uint64_t compute_cgraph_hash(const ggml_cgraph * cgraph) {
     return hash;
 }
 
+// Compute a hash of all USM data pointers in the cgraph.
+// When this hash matches between frames, tensor buffer allocations haven't changed
+// and we can skip re-recording the graph entirely (pure replay).
+static uint64_t compute_cgraph_pointer_hash(const ggml_cgraph * cgraph) {
+    uint64_t           hash      = 0xcbf29ce484222325ULL;  // FNV-1a offset basis
+    constexpr uint64_t FNV_PRIME = 0x100000001b3ULL;
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+
+        // Hash node's data pointer
+        hash ^= reinterpret_cast<uint64_t>(node->data);
+        hash *= FNV_PRIME;
+
+        // Hash source tensor data pointers
+        for (int s = 0; s < GGML_MAX_SRC && node->src[s]; s++) {
+            hash ^= reinterpret_cast<uint64_t>(node->src[s]->data);
+            hash *= FNV_PRIME;
+        }
+    }
+
+    return hash;
+}
+
 static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
     // Heuristic: Disable graphs for very large compute graphs to avoid driver hang/compile explosion.
     // The exact threshold may need tuning per device/driver.
@@ -1052,17 +1076,9 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         return status;
 
     } else if (graph_mode == graph_compat_t::SINGLE_DEVICE) {
-        // ===== SINGLE-DEVICE GRAPH PATH (with hash-based caching) =====
+        // ===== SINGLE-DEVICE GRAPH PATH (three-tier cache: replay / update / finalize) =====
         GGML_SYCL_DEBUG("[SYCL-GRAPH] Starting graph compute (n_nodes=%d)\n", cgraph->n_nodes);
         struct timeval tv_start, tv_end;
-        gettimeofday(&tv_start, NULL);
-
-        // Ensure the queue is idle before recording to avoid "depend on events from outside" error.
-        // This is a workaround for SYCL graph implicit dependencies on in-order queues.
-        sycl_ctx->stream()->wait();
-        gettimeofday(&tv_end, NULL);
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] Queue wait took %ld us\n",
-                        (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec));
         gettimeofday(&tv_start, NULL);
 
         const bool graph_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_limited_graph);
@@ -1076,58 +1092,78 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                         (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec));
         gettimeofday(&tv_start, NULL);
 
-        // Compute hash of graph topology for cache lookup
-        const uint64_t graph_hash = compute_cgraph_hash(cgraph);
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] Graph hash: 0x%016llx\n", (unsigned long long) graph_hash);
+        // Compute topology hash and USM pointer hash for three-tier cache lookup
+        const uint64_t graph_hash   = compute_cgraph_hash(cgraph);
+        const uint64_t pointer_hash = compute_cgraph_pointer_hash(cgraph);
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] Graph hash: 0x%016llx, pointer hash: 0x%016llx\n",
+                        (unsigned long long) graph_hash, (unsigned long long) pointer_hash);
 
-        // Check if we have a cached graph with matching topology
-        auto cache_it   = sycl_ctx->graph_cache.find(graph_hash);
-        bool use_cached = (cache_it != sycl_ctx->graph_cache.end());
+        auto cache_it        = sycl_ctx->graph_cache.find(graph_hash);
+        bool topology_cached = (cache_it != sycl_ctx->graph_cache.end());
 
-        if (use_cached) {
-            // Use cached graph - just execute it directly
-            GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache hit, reusing existing graph\n");
-            gettimeofday(&tv_end, NULL);
-            GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache lookup took %ld us\n",
-                            (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec));
-            gettimeofday(&tv_start, NULL);
+        gettimeofday(&tv_end, NULL);
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] Hash + cache lookup took %ld us\n",
+                        (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+        gettimeofday(&tv_start, NULL);
 
-            // Still need to execute the compute to update tensor data pointers
-            // For now, we re-record and update the cached graph
-            sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()),
-                                                    { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
-            model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
+        if (topology_cached) {
+            auto ptr_it        = sycl_ctx->graph_pointer_hashes.find(graph_hash);
+            bool pointers_match = (ptr_it != sycl_ctx->graph_pointer_hashes.end() && ptr_it->second == pointer_hash);
 
-            sycl_ctx->force_graph_compatible = true;
-            ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
-            sycl_ctx->force_graph_compatible = false;
+            if (pointers_match) {
+                // ===== TIER 1: Pure replay — topology + pointers match, zero host overhead =====
+                GGML_SYCL_DEBUG("[SYCL-GRAPH] Pure replay (topology+pointers match)\n");
 
-            model_sycl_graph.end_recording();
+                sycl_ctx->graph_exec_stream()->ext_oneapi_graph(*(cache_it->second));
+            } else {
+                // ===== TIER 2: Pointers changed — re-record + update =====
+                GGML_SYCL_DEBUG("[SYCL-GRAPH] Pointers changed, re-recording + update\n");
 
-            try {
-                cache_it->second->update(model_sycl_graph);
-                GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache update success\n");
-            } catch (const sycl::exception & e) {
-                GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache update failed: %s, re-finalizing\n", e.what());
-                auto exec_graph = model_sycl_graph.finalize({ sycl_ex::property::graph::updatable{} });
-                cache_it->second =
-                    std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec_graph));
+                // Wait for queue to be idle before recording
+                sycl_ctx->stream()->wait();
+
+                sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()),
+                                                        { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
+                model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
+
+                sycl_ctx->force_graph_compatible = true;
+                ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+                sycl_ctx->force_graph_compatible = false;
+
+                model_sycl_graph.end_recording();
+
+                try {
+                    cache_it->second->update(model_sycl_graph);
+                    GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache update success\n");
+                } catch (const sycl::exception & e) {
+                    GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache update failed: %s, re-finalizing\n", e.what());
+                    auto exec_graph = model_sycl_graph.finalize({ sycl_ex::property::graph::updatable{} });
+                    cache_it->second =
+                        std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec_graph));
+                }
+
+                sycl_ctx->graph_pointer_hashes[graph_hash] = pointer_hash;
+
+                gettimeofday(&tv_end, NULL);
+                GGML_SYCL_DEBUG("[SYCL-GRAPH] re-record + update took %ld us\n",
+                                (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec));
+                gettimeofday(&tv_start, NULL);
+
+                sycl_ctx->graph_exec_stream()->ext_oneapi_graph(*(cache_it->second));
             }
-
-            gettimeofday(&tv_end, NULL);
-            GGML_SYCL_DEBUG("[SYCL-GRAPH] finalize/update took %ld us\n",
-                            (tv_end.tv_sec - tv_start.tv_sec) * 1000000 + (tv_end.tv_usec - tv_start.tv_usec));
-            gettimeofday(&tv_start, NULL);
-
-            sycl_ctx->stream()->ext_oneapi_graph(*(cache_it->second));
         } else {
-            // Cache miss - record, finalize, and cache the new graph
+            // ===== TIER 3: Cache miss — full record + finalize =====
             GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache miss, creating new graph\n");
+
+            // Wait for queue to be idle before recording
+            sycl_ctx->stream()->wait();
 
             // Evict oldest entry if cache is full
             if (sycl_ctx->graph_cache.size() >= sycl_ctx->MAX_GRAPH_CACHE_SIZE) {
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache full, evicting oldest entry\n");
-                sycl_ctx->graph_cache.erase(sycl_ctx->graph_cache.begin());
+                auto evict_it = sycl_ctx->graph_cache.begin();
+                sycl_ctx->graph_pointer_hashes.erase(evict_it->first);
+                sycl_ctx->graph_cache.erase(evict_it);
             }
 
             sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()),
@@ -1163,9 +1199,10 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             auto exec_graph = graph_update_support ? model_sycl_graph.finalize(sycl_ex::property::graph::updatable{}) :
                                                      model_sycl_graph.finalize();
 
-            // Store in cache
+            // Store in cache with pointer hash
             sycl_ctx->graph_cache[graph_hash] =
                 std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec_graph));
+            sycl_ctx->graph_pointer_hashes[graph_hash] = pointer_hash;
 
             gettimeofday(&tv_end, NULL);
             GGML_SYCL_DEBUG("[SYCL-GRAPH] finalize took %ld us (cache size: %zu)\n",
@@ -1173,7 +1210,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                             sycl_ctx->graph_cache.size());
             gettimeofday(&tv_start, NULL);
 
-            sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->graph_cache[graph_hash]));
+            sycl_ctx->graph_exec_stream()->ext_oneapi_graph(*(sycl_ctx->graph_cache[graph_hash]));
         }
         gettimeofday(&tv_end, NULL);
         GGML_SYCL_DEBUG("[SYCL-GRAPH] ext_oneapi_graph took %ld us\n",

@@ -419,7 +419,43 @@ struct ggml_backend_sycl_context {
     // Graph cache: maps topology hash -> executable graph
     // This allows reusing graphs when the same topology is encountered again
     std::map<uint64_t, std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>> graph_cache;
+    // Pointer hash cache: maps topology hash -> USM pointer hash from last recording
+    // Used for three-tier cache lookup: pure replay / re-record+update / full record+finalize
+    std::map<uint64_t, uint64_t> graph_pointer_hashes;
     static constexpr size_t MAX_GRAPH_CACHE_SIZE = 8;  // Limit cache to prevent memory bloat
+
+    // Dedicated graph execution queue with no_immediate_command_list property.
+    // Intel discrete GPUs require this for efficient ext_oneapi_graph() submission.
+    queue_ptr graph_queue = nullptr;
+    sycl::queue graph_queue_storage;
+
+    queue_ptr graph_exec_stream() {
+        if (graph_queue != nullptr) {
+            return graph_queue;
+        }
+        // Create from the same context and device as the primary stream
+        queue_ptr primary = stream();
+        sycl::context ctx = primary->get_context();
+        sycl::device  dev = primary->get_device();
+        graph_queue_storage = sycl::queue(
+            ctx, dev,
+            [](sycl::exception_list exceptions) {
+                for (const auto & e : exceptions) {
+                    try {
+                        std::rethrow_exception(e);
+                    } catch (const sycl::exception & e) {
+                        std::cerr << "Caught asynchronous SYCL exception (graph queue):" << std::endl
+                                  << e.what() << std::endl;
+                    }
+                }
+            },
+            sycl::property_list(
+                sycl::property::queue::in_order{},
+                sycl::ext::intel::property::queue::no_immediate_command_list{}));
+        graph_queue = &graph_queue_storage;
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] Created dedicated graph execution queue with no_immediate_command_list\n");
+        return graph_queue;
+    }
 #endif
 
     ggml_sycl_pool & host_pool(int device) {
