@@ -1131,7 +1131,8 @@ static void ggml_sycl_op_mul_mat_xmx(ggml_backend_sycl_context & ctx,
         launch_gemm_xmx_f16_f16(stream, (const sycl::half *) src1_ddf_i, (const sycl::half *) src0_dd_i,
                                 (sycl::half *) dst_dd_i, N, M, K, 1.0f, 0.0f, K, K, ldc);
     } else if (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 ||
-               src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_1) {
+               src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_1 ||
+               src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) {
         // XMX int8 path for quantized types (opt-in via env var, can cause hangs on some configs)
         static bool enable_xmx_int8 = getenv("GGML_SYCL_XMX_INT8") != nullptr;
         if (enable_xmx_int8 && has_int8_xmx_support(stream)) {
@@ -1360,7 +1361,8 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             GGML_SYCL_ITT_MUL_MAT_XMX(f32);
             bool is_quant =
                 (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 ||
-                 src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_1);
+                 src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_1 ||
+                 src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K);
             fprintf(stderr, "ggml_sycl: MUL_MAT %s ne=[%ld,%ld,%ld,%ld] type=%s\n", is_quant ? "XMX_INT8" : "XMX",
                     dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
             if (is_quant) {
