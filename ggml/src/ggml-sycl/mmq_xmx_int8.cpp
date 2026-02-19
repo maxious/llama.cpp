@@ -16,23 +16,6 @@
 using namespace sycl;
 using namespace sycl::ext::oneapi::experimental::matrix;
 
-// Reorder Q8_1 blocks into XMX-friendly VNNI layout
-// src: block_q8_1[N][K/32]
-// dst: int8_t[K/4][N*4] (VNNI-packed)
-// scales: float[N][K/32] (Optional SoA for scales)
-// TODO: Implement this function
-void reorder_q8_1_xmx_layout(const block_q8_1 * __restrict__ src,
-                             int8_t * __restrict__ dst,
-                             int                      K,
-                             int                      N,
-                             const sycl::nd_item<1> & item_ct1) {
-    (void) src;
-    (void) dst;
-    (void) K;
-    (void) N;
-    (void) item_ct1;
-}
-
 void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
                                      const ggml_tensor *         src0,
                                      const ggml_tensor *         src1,
@@ -71,7 +54,6 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
     const int64_t ne0  = dst->ne[0];  // Output stride (leading dimension)
 
     // Calculate grid dimensions
-    // Use src1_ncols instead of ne11 to handle column striding for multi-device
     const int64_t M        = row_high - row_low;
     const int64_t N        = src1_ncols;
     const int64_t K        = ne00;
@@ -83,12 +65,16 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
 
     const int sg_size = 16;
 
+    // SLM layout: [TM * TN int32_t for accumulator] [TM * TK int8_t for matA] [TK * TN int8_t for matB]
+    // Total int32_t count: TM*TN + ceil((TM*TK + TK*TN) / 4)
+    const int slm_size = TM * TN + (TM * TK + TK * TN + 3) / 4;
+
     // Launch kernel based on quantization type
     switch (src0->type) {
         case GGML_TYPE_Q8_0:
             if (TM == 8 && TN == 16 && TK == 32) {
                 stream->submit([&](handler & cgh) {
-                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16 + 8 * 32 / 4), cgh);
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(slm_size), cgh);
                     cgh.parallel_for(
                         nd_range<2>({ static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size) },
                                     { static_cast<size_t>(1), static_cast<size_t>(sg_size) }),
@@ -104,7 +90,7 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
         case GGML_TYPE_Q4_0:
             if (TM == 8 && TN == 16 && TK == 32) {
                 stream->submit([&](handler & cgh) {
-                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16 + 8 * 32 / 4), cgh);
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(slm_size), cgh);
                     cgh.parallel_for(
                         nd_range<2>({ static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size) },
                                     { static_cast<size_t>(1), static_cast<size_t>(sg_size) }),
@@ -120,7 +106,7 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
         case GGML_TYPE_Q4_1:
             if (TM == 8 && TN == 16 && TK == 32) {
                 stream->submit([&](handler & cgh) {
-                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16 + 8 * 32 / 4), cgh);
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(slm_size), cgh);
                     cgh.parallel_for(
                         nd_range<2>({ static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size) },
                                     { static_cast<size_t>(1), static_cast<size_t>(sg_size) }),
@@ -136,7 +122,7 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
         case GGML_TYPE_Q5_0:
             if (TM == 8 && TN == 16 && TK == 32) {
                 stream->submit([&](handler & cgh) {
-                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16 + 8 * 32 / 4), cgh);
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(slm_size), cgh);
                     cgh.parallel_for(
                         nd_range<2>({ static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size) },
                                     { static_cast<size_t>(1), static_cast<size_t>(sg_size) }),
@@ -152,7 +138,7 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
         case GGML_TYPE_Q5_1:
             if (TM == 8 && TN == 16 && TK == 32) {
                 stream->submit([&](handler & cgh) {
-                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16 + 8 * 32 / 4), cgh);
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(slm_size), cgh);
                     cgh.parallel_for(
                         nd_range<2>({ static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size) },
                                     { static_cast<size_t>(1), static_cast<size_t>(sg_size) }),
@@ -168,7 +154,7 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
         case GGML_TYPE_Q8_1:
             if (TM == 8 && TN == 16 && TK == 32) {
                 stream->submit([&](handler & cgh) {
-                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(8 * 16 + 8 * 32 / 4), cgh);
+                    sycl::local_accessor<int32_t, 1> slm_tile(range<1>(slm_size), cgh);
                     cgh.parallel_for(
                         nd_range<2>({ static_cast<size_t>(nblocks_m), static_cast<size_t>(nblocks_n * sg_size) },
                                     { static_cast<size_t>(1), static_cast<size_t>(sg_size) }),

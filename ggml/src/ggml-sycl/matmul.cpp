@@ -1362,7 +1362,7 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             fprintf(stderr, "ggml_sycl: MUL_MAT %s ne=[%ld,%ld,%ld,%ld] type=%s\n", is_quant ? "XMX_INT8" : "XMX",
                     dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
             if (is_quant) {
-                ggml_sycl_op_mul_mat<quantize_q8_1_for_xmx>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_xmx);
+                ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_xmx);
             } else {
                 ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_xmx);
             }
