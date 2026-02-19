@@ -129,8 +129,12 @@
 ### XMX Int8 Support (Opt-in)
 - XMX int8 kernels exist in `mmq_xmx_int8.cpp` but were not wired up
 - Now connected via `ggml_sycl_op_mul_mat_xmx()` for q8_0, q4_0, q4_1, q5_0, q5_1, q8_1
+- K-quant support: Q4_K, Q5_K, Q6_K use multi-subgroup col_major B pattern; Q2_K, Q3_K added with split-MAD approach (16-element sub-blocks, two MADs per TK=32 tile)
 - Enable with: `GGML_SYCL_XMX_INT8=1 ./build-sycl/bin/llama-bench ...`
 - Without the flag, falls back to MKL (original behavior)
+- **Supported types**: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K
+- Test Q2_K: `GGML_SYCL_XMX_INT8=1 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q2_K"`
+- Test Q3_K: `GGML_SYCL_XMX_INT8=1 ./build-sycl/bin/test-backend-ops -b SYCL0 -o MUL_MAT -p "type_a=q3_K"`
 
 #### XMX Int8 Performance (Feb 2026)
 

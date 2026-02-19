@@ -158,6 +158,80 @@ static bool try_launch_q5_K(int tiles_n, const char * src0_dd_i, const char * sr
     }
 }
 
+// Launch helpers for Q2_K
+template <int N_SG, int TILES_N>
+static void launch_q2_K(const char * src0_dd_i, const char * src1_ddq_i, float * dst_dd_i,
+                        int64_t K, int64_t K_padded, int64_t M, int64_t N, int ldc,
+                        const dpct::queue_ptr & stream) {
+    constexpr int TM = 8, TN = 16, TK = 32;
+    const int64_t nblocks_m = (M + TM * N_SG - 1) / (TM * N_SG);
+    const int64_t nblocks_n = (N + TN * TILES_N - 1) / (TN * TILES_N);
+    const int slm_bytes = TILES_N * TN * TK + N_SG * TM * TK + N_SG * TM * TN * (int) sizeof(int32_t);
+
+    stream->submit([&](handler & cgh) {
+        sycl::local_accessor<int8_t, 1> slm(range<1>(slm_bytes), cgh);
+        cgh.parallel_for(
+            nd_range<2>({ static_cast<size_t>(nblocks_m * N_SG), static_cast<size_t>(nblocks_n * 16) },
+                        { static_cast<size_t>(N_SG), static_cast<size_t>(16) }),
+            [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
+                mmq_q2_K_xmx_kernel<TM, TN, TK, N_SG, TILES_N>(
+                    (const block_q2_K *) src0_dd_i, (const block_q8_1 *) src1_ddq_i, dst_dd_i,
+                    K, K_padded, M, N, ldc, item_ct1,
+                    slm.get_multi_ptr<access::decorated::no>().get());
+            });
+    });
+}
+
+template <int N_SG>
+static bool try_launch_q2_K(int tiles_n, const char * src0_dd_i, const char * src1_ddq_i,
+                            float * dst_dd_i, int64_t K, int64_t K_padded, int64_t M,
+                            int64_t N, int ldc, const dpct::queue_ptr & stream) {
+    switch (tiles_n) {
+        case 1: launch_q2_K<N_SG, 1>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        case 2: launch_q2_K<N_SG, 2>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        case 4: launch_q2_K<N_SG, 4>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        case 8: launch_q2_K<N_SG, 8>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        default: return false;
+    }
+}
+
+// Launch helpers for Q3_K
+template <int N_SG, int TILES_N>
+static void launch_q3_K(const char * src0_dd_i, const char * src1_ddq_i, float * dst_dd_i,
+                        int64_t K, int64_t K_padded, int64_t M, int64_t N, int ldc,
+                        const dpct::queue_ptr & stream) {
+    constexpr int TM = 8, TN = 16, TK = 32;
+    const int64_t nblocks_m = (M + TM * N_SG - 1) / (TM * N_SG);
+    const int64_t nblocks_n = (N + TN * TILES_N - 1) / (TN * TILES_N);
+    const int slm_bytes = TILES_N * TN * TK + N_SG * TM * TK + N_SG * TM * TN * (int) sizeof(int32_t);
+
+    stream->submit([&](handler & cgh) {
+        sycl::local_accessor<int8_t, 1> slm(range<1>(slm_bytes), cgh);
+        cgh.parallel_for(
+            nd_range<2>({ static_cast<size_t>(nblocks_m * N_SG), static_cast<size_t>(nblocks_n * 16) },
+                        { static_cast<size_t>(N_SG), static_cast<size_t>(16) }),
+            [=](nd_item<2> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
+                mmq_q3_K_xmx_kernel<TM, TN, TK, N_SG, TILES_N>(
+                    (const block_q3_K *) src0_dd_i, (const block_q8_1 *) src1_ddq_i, dst_dd_i,
+                    K, K_padded, M, N, ldc, item_ct1,
+                    slm.get_multi_ptr<access::decorated::no>().get());
+            });
+    });
+}
+
+template <int N_SG>
+static bool try_launch_q3_K(int tiles_n, const char * src0_dd_i, const char * src1_ddq_i,
+                            float * dst_dd_i, int64_t K, int64_t K_padded, int64_t M,
+                            int64_t N, int ldc, const dpct::queue_ptr & stream) {
+    switch (tiles_n) {
+        case 1: launch_q3_K<N_SG, 1>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        case 2: launch_q3_K<N_SG, 2>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        case 4: launch_q3_K<N_SG, 4>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        case 8: launch_q3_K<N_SG, 8>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); return true;
+        default: return false;
+    }
+}
+
 void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
                                      const ggml_tensor *         src0,
                                      const ggml_tensor *         src1,
@@ -238,6 +312,32 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
                 case 2: ok = try_launch_q5_K<2>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
                 case 4: ok = try_launch_q5_K<4>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
                 case 8: ok = try_launch_q5_K<8>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
+            }
+            if (ok) return;
+        }
+    }
+
+    // Use optimized multi-subgroup kernel for Q2_K
+    if (nsg > 1 && TM == 8 && TN == 16 && TK == 32 && src0->type == GGML_TYPE_Q2_K) {
+        if (tiles_n > 0) {
+            bool ok = false;
+            switch (nsg) {
+                case 2: ok = try_launch_q2_K<2>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
+                case 4: ok = try_launch_q2_K<4>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
+                case 8: ok = try_launch_q2_K<8>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
+            }
+            if (ok) return;
+        }
+    }
+
+    // Use optimized multi-subgroup kernel for Q3_K
+    if (nsg > 1 && TM == 8 && TN == 16 && TK == 32 && src0->type == GGML_TYPE_Q3_K) {
+        if (tiles_n > 0) {
+            bool ok = false;
+            switch (nsg) {
+                case 2: ok = try_launch_q3_K<2>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
+                case 4: ok = try_launch_q3_K<4>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
+                case 8: ok = try_launch_q3_K<8>(tiles_n, src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream); break;
             }
             if (ok) return;
         }
@@ -339,6 +439,18 @@ void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
         case GGML_TYPE_Q5_K:
             if (TM == 8 && TN == 16 && TK == 32) {
                 launch_q5_K<1, 1>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream);
+            }
+            break;
+
+        case GGML_TYPE_Q2_K:
+            if (TM == 8 && TN == 16 && TK == 32) {
+                launch_q2_K<1, 1>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream);
+            }
+            break;
+
+        case GGML_TYPE_Q3_K:
+            if (TM == 8 && TN == 16 && TK == 32) {
+                launch_q3_K<1, 1>(src0_dd_i, src1_ddq_i, dst_dd_i, K, K_padded, M, N, ldc, stream);
             }
             break;
 

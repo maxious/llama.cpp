@@ -1171,6 +1171,285 @@ static void mmq_q6_K_xmx_kernel(const block_q6_K * __restrict__ vx,
     }
 }
 
+// Q2_K multi-subgroup XMX kernel with col_major B layout and split-MAD
+// Q2_K has 16 sub-blocks of 16 elements (QK_K=256), affine: x = d*sc*q - dmin*m
+// With TK=32, each k_tile covers 2 sub-blocks. Two MADs per k_tile.
+template <int TM, int TN, int TK, int N_SG, int TILES_N>
+static void mmq_q2_K_xmx_kernel(const block_q2_K * __restrict__ vx,
+                                 const void * __restrict__ vy,
+                                 float * __restrict__ dst,
+                                 const int                K,
+                                 const int                K_padded,
+                                 const int                M,
+                                 const int                N,
+                                 const int                ldc,
+                                 const sycl::nd_item<2> & item_ct1,
+                                 int8_t *                 slm) {
+    const auto sg = item_ct1.get_sub_group();
+
+    const int local_linear = item_ct1.get_local_linear_id();
+    const int sg_id        = local_linear / 16;
+    const int lane_id      = local_linear % 16;
+
+    const int base_m    = item_ct1.get_group(0) * (TM * N_SG);
+    const int sg_startx = base_m + sg_id * TM;
+    const int base_n    = item_ct1.get_group(1) * (TN * TILES_N);
+
+    const int A_blocks = K / QK_K;
+    const int B_blocks = K_padded / QK8_1;
+    const int K_tiles  = K / TK;
+
+    const block_q8_1 * src1_q8 = (const block_q8_1 *) vy;
+
+    int8_t *  slm_B = slm;
+    int8_t *  slm_A = slm + TILES_N * TN * TK + sg_id * (TM * TK);
+    int32_t * slm_C = (int32_t *) (slm + TILES_N * TN * TK + N_SG * TM * TK) + sg_id * (TM * TN);
+
+    float acc[TILES_N * TM];
+    for (int i = 0; i < TILES_N * TM; i++) {
+        acc[i] = 0.0f;
+    }
+
+    constexpr int total_threads = N_SG * 16;
+
+    for (int k_tile = 0; k_tile < K_tiles; k_tile++) {
+        const int sb      = k_tile / 8;
+        const int sb_tile = k_tile % 8;
+
+        for (int sub_half = 0; sub_half < 2; sub_half++) {
+            const int scale_idx = 2 * sb_tile + sub_half;
+
+            // Load B: col_major layout, 16 active elements + 16 zeros
+            constexpr int total_B_elems = TILES_N * TN * TK;
+            for (int base_b = local_linear; base_b < total_B_elems; base_b += total_threads) {
+                int col_idx = base_b / TK;
+                int k       = base_b % TK;
+                int nt      = col_idx / TN;
+                int n       = col_idx % TN;
+                int col     = base_n + nt * TN + n;
+                if (col < N && k < 16) {
+                    const block_q8_1 * blk = &src1_q8[col * B_blocks + k_tile];
+                    slm_B[col_idx * TK + k] = blk->qs[sub_half * 16 + k];
+                } else {
+                    slm_B[col_idx * TK + k] = 0;
+                }
+            }
+
+            // Load A: dequantize Q2_K 2-bit values
+            for (int idx = lane_id; idx < TM * TK; idx += 16) {
+                int i   = idx / TK;
+                int j   = idx % TK;
+                int row = sg_startx + i;
+                if (row < M && j < 16) {
+                    const block_q2_K * blk = &vx[row * A_blocks + sb];
+                    int global_j  = sb_tile * 32 + sub_half * 16 + j;
+                    int byte_idx  = global_j / 4;
+                    int shift     = 2 * (global_j % 4);
+                    slm_A[i * TK + j] = (int8_t)((blk->qs[byte_idx] >> shift) & 0x3);
+                } else {
+                    slm_A[i * TK + j] = 0;
+                }
+            }
+
+            sycl::group_barrier(item_ct1.get_group());
+
+            joint_matrix<sub_group, int8_t, use::a, TM, TK, layout::row_major> matA;
+            auto pA = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(slm_A);
+            joint_matrix_load(sg, matA, pA, TK);
+
+            for (int nt = 0; nt < TILES_N; nt++) {
+                int8_t * slm_B_nt = slm_B + nt * TN * TK;
+
+                joint_matrix<sub_group, int8_t, use::b, TK, TN, layout::col_major> matB;
+                auto pB = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(slm_B_nt);
+                joint_matrix_load(sg, matB, pB, TK);
+
+                joint_matrix<sub_group, int32_t, use::accumulator, TM, TN> matC;
+                joint_matrix_fill(sg, matC, 0);
+                joint_matrix_mad(sg, matC, matA, matB, matC);
+
+                auto pC = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(slm_C);
+                joint_matrix_store(sg, matC, pC, TN, layout::row_major);
+                sycl::group_barrier(sg);
+
+                int n_base = base_n + nt * TN;
+                for (int i = 0; i < TM; i++) {
+                    int row = sg_startx + i;
+                    if (row < M && n_base + lane_id < N) {
+                        const block_q2_K * blk = &vx[row * A_blocks + sb];
+                        float dall  = (float) blk->dm[0];
+                        float dmin  = (float) blk->dm[1];
+                        uint8_t sc_byte = blk->scales[scale_idx];
+                        float sc    = (float)(sc_byte & 0xF);
+                        float m_val = (float)(sc_byte >> 4);
+
+                        const block_q8_1 & b_blk  = src1_q8[(n_base + lane_id) * B_blocks + k_tile];
+                        float              scale_b = (float) b_blk.ds[0];
+                        float              sum_b   = (float) b_blk.ds[1];
+
+                        int32_t val = slm_C[i * TN + lane_id];
+                        acc[nt * TM + i] += dall * sc * (float) val * scale_b - dmin * m_val * sum_b;
+                    }
+                }
+            }
+
+            sycl::group_barrier(item_ct1.get_group());
+        }
+    }
+
+    for (int nt = 0; nt < TILES_N; nt++) {
+        int n_base = base_n + nt * TN;
+        for (int i = 0; i < TM; i++) {
+            if (sg_startx + i < M && n_base + lane_id < N) {
+                dst[(n_base + lane_id) * ldc + (sg_startx + i)] = acc[nt * TM + i];
+            }
+        }
+    }
+}
+
+// Q3_K multi-subgroup XMX kernel with col_major B layout and split-MAD
+// Q3_K has 16 sub-blocks of 16 elements (QK_K=256), pure scale: x = d*scale*q
+// 3-bit values: 2 low bits from qs[], 1 high bit from hmask[], centered by -4
+// With TK=32, each k_tile covers 2 sub-blocks. Two MADs per k_tile.
+
+// Helper to extract 6-bit scale for Q3_K sub-block
+static inline int8_t get_scale_q3_K_xmx(int isc, const uint8_t * __restrict__ scales) {
+    int sc_low  = (scales[isc % 8] >> (4 * (isc / 8))) & 0xF;
+    int sc_high = ((scales[8 + isc % 4] >> (2 * (isc / 4))) & 3) << 4;
+    return (int8_t)((sc_low | sc_high) - 32);
+}
+
+template <int TM, int TN, int TK, int N_SG, int TILES_N>
+static void mmq_q3_K_xmx_kernel(const block_q3_K * __restrict__ vx,
+                                 const void * __restrict__ vy,
+                                 float * __restrict__ dst,
+                                 const int                K,
+                                 const int                K_padded,
+                                 const int                M,
+                                 const int                N,
+                                 const int                ldc,
+                                 const sycl::nd_item<2> & item_ct1,
+                                 int8_t *                 slm) {
+    const auto sg = item_ct1.get_sub_group();
+
+    const int local_linear = item_ct1.get_local_linear_id();
+    const int sg_id        = local_linear / 16;
+    const int lane_id      = local_linear % 16;
+
+    const int base_m    = item_ct1.get_group(0) * (TM * N_SG);
+    const int sg_startx = base_m + sg_id * TM;
+    const int base_n    = item_ct1.get_group(1) * (TN * TILES_N);
+
+    const int A_blocks = K / QK_K;
+    const int B_blocks = K_padded / QK8_1;
+    const int K_tiles  = K / TK;
+
+    const block_q8_1 * src1_q8 = (const block_q8_1 *) vy;
+
+    int8_t *  slm_B = slm;
+    int8_t *  slm_A = slm + TILES_N * TN * TK + sg_id * (TM * TK);
+    int32_t * slm_C = (int32_t *) (slm + TILES_N * TN * TK + N_SG * TM * TK) + sg_id * (TM * TN);
+
+    float acc[TILES_N * TM];
+    for (int i = 0; i < TILES_N * TM; i++) {
+        acc[i] = 0.0f;
+    }
+
+    constexpr int total_threads = N_SG * 16;
+
+    for (int k_tile = 0; k_tile < K_tiles; k_tile++) {
+        const int sb      = k_tile / 8;
+        const int sb_tile = k_tile % 8;
+
+        for (int sub_half = 0; sub_half < 2; sub_half++) {
+            const int scale_idx = 2 * sb_tile + sub_half;
+
+            // Load B: col_major layout, 16 active elements + 16 zeros
+            constexpr int total_B_elems = TILES_N * TN * TK;
+            for (int base_b = local_linear; base_b < total_B_elems; base_b += total_threads) {
+                int col_idx = base_b / TK;
+                int k       = base_b % TK;
+                int nt      = col_idx / TN;
+                int n       = col_idx % TN;
+                int col     = base_n + nt * TN + n;
+                if (col < N && k < 16) {
+                    const block_q8_1 * blk = &src1_q8[col * B_blocks + k_tile];
+                    slm_B[col_idx * TK + k] = blk->qs[sub_half * 16 + k];
+                } else {
+                    slm_B[col_idx * TK + k] = 0;
+                }
+            }
+
+            // Load A: dequantize Q3_K 3-bit values (2 low + 1 high), centered by -4
+            for (int idx = lane_id; idx < TM * TK; idx += 16) {
+                int i   = idx / TK;
+                int j   = idx % TK;
+                int row = sg_startx + i;
+                if (row < M && j < 16) {
+                    const block_q3_K * blk = &vx[row * A_blocks + sb];
+                    int global_j  = sb_tile * 32 + sub_half * 16 + j;
+                    int byte_idx  = global_j / 4;
+                    int shift     = 2 * (global_j % 4);
+                    int q_low2    = (blk->qs[byte_idx] >> shift) & 0x3;
+                    int q_high    = (blk->hmask[global_j / 8] >> (global_j % 8)) & 1;
+                    slm_A[i * TK + j] = (int8_t)((q_low2 | (q_high << 2)) - 4);
+                } else {
+                    slm_A[i * TK + j] = 0;
+                }
+            }
+
+            sycl::group_barrier(item_ct1.get_group());
+
+            joint_matrix<sub_group, int8_t, use::a, TM, TK, layout::row_major> matA;
+            auto pA = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(slm_A);
+            joint_matrix_load(sg, matA, pA, TK);
+
+            for (int nt = 0; nt < TILES_N; nt++) {
+                int8_t * slm_B_nt = slm_B + nt * TN * TK;
+
+                joint_matrix<sub_group, int8_t, use::b, TK, TN, layout::col_major> matB;
+                auto pB = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(slm_B_nt);
+                joint_matrix_load(sg, matB, pB, TK);
+
+                joint_matrix<sub_group, int32_t, use::accumulator, TM, TN> matC;
+                joint_matrix_fill(sg, matC, 0);
+                joint_matrix_mad(sg, matC, matA, matB, matC);
+
+                auto pC = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(slm_C);
+                joint_matrix_store(sg, matC, pC, TN, layout::row_major);
+                sycl::group_barrier(sg);
+
+                int n_base = base_n + nt * TN;
+                for (int i = 0; i < TM; i++) {
+                    int row = sg_startx + i;
+                    if (row < M && n_base + lane_id < N) {
+                        const block_q3_K * blk = &vx[row * A_blocks + sb];
+                        float d = (float) *(const sycl::half *) &blk->d;
+                        int8_t scale = get_scale_q3_K_xmx(scale_idx, blk->scales);
+
+                        const block_q8_1 & b_blk  = src1_q8[(n_base + lane_id) * B_blocks + k_tile];
+                        float              scale_b = (float) b_blk.ds[0];
+
+                        int32_t val = slm_C[i * TN + lane_id];
+                        acc[nt * TM + i] += d * (float) scale * (float) val * scale_b;
+                    }
+                }
+            }
+
+            sycl::group_barrier(item_ct1.get_group());
+        }
+    }
+
+    for (int nt = 0; nt < TILES_N; nt++) {
+        int n_base = base_n + nt * TN;
+        for (int i = 0; i < TM; i++) {
+            if (sg_startx + i < M && n_base + lane_id < N) {
+                dst[(n_base + lane_id) * ldc + (sg_startx + i)] = acc[nt * TM + i];
+            }
+        }
+    }
+}
+
 void ggml_sycl_op_mul_mat_q_xmx_int8(ggml_backend_sycl_context & ctx,
                                      const ggml_tensor *         src0,
                                      const ggml_tensor *         src1,
