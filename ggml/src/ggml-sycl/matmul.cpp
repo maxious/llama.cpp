@@ -102,6 +102,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
     const int64_t i02_divisor = ne12 / ne02;
 
     const size_t src0_ts = ggml_type_size(src0->type);
+    const size_t src1_ts = ggml_type_size(src1->type);
     const size_t src0_bs = ggml_blck_size(src0->type);
     const size_t q8_1_ts = sizeof(block_q8_1);
     const size_t q8_1_bs = QK8_1;
@@ -110,7 +111,9 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
     ggml_tensor_extra_gpu * src1_extra = (ggml_tensor_extra_gpu *) src1->extra;
 
     const bool src0_is_contiguous = ggml_is_contiguous(src0);
+    const bool src0_is_2d_contiguous = (src0->nb[0] == src0_ts && src0->nb[1] == (src0->ne[0] / ggml_blck_size(src0->type)) * src0_ts);
     const bool src1_is_contiguous = ggml_is_contiguous(src1);
+    const bool src1_is_2d_contiguous = (src1->nb[0] == src1_ts && src1->nb[1] == (src1->ne[0] / ggml_blck_size(src1->type)) * src1_ts);
 
     int64_t src1_padded_col_size = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 
@@ -189,13 +192,13 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
         ggml_sycl_set_device(i);
         queue_ptr stream = ctx.stream(i, 0);
 
-        if (src0_is_contiguous) {
+        if (src0_is_2d_contiguous) {
             dev[i].src0_dd = (char *) src0->data;
         } else {
             dev[i].src0_dd = dev[i].src0_dd_alloc.alloc(ctx.pool(i), ggml_nbytes(src0));
         }
 
-        if (src1_on_device && src1_is_contiguous) {
+        if (src1_on_device && src1_is_2d_contiguous) {
             dev[i].src1_ddf = (float *) src1->data;
         } else {
             dev[i].src1_ddf = dev[i].src1_ddf_alloc.alloc(ctx.pool(i), ggml_nelements(src1));
@@ -205,7 +208,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
             dev[i].src1_ddq =
                 dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1 * src1_padded_col_size * q8_1_ts / q8_1_bs);
 
-            if (src1_on_device && src1_is_contiguous) {
+            if (src1_on_device && src1_is_2d_contiguous) {
                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
                                                      /*num_src=*/2, " : converting src1 to Q8_1");
                 try {
@@ -273,13 +276,26 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                 const size_t src1_ddq_i_offset = (i0 * ne11 + src1_col_0) * src1_padded_col_size * q8_1_ts / q8_1_bs;
 
                 // for split tensors the data begins at i0 == i0_offset_low
-                char *  src0_dd_i = dev[i].src0_dd + (i0 / i02_divisor) * (ne01 * ne00 * src0_ts) / src0_bs;
+                char * src0_dd_i = nullptr;
+                if (src0_is_2d_contiguous) {
+                    src0_dd_i = dev[i].src0_dd + i03 * src0->nb[3] + (i02 / i02_divisor) * src0->nb[2];
+                } else {
+                    src0_dd_i = dev[i].src0_dd + (i0 / i02_divisor) * (ne01 * ne00 * src0_ts) / src0_bs;
+                }
+                
                 float * src1_ddf_i;
                 if (src1->type == GGML_TYPE_F16) {
-                    src1_ddf_i =
-                        (float *) ((char *) dev[i].src1_ddf + (i0 * ne11 + src1_col_0) * ne10 * sizeof(sycl::half));
+                    if (src1_is_2d_contiguous) {
+                        src1_ddf_i = (float *) ((char *) dev[i].src1_ddf + i03 * src1->nb[3] + i02 * src1->nb[2] + src1_col_0 * src1->nb[1]);
+                    } else {
+                        src1_ddf_i = (float *) ((char *) dev[i].src1_ddf + (i0 * ne11 + src1_col_0) * ne10 * sizeof(sycl::half));
+                    }
                 } else {
-                    src1_ddf_i = dev[i].src1_ddf + (i0 * ne11 + src1_col_0) * ne10;
+                    if (src1_is_2d_contiguous) {
+                        src1_ddf_i = dev[i].src1_ddf + (i03 * src1->nb[3] + i02 * src1->nb[2] + src1_col_0 * src1->nb[1]) / sizeof(float);
+                    } else {
+                        src1_ddf_i = dev[i].src1_ddf + (i0 * ne11 + src1_col_0) * ne10;
+                    }
                 }
                 char *  src1_ddq_i = dev[i].src1_ddq + src1_ddq_i_offset;
                 float * dst_dd_i   = dev[i].dst_dd + (i0 * ne1 + src1_col_0) * (dst_on_device ? ne0 : row_diff);
@@ -291,7 +307,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                 }
 
                 // copy src0, src1 to device if necessary
-                if (src1_is_contiguous) {
+                if (src1_is_2d_contiguous) {
                     if (i != ctx.device) {
                         if constexpr (quantize_enabled) {
                             char * src1_ddq_i_source = dev[ctx.device].src1_ddq + src1_ddq_i_offset;
@@ -303,11 +319,19 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                         } else {
                             float * src1_ddf_i_source;
                             if (src1->type == GGML_TYPE_F16) {
-                                src1_ddf_i_source = (float *) ((char *) src1_extra->data_device[ctx.device] +
-                                                               (i0 * ne11 + src1_col_0) * ne10 * sizeof(sycl::half));
+                                if (src1_is_2d_contiguous) {
+                                    src1_ddf_i_source = (float *) ((char *) src1_extra->data_device[ctx.device] + i03 * src1->nb[3] + i02 * src1->nb[2] + src1_col_0 * src1->nb[1]);
+                                } else {
+                                    src1_ddf_i_source = (float *) ((char *) src1_extra->data_device[ctx.device] +
+                                                                   (i0 * ne11 + src1_col_0) * ne10 * sizeof(sycl::half));
+                                }
                             } else {
-                                src1_ddf_i_source = (float *) src1_extra->data_device[ctx.device];
-                                src1_ddf_i_source += (i0 * ne11 + src1_col_0) * ne10;
+                                if (src1_is_2d_contiguous) {
+                                    src1_ddf_i_source = (float *) ((char *) src1_extra->data_device[ctx.device] + i03 * src1->nb[3] + i02 * src1->nb[2] + src1_col_0 * src1->nb[1]);
+                                } else {
+                                    src1_ddf_i_source = (float *) src1_extra->data_device[ctx.device];
+                                    src1_ddf_i_source += (i0 * ne11 + src1_col_0) * ne10;
+                                }
                             }
 
                             SYCL_CHECK(
@@ -337,7 +361,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                     }
                 }
 
-                if (src1_col_0 == 0 && !src0_is_contiguous && i02 % i02_divisor == 0) {
+                if (src1_col_0 == 0 && !src0_is_2d_contiguous && i02 % i02_divisor == 0) {
                     SYCL_CHECK(ggml_sycl_cpy_tensor_2d(src0_dd_i, src0, i03, i02 / i02_divisor, dev[i].row_low,
                                                        dev[i].row_high, stream));
                 }

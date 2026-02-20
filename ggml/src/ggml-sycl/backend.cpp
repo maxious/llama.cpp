@@ -104,10 +104,10 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         return false;
     }
 
-    const bool want_stats  = ctx.enable_op_stats && !ctx.force_graph_compatible;
+    const bool want_stats = ctx.enable_op_stats && !ctx.force_graph_compatible;
     const bool want_timing = want_stats && ctx.enable_op_timing;
-    const auto start_time =
-        want_timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
+    const auto start_time = want_timing ? std::chrono::high_resolution_clock::now()
+                                        : std::chrono::high_resolution_clock::time_point{};
     const std::string stats_key = want_stats ? ggml_sycl_op_stats_key(dst) : std::string{};
 
     if (dst->src[0] != nullptr && ggml_backend_buffer_is_sycl_split(dst->src[0]->buffer)) {
@@ -403,7 +403,7 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         double duration_ms = -1.0;
         if (want_timing) {
             const auto end_time = std::chrono::high_resolution_clock::now();
-            duration_ms         = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+            duration_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
         }
         ctx.record_op_stat(stats_key, duration_ms);
     }
@@ -483,7 +483,7 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t      backend,
     static bool tensor_trace_checked = false;
     static bool tensor_trace_enabled = false;
     if (!tensor_trace_checked) {
-        const char * env     = getenv("GGML_SYCL_TENSOR_TRACE");
+        const char * env = getenv("GGML_SYCL_TENSOR_TRACE");
         tensor_trace_enabled = env != nullptr && strcmp(env, "1") == 0;
         tensor_trace_checked = true;
     }
@@ -617,7 +617,7 @@ static bool node_needs_immediate_mode(ggml_backend_sycl_context & ctx, const ggm
         const ggml_tensor * src1 = node->src[1];
         // Cast away const for compatibility check functions that take non-const dst
         // (they don't actually modify it, just inspect dimensions/types)
-        ggml_tensor *       dst  = const_cast<ggml_tensor *>(node);
+        ggml_tensor * dst = const_cast<ggml_tensor *>(node);
 
         // Q5_0 and Q8_0 MMQ types cause GPU faults under SYCL graphs
         if (src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q8_0) {
@@ -631,8 +631,8 @@ static bool node_needs_immediate_mode(ggml_backend_sycl_context & ctx, const ggm
             src1->ne[1] == 1 && src0->ne[3] == 1 && src1->ne[3] == 1) {
             return false;
         }
-        if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) &&
-            src1->ne[1] == 1 && src1->ne[3] == 1) {
+        if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) &&
+            !ggml_is_transposed(src1) && src1->ne[1] == 1 && src1->ne[3] == 1) {
             return false;
         }
 
@@ -651,8 +651,24 @@ static bool node_needs_immediate_mode(ggml_backend_sycl_context & ctx, const ggm
         // Level Zero driver — stale results when different data reuses the same graph
         // topology. In real models, F16/F32 MUL_MAT is only used for KQ/KQV attention
         // which goes through Flash Attention, so this has no performance impact.
-        if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || src1->ne[2] * src1->ne[3] > 1 ||
-            src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32) {
+        // We allow 2D-contiguous tensors because ggml_sycl_op_mul_mat was modified
+        // to not pool-allocate them. This enables GQA (r2 > 1) to be graph-compatible!
+        const int64_t r3 = src1->ne[3] / src0->ne[3];  // Batch ratio
+        
+        const size_t src0_ts = ggml_type_size(src0->type);
+        const bool src0_is_2d_contiguous = (src0->nb[0] == src0_ts && src0->nb[1] == (src0->ne[0] / ggml_blck_size(src0->type)) * src0_ts);
+        const size_t src1_ts = ggml_type_size(src1->type);
+        const bool src1_is_2d_contiguous = (src1->nb[0] == src1_ts && src1->nb[1] == (src1->ne[0] / ggml_blck_size(src1->type)) * src1_ts);
+
+        // Allow GQA and batching if the inner 2D matrices are contiguous.
+        // ggml_sycl_op_mul_mat loops over batches, avoiding pool allocations if 2D contiguous.
+        // Note: For batched GQA with F16, the inner dispatch uses batched pointers 
+        // which pool-allocate ptrs_src arrays inside ggml_sycl_mul_mat_batched_sycl.
+        // If it goes there, we MUST use immediate mode.
+        bool is_batched_f16 = (!split && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && 
+                              !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1);
+
+        if (!src0_is_2d_contiguous || !src1_is_2d_contiguous || src1->ne[3] > 1 || r3 > 1 || is_batched_f16) {
             return true;
         }
 
@@ -703,10 +719,9 @@ static bool node_needs_immediate_mode(ggml_backend_sycl_context & ctx, const ggm
 // Execution plan step: either a graph segment or immediate (eager) nodes
 struct graph_exec_step {
     enum step_kind { GRAPH_SEGMENT, IMMEDIATE };
-
     step_kind kind;
-    int       node_begin;  // first node index (inclusive)
-    int       node_end;    // last node index (exclusive)
+    int node_begin;  // first node index (inclusive)
+    int node_end;    // last node index (exclusive)
 };
 
 // Build an execution plan that partitions cgraph nodes into graph segments and immediate nodes.
@@ -740,12 +755,10 @@ static std::vector<graph_exec_step> build_graph_exec_plan(ggml_backend_sycl_cont
                     i++;
                     continue;
                 }
-                if (!node_needs_immediate_mode(ctx, n)) {
-                    break;
-                }
+                if (!node_needs_immediate_mode(ctx, n)) break;
                 i++;
             }
-            plan.push_back({ graph_exec_step::IMMEDIATE, start, i });
+            plan.push_back({graph_exec_step::IMMEDIATE, start, i});
         } else {
             // Accumulate consecutive graph-compatible nodes
             int start = i;
@@ -757,12 +770,10 @@ static std::vector<graph_exec_step> build_graph_exec_plan(ggml_backend_sycl_cont
                     i++;
                     continue;
                 }
-                if (node_needs_immediate_mode(ctx, n)) {
-                    break;
-                }
+                if (node_needs_immediate_mode(ctx, n)) break;
                 i++;
             }
-            plan.push_back({ graph_exec_step::GRAPH_SEGMENT, start, i });
+            plan.push_back({graph_exec_step::GRAPH_SEGMENT, start, i});
         }
     }
 
@@ -838,7 +849,7 @@ static uint64_t compute_cgraph_pointer_hash(const ggml_cgraph * cgraph) {
 static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
     // Heuristic: Disable graphs for very large compute graphs to avoid driver hang/compile explosion.
     // The exact threshold may need tuning per device/driver.
-    if (cgraph->n_nodes > 2000) {
+    if (cgraph->n_nodes > 500) {
         GGML_LOG_INFO("%s: disabling SYCL graphs due to large graph size (%d nodes)\n", __func__, cgraph->n_nodes);
         return graph_compat_t::DISABLED;
     }
@@ -871,11 +882,12 @@ static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx,
                     ggml_tensor * src1 = node->src[1];
                     ggml_tensor * dst  = node;
 
-                    bool src0_supported =
-                        (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 ||
-                         src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_Q4_0 ||
-                         src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K ||
-                         src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K);
+                    bool src0_supported = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
+                                           src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_MXFP4 ||
+                                           src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0 ||
+                                           src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K ||
+                                           src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K ||
+                                           src0->type == GGML_TYPE_Q6_K);
 
                     if (!src0_supported || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
                         GGML_LOG_INFO(
@@ -1255,16 +1267,13 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         // Count segments and immediate steps for logging
         int n_graph_segments = 0, n_immediate_steps = 0;
         for (const auto & step : plan) {
-            if (step.kind == graph_exec_step::GRAPH_SEGMENT) {
-                n_graph_segments++;
-            } else {
-                n_immediate_steps++;
-            }
+            if (step.kind == graph_exec_step::GRAPH_SEGMENT) n_graph_segments++;
+            else n_immediate_steps++;
         }
 
         bool has_immediate_nodes = (n_immediate_steps > 0);
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] Plan: %zu steps (%d graph segments, %d immediate)\n", plan.size(),
-                        n_graph_segments, n_immediate_steps);
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] Plan: %zu steps (%d graph segments, %d immediate)\n",
+                        plan.size(), n_graph_segments, n_immediate_steps);
 
         if (!has_immediate_nodes) {
             // ===== FAST PATH: No immediate nodes, use monolithic three-tier cache =====
@@ -1277,9 +1286,9 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             bool topology_cached = (cache_it != sycl_ctx->graph_cache.end());
 
             if (topology_cached) {
-                auto ptr_it = sycl_ctx->graph_pointer_hashes.find(graph_hash);
-                bool pointers_match =
-                    (ptr_it != sycl_ctx->graph_pointer_hashes.end() && ptr_it->second == pointer_hash);
+                auto ptr_it         = sycl_ctx->graph_pointer_hashes.find(graph_hash);
+                bool pointers_match = (ptr_it != sycl_ctx->graph_pointer_hashes.end() &&
+                                       ptr_it->second == pointer_hash);
 
                 if (pointers_match) {
                     // ===== TIER 1: Pure replay =====
@@ -1291,7 +1300,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                     sycl_ctx->stream()->wait();
 
                     sycl_ex::command_graph mod_graph(*(sycl_ctx->stream()),
-                                                     { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
+                                                    {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
                     mod_graph.begin_recording(*(sycl_ctx->stream()));
                     sycl_ctx->force_graph_compatible = true;
                     ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
@@ -1303,9 +1312,9 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                         GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache update success\n");
                     } catch (const sycl::exception & e) {
                         GGML_SYCL_DEBUG("[SYCL-GRAPH] Cache update failed: %s, re-finalizing\n", e.what());
-                        auto exec = mod_graph.finalize({ sycl_ex::property::graph::updatable{} });
-                        cache_it->second =
-                            std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec));
+                        auto exec = mod_graph.finalize({sycl_ex::property::graph::updatable{}});
+                        cache_it->second = std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(
+                            std::move(exec));
                     }
                     sycl_ctx->graph_pointer_hashes[graph_hash] = pointer_hash;
                     sycl_ctx->graph_exec_stream()->ext_oneapi_graph(*(cache_it->second));
@@ -1322,7 +1331,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                 }
 
                 sycl_ex::command_graph mod_graph(*(sycl_ctx->stream()),
-                                                 { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
+                                                {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
                 mod_graph.begin_recording(*(sycl_ctx->stream()));
                 sycl_ctx->force_graph_compatible = true;
                 ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
@@ -1330,13 +1339,14 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                 mod_graph.end_recording();
 
                 const bool updatable = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_graph);
-                auto       exec =
-                    updatable ? mod_graph.finalize(sycl_ex::property::graph::updatable{}) : mod_graph.finalize();
+                auto exec = updatable ? mod_graph.finalize(sycl_ex::property::graph::updatable{})
+                                      : mod_graph.finalize();
                 sycl_ctx->graph_cache[graph_hash] =
                     std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec));
                 sycl_ctx->graph_pointer_hashes[graph_hash] = pointer_hash;
 
-                GGML_SYCL_DEBUG("[SYCL-GRAPH] Finalized new graph (cache size: %zu)\n", sycl_ctx->graph_cache.size());
+                GGML_SYCL_DEBUG("[SYCL-GRAPH] Finalized new graph (cache size: %zu)\n",
+                                sycl_ctx->graph_cache.size());
                 sycl_ctx->graph_exec_stream()->ext_oneapi_graph(*(sycl_ctx->graph_cache[graph_hash]));
             }
         } else {
@@ -1359,30 +1369,25 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                 // ===== SEGMENTED TIER 1: Pure replay — execute cached segments + immediate nodes =====
                 GGML_SYCL_DEBUG("[SYCL-GRAPH-SEG] Pure replay (%d graph segments cached)\n", n_graph_segments);
 
-                int         seg_idx = 0;
-                sycl::event last_graph_event;  // Track dependency between queues
-
+                int seg_idx = 0;
                 for (const auto & step : plan) {
                     if (step.kind == graph_exec_step::GRAPH_SEGMENT) {
-                        auto &                   exec = seg_cache_it->second.segment_graphs[seg_idx];
-                        // Build dependency list: include barrier from main stream if there was immediate work
-                        std::vector<sycl::event> deps;
+                        // Wait for any preceding immediate work to complete before submitting graph
                         if (seg_idx > 0 || n_immediate_steps > 0) {
-                            deps.push_back(sycl_ctx->stream()->ext_oneapi_submit_barrier());
+                            sycl_ctx->stream()->wait();
                         }
-                        last_graph_event = sycl_ctx->graph_exec_stream()->ext_oneapi_graph(*exec, deps);
-                        // Submit barrier on main stream to wait for graph completion (for next immediate work)
-                        if (seg_idx < n_graph_segments - 1 || n_immediate_steps > 0) {
-                            sycl_ctx->stream()->ext_oneapi_submit_barrier({ last_graph_event });
-                        }
+                        auto & exec = seg_cache_it->second.segment_graphs[seg_idx];
+                        sycl_ctx->graph_exec_stream()->ext_oneapi_graph(*exec);
+                        // Wait for graph to complete before any following immediate work
+                        sycl_ctx->graph_exec_stream()->wait();
                         seg_idx++;
                     } else {
-                        // Execute immediate nodes eagerly on main stream
-                        // (implicitly waits for preceding graph via barrier above)
+                        // Execute immediate nodes eagerly
                         for (int i = step.node_begin; i < step.node_end; i++) {
                             ggml_tensor * node = cgraph->nodes[i];
-                            if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
-                                node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
+                            if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE ||
+                                node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW ||
+                                node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
                                 (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                                 continue;
                             }
@@ -1398,7 +1403,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                                 is_rerecord ? "Re-recording (pointers changed)" : "Cache miss, recording",
                                 n_graph_segments);
 
-                sycl_ctx->stream()->wait();  // One-time sync before recording starts
+                sycl_ctx->stream()->wait();
 
                 // Evict if cache is full
                 if (!seg_cached && sycl_ctx->segmented_graph_cache.size() >= sycl_ctx->MAX_GRAPH_CACHE_SIZE) {
@@ -1410,21 +1415,19 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                 cache_entry.segment_graphs.clear();
                 cache_entry.segment_graphs.reserve(n_graph_segments);
 
-                sycl::event last_graph_event;  // Track dependency between queues
-                int         executed_seg_idx = 0;
-
                 for (const auto & step : plan) {
                     if (step.kind == graph_exec_step::GRAPH_SEGMENT) {
                         // Record this segment into a new graph
                         sycl_ex::command_graph seg_graph(*(sycl_ctx->stream()),
-                                                         { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
+                                                        {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
                         seg_graph.begin_recording(*(sycl_ctx->stream()));
 
                         sycl_ctx->force_graph_compatible = true;
                         for (int i = step.node_begin; i < step.node_end; i++) {
                             ggml_tensor * node = cgraph->nodes[i];
-                            if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
-                                node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
+                            if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE ||
+                                node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW ||
+                                node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
                                 (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                                 continue;
                             }
@@ -1435,37 +1438,29 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
 
                         seg_graph.end_recording();
 
-                        auto exec = updatable ? seg_graph.finalize(sycl_ex::property::graph::updatable{}) :
-                                                seg_graph.finalize();
+                        auto exec = updatable ? seg_graph.finalize(sycl_ex::property::graph::updatable{})
+                                              : seg_graph.finalize();
                         cache_entry.segment_graphs.push_back(
                             std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(
                                 std::move(exec)));
 
-                        // Execute this segment with event-based sync
-                        std::vector<sycl::event> deps;
-                        if (executed_seg_idx > 0 || n_immediate_steps > 0) {
-                            deps.push_back(sycl_ctx->stream()->ext_oneapi_submit_barrier());
-                        }
-                        last_graph_event =
-                            sycl_ctx->graph_exec_stream()->ext_oneapi_graph(*(cache_entry.segment_graphs.back()), deps);
-                        // Submit barrier on main stream to wait for graph completion
-                        if (executed_seg_idx < n_graph_segments - 1 || n_immediate_steps > 0) {
-                            sycl_ctx->stream()->ext_oneapi_submit_barrier({ last_graph_event });
-                        }
-                        executed_seg_idx++;
+                        // Execute this segment now
+                        sycl_ctx->graph_exec_stream()->ext_oneapi_graph(*(cache_entry.segment_graphs.back()));
+                        sycl_ctx->graph_exec_stream()->wait();
                     } else {
-                        // Execute immediate nodes eagerly on main stream
-                        // (implicitly waits for preceding graph via barrier above)
+                        // Execute immediate nodes eagerly (not recorded)
                         for (int i = step.node_begin; i < step.node_end; i++) {
                             ggml_tensor * node = cgraph->nodes[i];
-                            if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
-                                node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
+                            if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE ||
+                                node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW ||
+                                node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
                                 (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                                 continue;
                             }
                             bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
                             GGML_ASSERT(ok);
                         }
+                        sycl_ctx->stream()->wait();
                     }
                 }
 
@@ -2117,10 +2112,10 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
         return nullptr;
     };
 
-    const char * op_stats_env  = getenv("GGML_SYCL_OP_STATS");
-    ctx->enable_op_stats       = (op_stats_env != nullptr && strcmp(op_stats_env, "1") == 0);
+    const char * op_stats_env = getenv("GGML_SYCL_OP_STATS");
+    ctx->enable_op_stats = (op_stats_env != nullptr && strcmp(op_stats_env, "1") == 0);
     const char * op_timing_env = getenv("GGML_SYCL_OP_STATS_TIMING");
-    ctx->enable_op_timing      = (op_timing_env != nullptr && strcmp(op_timing_env, "1") == 0);
+    ctx->enable_op_timing = (op_timing_env != nullptr && strcmp(op_timing_env, "1") == 0);
 
     ggml_backend_t sycl_backend =
         new ggml_backend{ /* .guid    = */ ggml_backend_sycl_guid(),

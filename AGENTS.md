@@ -571,8 +571,9 @@ Counters and (optionally) timing totals/avg/min/max.
   - Q5_0/Q8_0 MUL_MAT: always immediate (GPU faults under SYCL graphs)
   - F16 permuted single-batch: graph-safe (direct kernels, no pool allocs)
   - Non-contiguous src0/src1: immediate (pool-allocated temporaries freed after recording)
-  - Batched MUL_MAT (ne12*ne13 > 1): immediate (batch loop pointer offsets, KQ/KQV goes through FA)
-  - F16/F32 src0: immediate (flaky Level Zero graph update() for XMX/tiled kernels)
+  - Multi-sequence batch (ne[3] > 1): immediate (pool-allocated pointer arrays for batched GEMM)
+  - GQA (r2 = src1->ne[2]/src0->ne[2] > 1): immediate (pool-allocated pointer arrays for batched GEMM dispatch)
+  - F16/F32 src0: **Only immediate if GQA/batch**; XMX path is graph-safe when r2=1 and r3=1
   - Remaining quantized types (Q4_K, Q4_0, Q2_K-Q6_K): graph-safe via DMMV/MMVQ/MMQ paths
 - **Test**:
   ```bash
@@ -583,8 +584,34 @@ Counters and (optionally) timing totals/avg/min/max.
   ```
 
 #### Fix 5: Enable graphs by default
-- Once fixes 1–3 are stable and tested, flip `GGML_SYCL_DISABLE_GRAPH` default from `1` to `0`.
+- Once fixes 1–4 are stable and tested, flip `GGML_SYCL_DISABLE_GRAPH` default from `1` to `0`.
 - Add a `GGML_SYCL_GRAPH_MODE` env var with values: `off` (current default), `replay` (fix 1 only), `full` (fixes 1+3).
+- **Current status**: Graphs cause ~14% regression on Llama-3.2-1B Q4_K (173 t/s vs 201 t/s with graphs disabled). The segmentation overhead (10 graph + 9 immediate steps) is inherent for GQA models.
+
+### GQA MUL_MAT Graph-Incompatibility (Feb 2026)
+
+**Problem**: F16 MUL_MAT operations with GQA (Grouped Query Attention) cause BCS page faults when recorded into SYCL graphs.
+
+**Root Cause**: GQA with `r2 = n_q_heads / n_kv_heads > 1` requires pool-allocated pointer arrays for batched GEMM dispatch:
+```cpp
+// matmul.cpp:763-765
+ggml_sycl_pool_alloc<const void *> ptrs_src(ctx.pool(), 2 * ne23);
+ggml_sycl_pool_alloc<void *>       ptrs_dst(ctx.pool(), 1 * ne23);
+```
+These RAII allocations are freed after `ggml_sycl_op_mul_mat` returns, but the recorded graph still references those addresses → page fault on BCS engine during replay.
+
+**Key Insight**: Multi-head parallelism (ne[2] > 1) is NOT the same as GQA:
+- **Multi-head (MHA)**: ne[2]=32, src0->ne[2]=32, r2=1 → contiguous batched GEMM, graph-safe
+- **GQA**: ne[2]=32, src0->ne[2]=8, r2=4 → pool-allocated pointer arrays, graph-incompatible
+
+**Detection**: Check `r2 = src1->ne[2] / src0->ne[2]` instead of raw `ne[2]`:
+```cpp
+const int64_t r2 = src1->ne[2] / src0->ne[2];  // GQA ratio
+const int64_t r3 = src1->ne[3] / src0->ne[3];  // Batch ratio
+if (r2 > 1 || r3 > 1) return true;  // Immediate mode required
+```
+
+**Result**: Llama-3.2-1B Q4_K generates 19 execution steps (10 graph + 9 immediate). The 9 immediate nodes are GQA MUL_MAT operations that cannot be avoided. This is the correct minimum segmentation for GQA models.
 
 ### Implementation Order
 1. ~~Fix 2 — trivial, one queue property change~~ ✅
