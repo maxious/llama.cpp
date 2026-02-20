@@ -672,15 +672,18 @@ static bool node_needs_immediate_mode(ggml_backend_sycl_context & ctx, const ggm
         // Level Zero driver — stale results when different data reuses the same graph
         // topology. In real models, F16/F32 MUL_MAT is only used for KQ/KQV attention
         // which goes through Flash Attention, so this has no performance impact.
-        if (!src0_is_2d_contiguous || !src1_is_2d_contiguous || src1->ne[3] > 1 || r3 > 1 || is_batched_f16 ||
-            src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32) {
-            if (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32) {
-                // Ignore the F16/F32 check for now to allow graph execution for KQ/KQV
-                // This allows the full graph to compile as 1 segment and run optimally
-                if (src0_is_2d_contiguous && src1_is_2d_contiguous && src1->ne[3] <= 1 && r3 <= 1 && !is_batched_f16) {
-                    return false;
-                }
-            }
+        if (!src0_is_2d_contiguous || !src1_is_2d_contiguous || src1->ne[3] > 1 || r3 > 1 || is_batched_f16) {
+            return true;
+        }
+
+        // F16/F32 are extremely flaky with oneMKL inside graphs!
+        // We disabled it intentionally before. Fall back to eager execution.
+        if (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32) {
+            // Note: F16/F32 is permitted in graphs only if XMX or Tiled GEMM supports it.
+            // XMX handles F16xF16 and F32xF32.
+            // Tiled GEMM handles F16xF32 and F32xF32.
+            // However, on some GPUs, Tiled GEMM is slower than oneMKL.
+            // For now, if F16/F32 is used outside of Flash Attention, segment it out to ensure stability.
             return true;
         }
 
