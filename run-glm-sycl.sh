@@ -64,7 +64,7 @@ fi
 #export LLAMA_KV_CACHE_DEBUG=1
 #export LLAMA_GRAPH_INPUT_DEBUG=1
 #export LLAMA_GRAPH_RESULT_DEBUG=1
-
+export GGML_SYCL_DISABLE_GRAPH=0
 echo "Starting llama-server in background..."
 echo "Log file: $LOG_FILE"
 echo "PID file: $PID_FILE"
@@ -72,7 +72,7 @@ echo "PID file: $PID_FILE"
 nohup ./build-sycl/bin/llama-server \
     --model models/koboldcpp/GLM-4.7-Flash-REAP-23B-A3B-Q8_0.gguf \
     --port 5000 --host 0.0.0.0 \
-    --fit on --flash-attn on \
+    --fit on --flash-attn on --no-mmap \
     --temp 0.7 --top-p 1.0 --min-p 0.01 \
     > "$LOG_FILE" 2>&1 &
 

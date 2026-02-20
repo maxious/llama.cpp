@@ -24,6 +24,13 @@ struct flash_attn_buffers {
     float ** V_ptrs_buf = nullptr;  // V pointer array for batched GEMM
     float ** O_ptrs_buf = nullptr;  // O pointer array for batched GEMM
 
+    // Host USM pointer arrays for GQA (kept alive for graph recording)
+    float ** h_Q_ptrs_buf = nullptr;
+    float ** h_K_ptrs_buf = nullptr;
+    float ** h_S_ptrs_buf = nullptr;
+    float ** h_V_ptrs_buf = nullptr;
+    float ** h_O_ptrs_buf = nullptr;
+
     // Track allocated sizes in bytes
     size_t Q_size        = 0;
     size_t K_size        = 0;
@@ -82,6 +89,21 @@ struct flash_attn_buffers {
             }
             if (O_ptrs_buf) {
                 sycl::free(O_ptrs_buf, *q);
+            }
+            if (h_Q_ptrs_buf) {
+                sycl::free(h_Q_ptrs_buf, *q);
+            }
+            if (h_K_ptrs_buf) {
+                sycl::free(h_K_ptrs_buf, *q);
+            }
+            if (h_S_ptrs_buf) {
+                sycl::free(h_S_ptrs_buf, *q);
+            }
+            if (h_V_ptrs_buf) {
+                sycl::free(h_V_ptrs_buf, *q);
+            }
+            if (h_O_ptrs_buf) {
+                sycl::free(h_O_ptrs_buf, *q);
             }
         }
     }
@@ -203,7 +225,12 @@ struct flash_attn_buffers {
                   float ***     out_K_ptrs,
                   float ***     out_S_ptrs,
                   float ***     out_V_ptrs,
-                  float ***     out_O_ptrs) {
+                  float ***     out_O_ptrs,
+                  float ***     out_h_Q_ptrs = nullptr,
+                  float ***     out_h_K_ptrs = nullptr,
+                  float ***     out_h_S_ptrs = nullptr,
+                  float ***     out_h_V_ptrs = nullptr,
+                  float ***     out_h_O_ptrs = nullptr) {
         bool was_allocated = false;
         if (size_bytes > ptrs_size) {
             if (Q_ptrs_buf) {
@@ -221,12 +248,32 @@ struct flash_attn_buffers {
             if (O_ptrs_buf) {
                 sycl::free(O_ptrs_buf, *q);
             }
+            if (h_Q_ptrs_buf) {
+                sycl::free(h_Q_ptrs_buf, *q);
+            }
+            if (h_K_ptrs_buf) {
+                sycl::free(h_K_ptrs_buf, *q);
+            }
+            if (h_S_ptrs_buf) {
+                sycl::free(h_S_ptrs_buf, *q);
+            }
+            if (h_V_ptrs_buf) {
+                sycl::free(h_V_ptrs_buf, *q);
+            }
+            if (h_O_ptrs_buf) {
+                sycl::free(h_O_ptrs_buf, *q);
+            }
             // Allocate all 5 pointer arrays
             Q_ptrs_buf    = (float **) sycl::malloc_device(size_bytes, *stream);
             K_ptrs_buf    = (float **) sycl::malloc_device(size_bytes, *stream);
             S_ptrs_buf    = (float **) sycl::malloc_device(size_bytes, *stream);
             V_ptrs_buf    = (float **) sycl::malloc_device(size_bytes, *stream);
             O_ptrs_buf    = (float **) sycl::malloc_device(size_bytes, *stream);
+            h_Q_ptrs_buf  = (float **) sycl::malloc_host(size_bytes, *stream);
+            h_K_ptrs_buf  = (float **) sycl::malloc_host(size_bytes, *stream);
+            h_S_ptrs_buf  = (float **) sycl::malloc_host(size_bytes, *stream);
+            h_V_ptrs_buf  = (float **) sycl::malloc_host(size_bytes, *stream);
+            h_O_ptrs_buf  = (float **) sycl::malloc_host(size_bytes, *stream);
             ptrs_size     = size_bytes;
             q             = stream;
             was_allocated = true;
@@ -236,6 +283,21 @@ struct flash_attn_buffers {
         *out_S_ptrs = S_ptrs_buf;
         *out_V_ptrs = V_ptrs_buf;
         *out_O_ptrs = O_ptrs_buf;
+        if (out_h_Q_ptrs) {
+            *out_h_Q_ptrs = h_Q_ptrs_buf;
+        }
+        if (out_h_K_ptrs) {
+            *out_h_K_ptrs = h_K_ptrs_buf;
+        }
+        if (out_h_S_ptrs) {
+            *out_h_S_ptrs = h_S_ptrs_buf;
+        }
+        if (out_h_V_ptrs) {
+            *out_h_V_ptrs = h_V_ptrs_buf;
+        }
+        if (out_h_O_ptrs) {
+            *out_h_O_ptrs = h_O_ptrs_buf;
+        }
         return was_allocated;
     }
 };

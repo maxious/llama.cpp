@@ -98,9 +98,15 @@ void ggml_sycl_op_flash_attn_tiled(ggml_backend_sycl_context & ctx, const ggml_t
     float ** S_ptrs    = nullptr;
     float ** V_ptrs    = nullptr;
     float ** O_ptrs    = nullptr;
+    float ** h_Q_ptrs  = nullptr;
+    float ** h_K_ptrs  = nullptr;
+    float ** h_S_ptrs  = nullptr;
+    float ** h_V_ptrs  = nullptr;
+    float ** h_O_ptrs  = nullptr;
 
     if (n_heads != n_kv_heads) {
-        ctx.fattn_buffers->get_ptrs(ptr_bytes, stream, &Q_ptrs, &K_ptrs, &S_ptrs, &V_ptrs, &O_ptrs);
+        ctx.fattn_buffers->get_ptrs(ptr_bytes, stream, &Q_ptrs, &K_ptrs, &S_ptrs, &V_ptrs, &O_ptrs, &h_Q_ptrs,
+                                    &h_K_ptrs, &h_S_ptrs, &h_V_ptrs, &h_O_ptrs);
     }
 
     if (n_heads == n_kv_heads) {
@@ -111,20 +117,16 @@ void ggml_sycl_op_flash_attn_tiled(ggml_backend_sycl_context & ctx, const ggml_t
         launch_gemm_tiled_batched<true>(stream, (const float *) Q->data, (const float *) K->data, S_ptr, N, N_kv, DQK,
                                         1.0f, 0.0f, n_heads, DQK, DQK, N_kv, stride_Q, stride_K, stride_S);
     } else {
-        std::vector<float *> h_Q(n_heads);
-        std::vector<float *> h_K(n_heads);
-        std::vector<float *> h_S(n_heads);
-
         for (int i = 0; i < n_heads; ++i) {
-            h_Q[i]   = (float *) Q->data + i * (Q->nb[2] / sizeof(T_Q));
-            int kv_i = i / (n_heads / n_kv_heads);
-            h_K[i]   = (float *) K->data + kv_i * (K->nb[2] / sizeof(T_K));
-            h_S[i]   = S_ptr + i * N * N_kv;
+            h_Q_ptrs[i] = (float *) Q->data + i * (Q->nb[2] / sizeof(T_Q));
+            int kv_i    = i / (n_heads / n_kv_heads);
+            h_K_ptrs[i] = (float *) K->data + kv_i * (K->nb[2] / sizeof(T_K));
+            h_S_ptrs[i] = S_ptr + i * N * N_kv;
         }
 
-        stream->memcpy(Q_ptrs, h_Q.data(), ptr_bytes);
-        stream->memcpy(K_ptrs, h_K.data(), ptr_bytes);
-        stream->memcpy(S_ptrs, h_S.data(), ptr_bytes);
+        stream->memcpy(Q_ptrs, h_Q_ptrs, ptr_bytes);
+        stream->memcpy(K_ptrs, h_K_ptrs, ptr_bytes);
+        stream->memcpy(S_ptrs, h_S_ptrs, ptr_bytes);
 
         launch_gemm_tiled_batched_indirect<true>(stream, (const float **) Q_ptrs, (const float **) K_ptrs, S_ptrs, N,
                                                  N_kv, DQK, 1.0f, 0.0f, n_heads, DQK, DQK, N_kv);
@@ -155,22 +157,18 @@ void ggml_sycl_op_flash_attn_tiled(ggml_backend_sycl_context & ctx, const ggml_t
         launch_gemm_tiled_batched<false>(stream, P_ptr, (const float *) V->data, O_ptr, N, DV, N_kv, 1.0f, 0.0f,
                                          n_heads, N_kv, DV, stride_O_seq, stride_P, stride_V, stride_O_head);
     } else {
-        std::vector<float *> h_S(n_heads);  // P reuse S
-        std::vector<float *> h_V(n_heads);
-        std::vector<float *> h_O(n_heads);
-
         int64_t stride_O_head = dst->nb[1] / 4;
         int64_t stride_O_seq  = dst->nb[2] / 4;
 
         for (int i = 0; i < n_heads; ++i) {
-            h_S[i]   = P_ptr + i * N * N_kv;
-            int kv_i = i / (n_heads / n_kv_heads);
-            h_V[i]   = (float *) V->data + kv_i * (V->nb[2] / sizeof(T_V));
-            h_O[i]   = O_ptr + i * stride_O_head;
+            h_S_ptrs[i] = P_ptr + i * N * N_kv;
+            int kv_i    = i / (n_heads / n_kv_heads);
+            h_V_ptrs[i] = (float *) V->data + kv_i * (V->nb[2] / sizeof(T_V));
+            h_O_ptrs[i] = O_ptr + i * stride_O_head;
         }
-        stream->memcpy(S_ptrs, h_S.data(), ptr_bytes);  // Reuse S_ptrs
-        stream->memcpy(V_ptrs, h_V.data(), ptr_bytes);
-        stream->memcpy(O_ptrs, h_O.data(), ptr_bytes);
+        stream->memcpy(S_ptrs, h_S_ptrs, ptr_bytes);  // Reuse S_ptrs
+        stream->memcpy(V_ptrs, h_V_ptrs, ptr_bytes);
+        stream->memcpy(O_ptrs, h_O_ptrs, ptr_bytes);
 
         launch_gemm_tiled_batched_indirect<false>(stream, (const float **) S_ptrs, (const float **) V_ptrs, O_ptrs, N,
                                                   DV, N_kv, 1.0f, 0.0f, n_heads, N_kv, DV, stride_O_seq);

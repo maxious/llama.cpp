@@ -421,7 +421,7 @@ struct ggml_backend_sycl_context {
     std::map<uint64_t, std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>> graph_cache;
     // Pointer hash cache: maps topology hash -> USM pointer hash from last recording
     // Used for three-tier cache lookup: pure replay / re-record+update / full record+finalize
-    std::map<uint64_t, uint64_t> graph_pointer_hashes;
+    std::map<uint64_t, uint64_t>                                                                  graph_pointer_hashes;
     static constexpr size_t MAX_GRAPH_CACHE_SIZE = 8;  // Limit cache to prevent memory bloat
 
     // Segmented graph cache: for graphs with immediate-mode nodes, we cache
@@ -429,13 +429,14 @@ struct ggml_backend_sycl_context {
     // Each segment is a contiguous range of graph-compatible nodes.
     struct segment_cache_entry {
         std::vector<std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>> segment_graphs;
-        uint64_t pointer_hash = 0;
+        uint64_t                                                                               pointer_hash = 0;
     };
+
     std::map<uint64_t, segment_cache_entry> segmented_graph_cache;
 
     // Dedicated graph execution queue with no_immediate_command_list property.
     // Intel discrete GPUs require this for efficient ext_oneapi_graph() submission.
-    queue_ptr graph_queue = nullptr;
+    queue_ptr   graph_queue = nullptr;
     sycl::queue graph_queue_storage;
 
     queue_ptr graph_exec_stream() {
@@ -443,10 +444,10 @@ struct ggml_backend_sycl_context {
             return graph_queue;
         }
         // Create from the same context and device as the primary stream
-        queue_ptr primary = stream();
-        sycl::context ctx = primary->get_context();
-        sycl::device  dev = primary->get_device();
-        graph_queue_storage = sycl::queue(
+        queue_ptr     primary = stream();
+        sycl::context ctx     = primary->get_context();
+        sycl::device  dev     = primary->get_device();
+        graph_queue_storage   = sycl::queue(
             ctx, dev,
             [](sycl::exception_list exceptions) {
                 for (const auto & e : exceptions) {
@@ -458,9 +459,8 @@ struct ggml_backend_sycl_context {
                     }
                 }
             },
-            sycl::property_list(
-                sycl::property::queue::in_order{},
-                sycl::ext::intel::property::queue::no_immediate_command_list{}));
+            sycl::property_list(sycl::property::queue::in_order{},
+                                  sycl::ext::intel::property::queue::no_immediate_command_list{}));
         graph_queue = &graph_queue_storage;
         GGML_SYCL_DEBUG("[SYCL-GRAPH] Created dedicated graph execution queue with no_immediate_command_list\n");
         return graph_queue;
@@ -480,10 +480,10 @@ struct ggml_backend_sycl_context {
     bool enable_op_timing = false;
 
     struct op_stat_entry {
-        uint64_t count = 0;
+        uint64_t count    = 0;
         double   total_ms = 0.0;
-        double   min_ms = std::numeric_limits<double>::max();
-        double   max_ms = 0.0;
+        double   min_ms   = std::numeric_limits<double>::max();
+        double   max_ms   = 0.0;
     };
 
     std::map<std::string, op_stat_entry> op_stats;
@@ -520,11 +520,9 @@ struct ggml_backend_sycl_context {
             const auto & entry = item.second;
             if (enable_op_timing && entry.count > 0) {
                 const double avg_ms = entry.total_ms / static_cast<double>(entry.count);
-                std::fprintf(stderr,
-                             "%s: count=%" PRIu64 " total=%.3fms avg=%.3fms min=%.3fms max=%.3fms\n",
+                std::fprintf(stderr, "%s: count=%" PRIu64 " total=%.3fms avg=%.3fms min=%.3fms max=%.3fms\n",
                              item.first.c_str(), entry.count, entry.total_ms, avg_ms,
-                             entry.min_ms == std::numeric_limits<double>::max() ? 0.0 : entry.min_ms,
-                             entry.max_ms);
+                             entry.min_ms == std::numeric_limits<double>::max() ? 0.0 : entry.min_ms, entry.max_ms);
             } else {
                 std::fprintf(stderr, "%s: count=%" PRIu64 "\n", item.first.c_str(), entry.count);
             }
