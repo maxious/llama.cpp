@@ -861,7 +861,7 @@ static uint64_t compute_cgraph_pointer_hash(const ggml_cgraph * cgraph) {
 static graph_compat_t check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
     // Heuristic: Disable graphs for very large compute graphs to avoid driver hang/compile explosion.
     // The exact threshold may need tuning per device/driver.
-    if (cgraph->n_nodes > 500) {
+    if (cgraph->n_nodes > 5000) {
         GGML_LOG_INFO("%s: disabling SYCL graphs due to large graph size (%d nodes)\n", __func__, cgraph->n_nodes);
         return graph_compat_t::DISABLED;
     }
