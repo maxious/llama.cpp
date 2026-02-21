@@ -951,9 +951,16 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
         }
 
         // Workaround: XMX hangs with head size 40 on some GPUs, force MKL for all batch sizes.
-        const bool xmx_head_40_workaround = (DQK == 40);
+        const bool xmx_head_40_workaround     = (DQK == 40);
+        const bool xmx_kvsplit_b60_workaround = (direct_disabled_b60 && N > 1);
 
         if (!sycl_use_xmx || sycl_use_mkl || use_mkl_for_sinks || small_batch || xmx_head_40_workaround) {
+            return false;
+        }
+
+        if (xmx_kvsplit_b60_workaround) {
+            GGML_SYCL_DEBUG("ggml_sycl: Disabling XMX KV-split flash attention on %s for N=%ld, falling back\n",
+                                     device_name.c_str(), N);
             return false;
         }
 
