@@ -612,6 +612,16 @@ static bool node_needs_immediate_mode(ggml_backend_sycl_context & ctx, const ggm
         return true;
     }
 
+    // Flash Attention uses pool-allocated scratch buffers (S matrix, pointer arrays for GQA)
+    // and host-to-device memcpy for indirect pointer dispatch. Both are graph-incompatible:
+    // - Pool allocations create internal SYCL events that break graph recording
+    // - Host memcpy of pointer arrays captures stale addresses on graph replay
+    // - oneMKL FA path creates internal events (graph-incompatible)
+    // Running FA in immediate mode is safe — it's at layer boundaries with minimal segmentation cost.
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        return true;
+    }
+
     if (node->op == GGML_OP_MUL_MAT) {
         const ggml_tensor * src0 = node->src[0];
         const ggml_tensor * src1 = node->src[1];
@@ -1289,6 +1299,17 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         bool has_immediate_nodes = (n_immediate_steps > 0);
         GGML_SYCL_DEBUG("[SYCL-GRAPH] Plan: %zu steps (%d graph segments, %d immediate)\n",
                         plan.size(), n_graph_segments, n_immediate_steps);
+
+        // Fragmentation guard: if the plan is highly fragmented, the overhead of
+        // recording/finalizing/synchronizing many tiny graph segments exceeds the
+        // benefit. Fall back to eager execution.
+        constexpr int MAX_GRAPH_STEPS = 100;
+        if ((int) plan.size() > MAX_GRAPH_STEPS) {
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] Plan too fragmented (%zu steps > %d), falling back to eager\n",
+                            plan.size(), MAX_GRAPH_STEPS);
+            ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+            return GGML_STATUS_SUCCESS;
+        }
 
         if (!has_immediate_nodes) {
             // ===== FAST PATH: No immediate nodes, use monolithic three-tier cache =====
