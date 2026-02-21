@@ -25,6 +25,7 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #if GGML_SYCL_DNNL
@@ -307,6 +308,13 @@ struct ggml_backend_sycl_context {
     bool             force_graph_compatible = false;
     bool             graph_recording_active = false;
 
+#ifdef GGML_SYCL_GRAPH
+    bool     graph_recording_node_bound    = false;
+    uint64_t graph_recording_topology_hash = 0;
+    int      graph_recording_segment_index = -1;
+    int      graph_recording_node_index    = -1;
+#endif
+
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
     explicit ggml_backend_sycl_context(int device) : device(device), name(GGML_SYCL_NAME + std::to_string(device)) {
@@ -429,7 +437,9 @@ struct ggml_backend_sycl_context {
     // Pointer hash cache: maps topology hash -> USM pointer hash from last recording
     // Used for three-tier cache lookup: pure replay / re-record+update / full record+finalize
     std::map<uint64_t, uint64_t>                                                                  graph_pointer_hashes;
-    static constexpr size_t MAX_GRAPH_CACHE_SIZE = 8;  // Limit cache to prevent memory bloat
+    static constexpr size_t MAX_GRAPH_CACHE_SIZE = 8;        // Limit cache to prevent memory bloat
+
+    using fattn_node_cache_key = std::tuple<int, int, int>;  // (segment_idx, node_idx, device)
 
     // Segmented graph cache: for graphs with immediate-mode nodes, we cache
     // per-segment executable graphs keyed by (topology_hash, segment_index).
@@ -437,11 +447,59 @@ struct ggml_backend_sycl_context {
     struct segment_cache_entry {
         std::vector<std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>> segment_graphs;
         uint64_t                                                                               pointer_hash = 0;
+        std::map<fattn_node_cache_key, std::unique_ptr<flash_attn_buffers>>                    fattn_node_buffers;
     };
+
+    // Monolithic graph cache companion: per-node FA scratch/pointer buffers owned by graph topology cache entries.
+    std::map<uint64_t, std::map<fattn_node_cache_key, std::unique_ptr<flash_attn_buffers>>> graph_fattn_node_buffers;
 
     std::map<uint64_t, segment_cache_entry> segmented_graph_cache;
 
+    segment_cache_entry * graph_recording_segment_cache = nullptr;
+
+    void graph_recording_begin_fattn_scope(uint64_t topology_hash, int segment_idx, segment_cache_entry * seg_cache) {
+        graph_recording_topology_hash = topology_hash;
+        graph_recording_segment_index = segment_idx;
+        graph_recording_segment_cache = seg_cache;
+        graph_recording_node_bound    = false;
+        graph_recording_node_index    = -1;
+    }
+
+    void graph_recording_end_fattn_scope() {
+        graph_recording_node_bound    = false;
+        graph_recording_node_index    = -1;
+        graph_recording_topology_hash = 0;
+        graph_recording_segment_index = -1;
+        graph_recording_segment_cache = nullptr;
+    }
+
+    void graph_recording_bind_fattn_node(int node_idx) {
+        graph_recording_node_bound = true;
+        graph_recording_node_index = node_idx;
+    }
+
+    void graph_recording_unbind_fattn_node() {
+        graph_recording_node_bound = false;
+        graph_recording_node_index = -1;
+    }
+
+    std::unique_ptr<flash_attn_buffers> * graph_recording_fattn_buffer_slot() {
+        if (!graph_recording_node_bound || !graph_recording_active || !force_graph_compatible) {
+            return nullptr;
+        }
+
+        const fattn_node_cache_key key = { graph_recording_segment_index, graph_recording_node_index, device };
+        if (graph_recording_segment_cache != nullptr) {
+            return &graph_recording_segment_cache->fattn_node_buffers[key];
+        }
+
+        return &graph_fattn_node_buffers[graph_recording_topology_hash][key];
+    }
+
+    void evict_graph_fattn_node_buffers(uint64_t topology_hash) { graph_fattn_node_buffers.erase(topology_hash); }
+
     // Topologies that repeatedly fall back to eager due to fragmented plans.
+
     // Value is the number of observed fragmented-plan fallbacks for this topology.
     std::map<uint64_t, uint32_t> fragmented_graph_topologies;
 

@@ -50,21 +50,43 @@ std::string ggml_sycl_flash_attn_stats_key(const ggml_tensor * dst,
     return oss.str();
 }
 
-struct fattn_graph_buffer_mode_guard {
-    flash_attn_buffers * buffers  = nullptr;
-    bool                 previous = false;
+struct fattn_buffer_binding_guard {
+    ggml_backend_sycl_context &           ctx;
+    std::unique_ptr<flash_attn_buffers> * graph_slot = nullptr;
+    std::unique_ptr<flash_attn_buffers>   shared_saved;
+    bool                                  previous_graph_mode = false;
 
-    fattn_graph_buffer_mode_guard(flash_attn_buffers * buffers, bool enabled) : buffers(buffers) {
-        if (this->buffers) {
-            previous = this->buffers->is_graph_recording_mode();
-            this->buffers->set_graph_recording_mode(enabled);
+    fattn_buffer_binding_guard(ggml_backend_sycl_context & ctx, bool recording_graph) : ctx(ctx) {
+#ifdef GGML_SYCL_GRAPH
+        if (recording_graph) {
+            graph_slot = ctx.graph_recording_fattn_buffer_slot();
+            if (graph_slot != nullptr) {
+                shared_saved = std::move(ctx.fattn_buffers);
+                if (!*graph_slot) {
+                    *graph_slot = std::make_unique<flash_attn_buffers>();
+                }
+                ctx.fattn_buffers = std::move(*graph_slot);
+            }
         }
+#endif
+
+        if (!ctx.fattn_buffers) {
+            ctx.fattn_buffers = std::make_unique<flash_attn_buffers>();
+        }
+        previous_graph_mode = ctx.fattn_buffers->is_graph_recording_mode();
+        ctx.fattn_buffers->set_graph_recording_mode(recording_graph);
     }
 
-    ~fattn_graph_buffer_mode_guard() {
-        if (buffers) {
-            buffers->set_graph_recording_mode(previous);
+    ~fattn_buffer_binding_guard() {
+        if (ctx.fattn_buffers) {
+            ctx.fattn_buffers->set_graph_recording_mode(previous_graph_mode);
         }
+#ifdef GGML_SYCL_GRAPH
+        if (graph_slot != nullptr) {
+            *graph_slot       = std::move(ctx.fattn_buffers);
+            ctx.fattn_buffers = std::move(shared_saved);
+        }
+#endif
     }
 };
 }  // namespace
@@ -450,10 +472,52 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
 }
 
 bool ggml_sycl_flash_attn_graph_compatible(const ggml_tensor * dst) {
-    GGML_UNUSED(dst);
-    // Disabled for now: the current FA graph path can trigger Xe CCS CAT/page faults
-    // and needs per-node graph-lifetime buffer ownership before re-enabling.
-    return false;
+    static int cached = -1;
+    if (cached < 0) {
+        const char * env = getenv("GGML_SYCL_FLASH_ATTN_GRAPH_EXPERIMENTAL");
+        cached           = (env && strcmp(env, "1") == 0) ? 1 : 0;
+    }
+    if (!cached) {
+        return false;
+    }
+
+    if (!ggml_sycl_flash_attn_ext_supported(dst)) {
+        return false;
+    }
+
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    if (Q == nullptr || K == nullptr || V == nullptr || sinks != nullptr) {
+        return false;
+    }
+    if (mask != nullptr && mask->type != GGML_TYPE_F32 && mask->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    const bool all_f32        = (Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F32 && V->type == GGML_TYPE_F32);
+    const bool all_f16        = (Q->type == GGML_TYPE_F16 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
+    const bool mixed_qf32_kv  = (Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
+    const bool tiled_type_ok  = all_f32 || all_f16 || mixed_qf32_kv;
+    const bool output_type_ok = (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+
+    const int64_t dqk = Q->ne[0];
+    const int64_t dv  = V->ne[0];
+    const int64_t N   = Q->ne[1];
+
+    if (!tiled_type_ok || !output_type_ok) {
+        return false;
+    }
+
+    // Gradual re-enable: small-batch tiled FA only.
+    if (dqk != dv || dqk <= 0 || dqk > 128 || N >= 32) {
+        return false;
+    }
+
+    return true;
 }
 
 template <int64_t DQK, int64_t DV> void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -833,10 +897,7 @@ void ggml_sycl_op_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     }
 #endif
 
-    if (!ctx.fattn_buffers) {
-        ctx.fattn_buffers = std::make_unique<flash_attn_buffers>();
-    }
-    fattn_graph_buffer_mode_guard fattn_graph_buffers_mode(ctx.fattn_buffers.get(), recording_graph);
+    fattn_buffer_binding_guard fattn_buffers_guard(ctx, recording_graph);
 
     const bool want_timing = ctx.enable_op_timing && !recording_graph;
     auto       start_time  = std::chrono::high_resolution_clock::time_point{};

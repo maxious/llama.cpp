@@ -584,7 +584,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
+#ifdef GGML_SYCL_GRAPH
+        const bool bind_fattn_graph_node = sycl_ctx->graph_recording_active && sycl_ctx->force_graph_compatible &&
+                                           sycl_ctx->graph_recording_segment_index == -1 &&
+                                           sycl_ctx->graph_recording_topology_hash != 0;
+        if (bind_fattn_graph_node) {
+            sycl_ctx->graph_recording_bind_fattn_node(i);
+        }
+#endif
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+#ifdef GGML_SYCL_GRAPH
+        if (bind_fattn_graph_node) {
+            sycl_ctx->graph_recording_unbind_fattn_node();
+        }
+#endif
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
@@ -1579,7 +1592,9 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                     mod_graph.begin_recording(*(sycl_ctx->stream()));
                     sycl_ctx->force_graph_compatible = true;
                     sycl_ctx->graph_recording_active = true;
+                    sycl_ctx->graph_recording_begin_fattn_scope(graph_hash, -1, nullptr);
                     ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+                    sycl_ctx->graph_recording_end_fattn_scope();
                     sycl_ctx->graph_recording_active = false;
                     sycl_ctx->force_graph_compatible = false;
                     mod_graph.end_recording();
@@ -1604,6 +1619,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                 if (sycl_ctx->graph_cache.size() >= sycl_ctx->MAX_GRAPH_CACHE_SIZE) {
                     auto evict_it = sycl_ctx->graph_cache.begin();
                     sycl_ctx->graph_pointer_hashes.erase(evict_it->first);
+                    sycl_ctx->evict_graph_fattn_node_buffers(evict_it->first);
                     sycl_ctx->graph_cache.erase(evict_it);
                 }
 
@@ -1612,7 +1628,9 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                 mod_graph.begin_recording(*(sycl_ctx->stream()));
                 sycl_ctx->force_graph_compatible = true;
                 sycl_ctx->graph_recording_active = true;
+                sycl_ctx->graph_recording_begin_fattn_scope(graph_hash, -1, nullptr);
                 ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+                sycl_ctx->graph_recording_end_fattn_scope();
                 sycl_ctx->graph_recording_active = false;
                 sycl_ctx->force_graph_compatible = false;
                 mod_graph.end_recording();
@@ -1701,6 +1719,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                 cache_entry.segment_graphs.clear();
                 cache_entry.segment_graphs.reserve(n_graph_segments);
 
+                int seg_idx_record = 0;
                 for (const auto & step : plan) {
                     if (step.kind == graph_exec_step::GRAPH_SEGMENT) {
                         const auto             t_seg_record0 = graph_timing_now();
@@ -1710,6 +1729,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
 
                         sycl_ctx->force_graph_compatible = true;
                         sycl_ctx->graph_recording_active = true;
+                        sycl_ctx->graph_recording_begin_fattn_scope(graph_hash, seg_idx_record, &cache_entry);
                         for (int i = step.node_begin; i < step.node_end; i++) {
                             ggml_tensor * node = cgraph->nodes[i];
                             if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
@@ -1717,9 +1737,12 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                                 (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                                 continue;
                             }
+                            sycl_ctx->graph_recording_bind_fattn_node(i);
                             bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+                            sycl_ctx->graph_recording_unbind_fattn_node();
                             GGML_ASSERT(ok);
                         }
+                        sycl_ctx->graph_recording_end_fattn_scope();
                         sycl_ctx->graph_recording_active = false;
                         sycl_ctx->force_graph_compatible = false;
 
@@ -1738,6 +1761,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                         const auto t_seg_wait0 = graph_timing_now();
                         sycl_ctx->graph_exec_stream()->wait();
                         record_graph_timing_us("seg_record_graph_wait_us", t_seg_wait0, graph_timing_now());
+                        seg_idx_record++;
                     } else {
                         const auto t_im0 = graph_timing_now();
                         for (int i = step.node_begin; i < step.node_end; i++) {
