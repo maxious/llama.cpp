@@ -723,6 +723,10 @@ static graph_immediate_reason node_immediate_mode_reason(ggml_backend_sycl_conte
     }
 
     if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        if (ggml_sycl_flash_attn_graph_compatible(node)) {
+            return graph_immediate_reason::NONE;
+        }
+
         if (ggml_sycl_graph_test_allow_flash_attn()) {
             const ggml_tensor * Q     = node->src[0];
             const ggml_tensor * K     = node->src[1];
@@ -1282,6 +1286,9 @@ static std::map<int, std::vector<int>> partition_nodes_by_device(ggml_backend_sy
 // Record and execute per-device graphs for multi-GPU setups
 static ggml_status ggml_backend_sycl_multi_device_graph_compute(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
     int device_count = ggml_sycl_info().device_count;
+
+    // TODO: Replace coarse per-device sequencing/queue waits with a dependency-aware scheduler
+    // that overlaps compute and inter-device transfers (dual-B60 prompt throughput follow-up).
 
     GGML_LOG_INFO("[SYCL-MULTI-GRAPH] Starting multi-device graph compute (%d devices, %d nodes)\n", device_count,
                   cgraph->n_nodes);
