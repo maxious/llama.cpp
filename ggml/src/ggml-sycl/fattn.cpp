@@ -498,26 +498,38 @@ bool ggml_sycl_flash_attn_graph_compatible(const ggml_tensor * dst) {
         return false;
     }
 
-    const bool all_f32        = (Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F32 && V->type == GGML_TYPE_F32);
-    const bool all_f16        = (Q->type == GGML_TYPE_F16 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
-    const bool mixed_qf32_kv  = (Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
-    const bool tiled_type_ok  = all_f32 || all_f16 || mixed_qf32_kv;
-    const bool output_type_ok = (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+    const bool all_f32       = (Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F32 && V->type == GGML_TYPE_F32);
+    const bool all_f16       = (Q->type == GGML_TYPE_F16 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
+    const bool mixed_qf32_kv = (Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
+
+    if (!(all_f32 || all_f16 || mixed_qf32_kv) || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
 
     const int64_t dqk = Q->ne[0];
     const int64_t dv  = V->ne[0];
     const int64_t N   = Q->ne[1];
 
-    if (!tiled_type_ok || !output_type_ok) {
+    if (dqk <= 0 || dv <= 0 || N <= 0) {
         return false;
     }
 
-    // Gradual re-enable: small-batch tiled FA only.
-    if (dqk != dv || dqk <= 0 || dqk > 128 || N >= 32) {
+    if (N < 32) {
         return false;
     }
 
-    return true;
+    if (dqk != dv) {
+        return false;
+    }
+
+    switch (dqk) {
+        case 64:
+        case 80:
+        case 128:
+            return true;
+        default:
+            return false;
+    }
 }
 
 template <int64_t DQK, int64_t DV> void ggml_sycl_op_flash_attn_2(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
