@@ -587,6 +587,8 @@ Counters and (optionally) timing totals/avg/min/max.
 - Once fixes 1–4 are stable and tested, flip `GGML_SYCL_DISABLE_GRAPH` default from `1` to `0`.
 - Add a `GGML_SYCL_GRAPH_MODE` env var with values: `off` (current default), `replay` (fix 1 only), `full` (fixes 1+3).
 - **Current status**: Graphs cause ~14% regression on Llama-3.2-1B Q4_K (173 t/s vs 201 t/s with graphs disabled). The segmentation overhead (10 graph + 9 immediate steps) is inherent for GQA models.
+- **Updated status (Feb 2026, post-36388b86d)**: `FLASH_ATTN_EXT` is forced to eager in `node_needs_immediate_mode()` to avoid stale pooled pointer arrays during graph replay on GQA/MLA models (DEVICE_LOST). A fragmentation guard also falls back to full eager when the segmented execution plan is too fragmented (`>100` steps), because hundreds of tiny graph/eager transitions are slower than pure eager execution.
+- **Implication**: Do **not** enable graphs by default yet. The next step is reducing graph-incompatible pointer-array/pool-allocation patterns rather than expanding eager fallbacks.
 
 ### GQA MUL_MAT Graph-Incompatibility (Feb 2026)
 
@@ -619,6 +621,64 @@ if (r2 > 1 || r3 > 1) return true;  // Immediate mode required
 3. ~~Fix 3 — architecturally important, segmented graph execution~~ ✅
 4. ~~Fix 4 — graph-safe dispatch (abandoned `dynamic_command_group`, used direct dispatch instead)~~ ✅
 5. Fix 5 — final gate after stability validation
+
+## What To Try Next (Post-36388b86d)
+
+### Recommendation: Do not revert 36388b86d yet
+- The latest commit is a **stability guardrail**, not just a pessimization: it prevents `DEVICE_LOST` from stale pointer arrays captured during graph recording (especially GQA/MLA `FLASH_ATTN_EXT`).
+- Reverting it likely reintroduces crashes and invalidates performance comparisons (throughput wins are not meaningful if graph replay is unsafe).
+- **Better path**: keep the eager fallback + fragmentation guard, then selectively re-enable graph mode only after eliminating the root causes below.
+
+### Root Cause Work (highest priority)
+1. **Make graph-replayed ops stop using ephemeral pool pointer arrays**
+   - Problem pattern: RAII `ggml_sycl_pool_alloc<...>` pointer arrays / temporaries created during recording and freed before replay.
+   - Next fix: allocate graph-stable pointer tables from a persistent cache keyed by graph topology + shape (or pointer hash), and refresh contents in-place each invocation.
+   - Targets:
+     - `MUL_MAT` batched/GQA paths (pointer arrays for batched GEMM dispatch)
+     - `FLASH_ATTN_EXT` tiled/GQA/MLA fallback paths (pointer lists + H2D memcpy during recording)
+   - Success criterion: those ops can run under graph replay with no BCS page faults / `DEVICE_LOST`.
+
+2. **Split graph compatibility into finer-grained reasons (for measurement)**
+   - Add per-reason counters in `node_needs_immediate_mode()` (e.g. `reason=flash_attn_ptr_arrays`, `reason=gqa_ptr_arrays`, `reason=noncontig_temp`, `reason=mul_mat_id_dynamic_ids`).
+   - This makes it obvious which fallback dominates real models and prevents chasing low-impact fixes.
+   - Use `GGML_SYCL_OP_STATS=1` + a new graph-plan summary counter to report step counts by reason.
+
+3. **Replace the hard fragmentation cutoff with a cost model**
+   - Current `>100` steps guard is a good emergency brake, but too coarse.
+   - Next step: estimate cost = `N_graph_segments * graph_submit_overhead + N_boundaries * sync_cost + N_immediate_nodes * eager_cost`, and compare with pure eager.
+   - Even a rough heuristic (weighted by node types / bytes moved) is better than a fixed threshold.
+
+### Performance Work That Still Looks High-Value
+4. **Token generation gap: profile segmented graph overhead vs eager on B60**
+   - Measure with `onetrace` + ITT on `tg128` / `n=1` workloads and record:
+     - graph submit latency
+     - `stream()->wait()` boundary cost
+     - top immediate-mode ops by time
+   - Goal: confirm whether the regression is mostly segmentation/sync or kernel-level (`DMMV/MMVQ/dequantize`) cost.
+
+5. **Fused Flash Attention (`fattn_fused`) register-pressure reduction**
+   - Prior notes already point to accumulator/logit pressure; this remains likely high ROI for prompt throughput when XMX FA is unavailable.
+   - Try:
+     - smaller tiles (`BQ/BK`) per architecture
+     - partial reduction in registers (chunked softmax / split accumulators)
+     - subgroup-private + shared reduction variants
+   - Verify with `onetrace` and compiler spill indicators (if available via IGC dumps / asm).
+
+6. **XMX int8: focus on col_major A (not more prefetch tuning)**
+   - v5 showed col_major B mattered; prefetch did not.
+   - Next likely win is symmetric treatment for A tile layout (reduce scatter on `block_q8_0` loads), then accumulator-direct scale application to avoid SLM round-trip.
+
+### Suggested Experimental Plan (safe sequence)
+1. Keep `36388b86d` in place.
+2. Add graph fallback reason counters + plan summary logging.
+3. Implement persistent graph-owned pointer-table storage for one path first (`MUL_MAT` GQA), test replay stability.
+4. If stable, re-enable graph for that path only; benchmark `tg128`.
+5. Repeat for `FLASH_ATTN_EXT` tiled/GQA path.
+6. Replace `>100` fragmentation guard with heuristic after data is collected.
+
+### Open Question: `MUL_MAT_ID`
+- `MUL_MAT_ID` is still correctly treated as immediate for now (data-dependent expert routing / ids content changes).
+- If revisiting, treat it as a separate project: graph-safe execution likely needs a persistent indirection buffer strategy or explicit graph parameter updates, not just cache-key changes.
 
 ### Testing Strategy
 - **Fix 1 correctness**: Run `test-backend-ops -b SYCL0` with `GGML_SYCL_DISABLE_GRAPH=0` and verify all ops pass.

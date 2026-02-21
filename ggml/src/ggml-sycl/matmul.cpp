@@ -111,9 +111,11 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
     ggml_tensor_extra_gpu * src1_extra = (ggml_tensor_extra_gpu *) src1->extra;
 
     const bool src0_is_contiguous = ggml_is_contiguous(src0);
-    const bool src0_is_2d_contiguous = (src0->nb[0] == src0_ts && src0->nb[1] == (src0->ne[0] / ggml_blck_size(src0->type)) * src0_ts);
+    const bool src0_is_2d_contiguous =
+        (src0->nb[0] == src0_ts && src0->nb[1] == (src0->ne[0] / ggml_blck_size(src0->type)) * src0_ts);
     const bool src1_is_contiguous = ggml_is_contiguous(src1);
-    const bool src1_is_2d_contiguous = (src1->nb[0] == src1_ts && src1->nb[1] == (src1->ne[0] / ggml_blck_size(src1->type)) * src1_ts);
+    const bool src1_is_2d_contiguous =
+        (src1->nb[0] == src1_ts && src1->nb[1] == (src1->ne[0] / ggml_blck_size(src1->type)) * src1_ts);
 
     int64_t src1_padded_col_size = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 
@@ -282,17 +284,20 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                 } else {
                     src0_dd_i = dev[i].src0_dd + (i0 / i02_divisor) * (ne01 * ne00 * src0_ts) / src0_bs;
                 }
-                
+
                 float * src1_ddf_i;
                 if (src1->type == GGML_TYPE_F16) {
                     if (src1_is_2d_contiguous) {
-                        src1_ddf_i = (float *) ((char *) dev[i].src1_ddf + i03 * src1->nb[3] + i02 * src1->nb[2] + src1_col_0 * src1->nb[1]);
+                        src1_ddf_i = (float *) ((char *) dev[i].src1_ddf + i03 * src1->nb[3] + i02 * src1->nb[2] +
+                                                src1_col_0 * src1->nb[1]);
                     } else {
-                        src1_ddf_i = (float *) ((char *) dev[i].src1_ddf + (i0 * ne11 + src1_col_0) * ne10 * sizeof(sycl::half));
+                        src1_ddf_i =
+                            (float *) ((char *) dev[i].src1_ddf + (i0 * ne11 + src1_col_0) * ne10 * sizeof(sycl::half));
                     }
                 } else {
                     if (src1_is_2d_contiguous) {
-                        src1_ddf_i = dev[i].src1_ddf + (i03 * src1->nb[3] + i02 * src1->nb[2] + src1_col_0 * src1->nb[1]) / sizeof(float);
+                        src1_ddf_i = dev[i].src1_ddf +
+                                     (i03 * src1->nb[3] + i02 * src1->nb[2] + src1_col_0 * src1->nb[1]) / sizeof(float);
                     } else {
                         src1_ddf_i = dev[i].src1_ddf + (i0 * ne11 + src1_col_0) * ne10;
                     }
@@ -320,14 +325,19 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                             float * src1_ddf_i_source;
                             if (src1->type == GGML_TYPE_F16) {
                                 if (src1_is_2d_contiguous) {
-                                    src1_ddf_i_source = (float *) ((char *) src1_extra->data_device[ctx.device] + i03 * src1->nb[3] + i02 * src1->nb[2] + src1_col_0 * src1->nb[1]);
+                                    src1_ddf_i_source =
+                                        (float *) ((char *) src1_extra->data_device[ctx.device] + i03 * src1->nb[3] +
+                                                   i02 * src1->nb[2] + src1_col_0 * src1->nb[1]);
                                 } else {
-                                    src1_ddf_i_source = (float *) ((char *) src1_extra->data_device[ctx.device] +
-                                                                   (i0 * ne11 + src1_col_0) * ne10 * sizeof(sycl::half));
+                                    src1_ddf_i_source =
+                                        (float *) ((char *) src1_extra->data_device[ctx.device] +
+                                                   (i0 * ne11 + src1_col_0) * ne10 * sizeof(sycl::half));
                                 }
                             } else {
                                 if (src1_is_2d_contiguous) {
-                                    src1_ddf_i_source = (float *) ((char *) src1_extra->data_device[ctx.device] + i03 * src1->nb[3] + i02 * src1->nb[2] + src1_col_0 * src1->nb[1]);
+                                    src1_ddf_i_source =
+                                        (float *) ((char *) src1_extra->data_device[ctx.device] + i03 * src1->nb[3] +
+                                                   i02 * src1->nb[2] + src1_col_0 * src1->nb[1]);
                                 } else {
                                     src1_ddf_i_source = (float *) src1_extra->data_device[ctx.device];
                                     src1_ddf_i_source += (i0 * ne11 + src1_col_0) * ne10;
@@ -685,6 +695,43 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
 
+    if (ctx.graph_recording_active) {
+        const int ne23 = (int) (ne12 * ne13);
+
+        const void **                      persistent_ptrs_src = nullptr;
+        void **                            persistent_ptrs_dst = nullptr;
+        ggml_sycl_pool_alloc<const void *> ptrs_src_local;
+        ggml_sycl_pool_alloc<void *>       ptrs_dst_local;
+        if (ctx.graph_recording_active) {
+            persistent_ptrs_src = ctx.get_graph_batched_src_ptrs(2 * ne23);
+            persistent_ptrs_dst = ctx.get_graph_batched_dst_ptrs(1 * ne23);
+        } else {
+            ptrs_src_local.alloc(ctx.pool(), 2 * ne23);
+            ptrs_dst_local.alloc(ctx.pool(), 1 * ne23);
+            persistent_ptrs_src = ptrs_src_local.get();
+            persistent_ptrs_dst = ptrs_dst_local.get();
+        }
+
+        sycl::range<3> block_dims(1, ne12, ne13);
+        queue->submit([&](sycl::handler & cgh) {
+            const void ** ptrs_src_get = persistent_ptrs_src;
+            void **       ptrs_dst_get = persistent_ptrs_dst;
+            size_t        nb12_scaled  = src1->type == GGML_TYPE_F16 ? nb12 : s12 * sizeof(sycl::half);
+            size_t        nb13_scaled  = src1->type == GGML_TYPE_F16 ? nb13 : s13 * sizeof(sycl::half);
+            cgh.parallel_for(sycl::nd_range<3>(block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
+                k_compute_batched_ptrs(src0_f16, src1_f16, dst_ddf, ptrs_src_get, ptrs_dst_get, ne12, ne13, ne23, nb02,
+                                       nb03, nb12_scaled, nb13_scaled, nbd2, nbd3, r2, r3, item_ct1);
+            });
+        });
+
+        launch_gemm_f16_f32_tiled_batched_indirect<false>(
+            queue, (const sycl::half * const *) (persistent_ptrs_src + 1 * ne23),
+            (const sycl::half * const *) (persistent_ptrs_src + 0 * ne23),
+            (float * const *) (persistent_ptrs_dst + 0 * ne23), (int) ne11, (int) ne01, (int) ne10, alpha_f32, beta_f32,
+            ne23, (int) s11, (int) (nb01 / nb00), (int) ne0);
+        return;
+    }
+
 #if GGML_SYCL_DNNL
     if (!g_ggml_sycl_disable_dnn) {
         int64_t str_a0 = nb00 / type_size_src0;
@@ -784,14 +831,25 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
         } else {
             const int ne23 = ne12 * ne13;
 
-            ggml_sycl_pool_alloc<const void *>         ptrs_src(ctx.pool(), 2 * ne23);
-            ggml_sycl_pool_alloc<void *>               ptrs_dst(ctx.pool(), 1 * ne23);
+            const void **                      persistent_ptrs_src = nullptr;
+            void **                            persistent_ptrs_dst = nullptr;
+            ggml_sycl_pool_alloc<const void *> ptrs_src_local;
+            ggml_sycl_pool_alloc<void *>       ptrs_dst_local;
+            if (ctx.graph_recording_active) {
+                persistent_ptrs_src = ctx.get_graph_batched_src_ptrs(2 * ne23);
+                persistent_ptrs_dst = ctx.get_graph_batched_dst_ptrs(1 * ne23);
+            } else {
+                ptrs_src_local.alloc(ctx.pool(), 2 * ne23);
+                ptrs_dst_local.alloc(ctx.pool(), 1 * ne23);
+                persistent_ptrs_src = ptrs_src_local.get();
+                persistent_ptrs_dst = ptrs_dst_local.get();
+            }
             ggml_sycl_pool_alloc<matrix_info_t<float>> matrix_info(ctx.host_pool(), 1);
 
             sycl::range<3> block_dims(1, ne12, ne13);
             queue->submit([&](sycl::handler & cgh) {
-                const void ** ptrs_src_get = ptrs_src.get();
-                void **       ptrs_dst_get = ptrs_dst.get();
+                const void ** ptrs_src_get = persistent_ptrs_src;
+                void **       ptrs_dst_get = persistent_ptrs_dst;
                 size_t        nb12_scaled  = src1->type == GGML_TYPE_F16 ? nb12 : s12 * sizeof(sycl::half);
                 size_t        nb13_scaled  = src1->type == GGML_TYPE_F16 ? nb13 : s13 * sizeof(sycl::half);
                 cgh.parallel_for(sycl::nd_range<3>(block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
@@ -802,9 +860,10 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
 
             SYCL_CHECK(CHECK_TRY_ERROR(dpct::gemm_batch(
                 *queue, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans, ne01, ne11, ne10, alpha,
-                (const void **) (ptrs_src.get() + 0 * ne23), dpct::library_data_t::real_half, nb01 / nb00,
-                (const void **) (ptrs_src.get() + 1 * ne23), dpct::library_data_t::real_half, s11, beta,
-                (void **) (ptrs_dst.get() + 0 * ne23), mkl_data_type, ne0, ne23, mkl_compute_type, matrix_info.get())));
+                (const void **) (persistent_ptrs_src + 0 * ne23), dpct::library_data_t::real_half, nb01 / nb00,
+                (const void **) (persistent_ptrs_src + 1 * ne23), dpct::library_data_t::real_half, s11, beta,
+                (void **) (persistent_ptrs_dst + 0 * ne23), mkl_data_type, ne0, ne23, mkl_compute_type,
+                matrix_info.get())));
         }
     }
 } catch (const sycl::exception & exc) {
@@ -1158,7 +1217,8 @@ static void ggml_sycl_op_mul_mat_xmx(ggml_backend_sycl_context & ctx,
                src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_1 ||
                src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) {
         // XMX int8 path for quantized types (disable with GGML_SYCL_XMX_INT8=0)
-        static bool disable_xmx_int8 = (getenv("GGML_SYCL_XMX_INT8") && std::string(getenv("GGML_SYCL_XMX_INT8")) == "0");
+        static bool disable_xmx_int8 =
+            (getenv("GGML_SYCL_XMX_INT8") && std::string(getenv("GGML_SYCL_XMX_INT8")) == "0");
         if (!disable_xmx_int8 && has_int8_xmx_support(stream)) {
             ggml_sycl_op_mul_mat_q_xmx_int8(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low,
                                             row_high, src1_ncols, src1_padded_row_size, stream);
@@ -1266,14 +1326,23 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
 
         const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
 
+        const int64_t r3_graph = src1->ne[3] / src0->ne[3];
+        if (!split && src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) &&
+            !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1 && src1->ne[3] == 1 && r3_graph == 1) {
+            GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT BATCHED_F16 [graph] ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0],
+                            dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
+            ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
+            return;
+        }
+
         // F16 permuted/non-contiguous single-batch paths use custom kernels (graph-safe)
         if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) &&
             src1->ne[1] == 1 && src0->ne[3] == 1 && src1->ne[3] == 1) {
             ggml_sycl_mul_mat_vec_p021(ctx, src0, src1, dst);
             return;
         }
-        if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) &&
-            !ggml_is_transposed(src1) && src1->ne[1] == 1 && src1->ne[3] == 1) {
+        if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) &&
+            src1->ne[1] == 1 && src1->ne[3] == 1) {
             ggml_sycl_mul_mat_vec_nc(ctx, src0, src1, dst);
             return;
         }
@@ -1288,27 +1357,27 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         use_mul_mat_q_g = use_mul_mat_q_g && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
 #endif
         constexpr int64_t MMQ_MIN_NROWS_G = 128;
-        use_mul_mat_q_g = use_mul_mat_q_g && (src0->ne[1] >= MMQ_MIN_NROWS_G);
-        use_mul_mat_q_g = use_mul_mat_q_g && (src1->ne[1] >= MMQ_MIN_NROWS_G);
+        use_mul_mat_q_g                   = use_mul_mat_q_g && (src0->ne[1] >= MMQ_MIN_NROWS_G);
+        use_mul_mat_q_g                   = use_mul_mat_q_g && (src1->ne[1] >= MMQ_MIN_NROWS_G);
         // Belt-and-suspenders: exclude Q5_0/Q8_0 from MMQ during graph recording
         // (they should already be segmented out, but guard against edge cases)
         use_mul_mat_q_g = use_mul_mat_q_g && (src0->type != GGML_TYPE_Q5_0) && (src0->type != GGML_TYPE_Q8_0);
 
         if (use_dequantize_mul_mat_vec_g) {
-            GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT DMMV [graph] ne=[%ld,%ld,%ld,%ld] type=%s\n",
-                    dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
+            GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT DMMV [graph] ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1],
+                            dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
             ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);
             return;
         }
         if (use_mul_mat_vec_q_g) {
-            GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT MMVQ [graph] ne=[%ld,%ld,%ld,%ld] type=%s\n",
-                    dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
+            GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT MMVQ [graph] ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1],
+                            dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
             return;
         }
         if (use_mul_mat_q_g) {
-            GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT MMQ [graph] ne=[%ld,%ld,%ld,%ld] type=%s\n",
-                    dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
+            GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT MMQ [graph] ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1],
+                            dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
             return;
         }
@@ -1330,8 +1399,8 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         }
 
         // Last resort: tiled GEMM (graph-compatible but slower)
-        GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT TILED [graph fallback] ne=[%ld,%ld,%ld,%ld] type=%s\n",
-                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
+        GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT TILED [graph fallback] ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0],
+                        dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
         GGML_SYCL_ITT_MUL_MAT_TILED(f32);
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_tiled);
         return;
@@ -1417,7 +1486,7 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::DMMV);
         GGML_SYCL_ITT_OP(dmmv);
         GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT DMMV ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
-                dst->ne[3], ggml_type_name(src0->type));
+                        dst->ne[3], ggml_type_name(src0->type));
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);
     } else if (use_mul_mat_vec_q) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
@@ -1425,18 +1494,18 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         if (extra && extra->optimized_feature.reorder) {
             GGML_SYCL_ITT_OP(mmvq_reorder);
             GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT MMVQ_REORDER ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1],
-                    dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
+                            dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
             ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         } else {
             GGML_SYCL_ITT_OP(mmvq);
             GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT MMVQ ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1],
-                    dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
+                            dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         }
     } else if (use_mul_mat_q) {
         GGML_SYCL_ITT_MUL_MAT_MMQ(quantized);
         GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT MMQ ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
-                dst->ne[3], ggml_type_name(src0->type));
+                        dst->ne[3], ggml_type_name(src0->type));
         ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
     } else {
         if (xmx_gemm_available(ctx.stream())) {
@@ -1445,10 +1514,10 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             bool is_quant =
                 (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 ||
                  src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_1 ||
-                 src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K ||
-                 src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K);
+                 src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q4_K ||
+                 src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K);
             GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT %s ne=[%ld,%ld,%ld,%ld] type=%s\n", is_quant ? "XMX_INT8" : "XMX",
-                    dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
+                            dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
             if (is_quant) {
                 ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_xmx);
             } else {
@@ -1457,7 +1526,7 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         } else {
             GGML_SYCL_ITT_MUL_MAT_MKL(f32);
             GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT MKL ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
-                    dst->ne[3], ggml_type_name(src0->type));
+                            dst->ne[3], ggml_type_name(src0->type));
             ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);
         }
     }
@@ -1770,36 +1839,37 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
         expert_stride = N_local * ggml_row_size(src0->type, K);
     }
 
-    // =========================================================================
-    // Direct-IDs FAST PATH: Single kernel, zero pack/unpack overhead.
-    // Reads ids tensor in-kernel, accesses src1 and dst directly via strides.
-    // Eliminates: count/scan/pack kernels + packed buffers + unpack kernel.
-    // =========================================================================
-    #define LAUNCH_DIRECT_IDS(launch_fn) do { \
-        launch_fn(stream,                     \
-                  (const char *) src1->data,  \
-                  (const char *) src0->data,  \
-                  (char *) dst->data,         \
-                  (const char *) ids->data,   \
-                  n_ids, n_batches,            \
-                  ids->nb[0], ids->nb[1],      \
-                  src1->ne[1], src1->nb[1], src1->nb[2], \
-                  dst->nb[1], dst->nb[2],      \
-                  expert_stride, N, K, N_local, row_low); \
-        return; \
+// =========================================================================
+// Direct-IDs FAST PATH: Single kernel, zero pack/unpack overhead.
+// Reads ids tensor in-kernel, accesses src1 and dst directly via strides.
+// Eliminates: count/scan/pack kernels + packed buffers + unpack kernel.
+// =========================================================================
+#define LAUNCH_DIRECT_IDS(launch_fn)                                                                            \
+    do {                                                                                                        \
+        launch_fn(stream, (const char *) src1->data, (const char *) src0->data, (char *) dst->data,             \
+                  (const char *) ids->data, n_ids, n_batches, ids->nb[0], ids->nb[1], src1->ne[1], src1->nb[1], \
+                  src1->nb[2], dst->nb[1], dst->nb[2], expert_stride, N, K, N_local, row_low);                  \
+        return;                                                                                                 \
     } while (0)
 
     switch (src0->type) {
-        case GGML_TYPE_Q8_0:  LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_q8_0);
-        case GGML_TYPE_Q4_K:  LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_q4_K);
-        case GGML_TYPE_Q5_K:  LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_q5_K);
-        case GGML_TYPE_Q6_K:  LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_q6_K);
-        case GGML_TYPE_MXFP4: LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_mxfp4);
-        case GGML_TYPE_BF16:  LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_bf16);
-        default: break;  // Fall through to generic path
+        case GGML_TYPE_Q8_0:
+            LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_q8_0);
+        case GGML_TYPE_Q4_K:
+            LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_q4_K);
+        case GGML_TYPE_Q5_K:
+            LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_q5_K);
+        case GGML_TYPE_Q6_K:
+            LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_q6_K);
+        case GGML_TYPE_MXFP4:
+            LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_mxfp4);
+        case GGML_TYPE_BF16:
+            LAUNCH_DIRECT_IDS(launch_gemm_direct_ids_bf16);
+        default:
+            break;  // Fall through to generic path
     }
 
-    #undef LAUNCH_DIRECT_IDS
+#undef LAUNCH_DIRECT_IDS
 
     // =========================================================================
     // Generic path: count/scan/pack → GEMM → unpack (all other types)
@@ -1887,81 +1957,79 @@ static void ggml_sycl_mul_mat_id_tiled(ggml_backend_sycl_context & ctx, ggml_ten
     const bool use_xmx_indirect = xmx_gemm_available(stream);
 
     {
-    for (int i = 0; i < n_experts; ++i) {
-        if (src0->type == GGML_TYPE_F16) {
-            const sycl::half * weights = (const sycl::half *) ((const char *) src0_base + i * expert_stride);
-            if (use_xmx_indirect) {
-                launch_gemm_xmx_indirect_f32_f16(stream, src1_packed_f32, weights, dst_packed,
-                                                 dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
-                                                 total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+        for (int i = 0; i < n_experts; ++i) {
+            if (src0->type == GGML_TYPE_F16) {
+                const sycl::half * weights = (const sycl::half *) ((const char *) src0_base + i * expert_stride);
+                if (use_xmx_indirect) {
+                    launch_gemm_xmx_indirect_f32_f16(stream, src1_packed_f32, weights, dst_packed,
+                                                     dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                                     total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+                } else {
+                    launch_gemm_tiled_indirect_f32_f16(stream, src1_packed_f32, weights, dst_packed,
+                                                       dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                                       total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+                }
+            } else if (src0->type == GGML_TYPE_BF16) {
+                const sycl::ext::oneapi::bfloat16 * weights =
+                    (const sycl::ext::oneapi::bfloat16 *) ((const char *) src0_base + i * expert_stride);
+                if (use_xmx_indirect) {
+                    launch_gemm_xmx_indirect_f32_bf16(stream, src1_packed_f32, weights, dst_packed,
+                                                      dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                                      total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+                } else {
+                    launch_gemm_tiled_indirect_f32_bf16(stream, src1_packed_f32, weights, dst_packed,
+                                                        dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                                        total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+                }
+            } else if (src0->type == GGML_TYPE_MXFP4) {
+                const block_mxfp4 * weights = (const block_mxfp4 *) ((const char *) src0_base + i * expert_stride);
+                launch_gemm_tiled_indirect_mxfp4_f16(stream, src1_packed_f16, weights, dst_packed,
+                                                     dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
+                                                     total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+            } else if (src0->type == GGML_TYPE_Q4_0) {
+                const block_q4_0 * weights = (const block_q4_0 *) ((const char *) src0_base + i * expert_stride);
+                launch_gemm_tiled_indirect_q4_0(stream, src1_packed_f32, weights, dst_packed,
+                                                dev_expert_counts.get() + i, dev_expert_offsets.get() + i, total_rows,
+                                                N_local, K, 1.0f, 0.0f, K, K, N_local);
+            } else if (src0->type == GGML_TYPE_Q2_K) {
+                const block_q2_K * weights = (const block_q2_K *) ((const char *) src0_base + i * expert_stride);
+                launch_gemm_tiled_indirect_q2_K(stream, src1_packed_f32, weights, dst_packed,
+                                                dev_expert_counts.get() + i, dev_expert_offsets.get() + i, total_rows,
+                                                N_local, K, 1.0f, 0.0f, K, K, N_local);
+            } else if (src0->type == GGML_TYPE_Q3_K) {
+                const block_q3_K * weights = (const block_q3_K *) ((const char *) src0_base + i * expert_stride);
+                launch_gemm_tiled_indirect_q3_K(stream, src1_packed_f32, weights, dst_packed,
+                                                dev_expert_counts.get() + i, dev_expert_offsets.get() + i, total_rows,
+                                                N_local, K, 1.0f, 0.0f, K, K, N_local);
+            } else if (src0->type == GGML_TYPE_Q4_K) {
+                const block_q4_K * weights = (const block_q4_K *) ((const char *) src0_base + i * expert_stride);
+                launch_gemm_tiled_indirect_q4_K(stream, src1_packed_f32, weights, dst_packed,
+                                                dev_expert_counts.get() + i, dev_expert_offsets.get() + i, total_rows,
+                                                N_local, K, 1.0f, 0.0f, K, K, N_local);
+            } else if (src0->type == GGML_TYPE_Q5_K) {
+                const block_q5_K * weights = (const block_q5_K *) ((const char *) src0_base + i * expert_stride);
+                launch_gemm_tiled_indirect_q5_K(stream, src1_packed_f32, weights, dst_packed,
+                                                dev_expert_counts.get() + i, dev_expert_offsets.get() + i, total_rows,
+                                                N_local, K, 1.0f, 0.0f, K, K, N_local);
+            } else if (src0->type == GGML_TYPE_Q6_K) {
+                const block_q6_K * weights = (const block_q6_K *) ((const char *) src0_base + i * expert_stride);
+                launch_gemm_tiled_indirect_q6_K(stream, src1_packed_f32, weights, dst_packed,
+                                                dev_expert_counts.get() + i, dev_expert_offsets.get() + i, total_rows,
+                                                N_local, K, 1.0f, 0.0f, K, K, N_local);
             } else {
-                launch_gemm_tiled_indirect_f32_f16(stream, src1_packed_f32, weights, dst_packed,
-                                                   dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
-                                                   total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
-            }
-        } else if (src0->type == GGML_TYPE_BF16) {
-            const sycl::ext::oneapi::bfloat16 * weights =
-                (const sycl::ext::oneapi::bfloat16 *) ((const char *) src0_base + i * expert_stride);
-            if (use_xmx_indirect) {
-                launch_gemm_xmx_indirect_f32_bf16(stream, src1_packed_f32, weights, dst_packed,
-                                                  dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
-                                                  total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
-            } else {
-                launch_gemm_tiled_indirect_f32_bf16(stream, src1_packed_f32, weights, dst_packed,
-                                                    dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
-                                                    total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
-            }
-        } else if (src0->type == GGML_TYPE_MXFP4) {
-            const block_mxfp4 * weights = (const block_mxfp4 *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_mxfp4_f16(stream, src1_packed_f16, weights, dst_packed,
-                                                 dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
-                                                 total_rows,
-                                                 N_local, K, 1.0f, 0.0f, K, K, N_local);
-        } else if (src0->type == GGML_TYPE_Q4_0) {
-            const block_q4_0 * weights = (const block_q4_0 *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_q4_0(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
-                                            dev_expert_offsets.get() + i,
-                                            total_rows,
-                                            N_local, K, 1.0f, 0.0f, K, K, N_local);
-        } else if (src0->type == GGML_TYPE_Q2_K) {
-            const block_q2_K * weights = (const block_q2_K *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_q2_K(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
-                                            dev_expert_offsets.get() + i, total_rows, N_local, K, 1.0f, 0.0f, K, K,
-                                            N_local);
-        } else if (src0->type == GGML_TYPE_Q3_K) {
-            const block_q3_K * weights = (const block_q3_K *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_q3_K(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
-                                            dev_expert_offsets.get() + i, total_rows, N_local, K, 1.0f, 0.0f, K, K,
-                                            N_local);
-        } else if (src0->type == GGML_TYPE_Q4_K) {
-            const block_q4_K * weights = (const block_q4_K *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_q4_K(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
-                                            dev_expert_offsets.get() + i, total_rows, N_local, K, 1.0f, 0.0f, K, K,
-                                            N_local);
-        } else if (src0->type == GGML_TYPE_Q5_K) {
-            const block_q5_K * weights = (const block_q5_K *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_q5_K(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
-                                            dev_expert_offsets.get() + i, total_rows, N_local, K, 1.0f, 0.0f, K, K,
-                                            N_local);
-        } else if (src0->type == GGML_TYPE_Q6_K) {
-            const block_q6_K * weights = (const block_q6_K *) ((const char *) src0_base + i * expert_stride);
-            launch_gemm_tiled_indirect_q6_K(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
-                                            dev_expert_offsets.get() + i, total_rows, N_local, K, 1.0f, 0.0f, K, K,
-                                            N_local);
-        } else {
-            const float * weights = (const float *) ((const char *) src0_base + i * expert_stride);
-            if (use_xmx_indirect) {
-                launch_gemm_xmx_indirect(stream, src1_packed_f32, weights, dst_packed,
-                                         dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
-                                         total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
-            } else {
-                launch_gemm_tiled_indirect(stream, src1_packed_f32, weights, dst_packed,
-                                           dev_expert_counts.get() + i, dev_expert_offsets.get() + i,
-                                           total_rows, N_local, K, 1.0f, 0.0f, K, K, N_local);
+                const float * weights = (const float *) ((const char *) src0_base + i * expert_stride);
+                if (use_xmx_indirect) {
+                    launch_gemm_xmx_indirect(stream, src1_packed_f32, weights, dst_packed, dev_expert_counts.get() + i,
+                                             dev_expert_offsets.get() + i, total_rows, N_local, K, 1.0f, 0.0f, K, K,
+                                             N_local);
+                } else {
+                    launch_gemm_tiled_indirect(stream, src1_packed_f32, weights, dst_packed,
+                                               dev_expert_counts.get() + i, dev_expert_offsets.get() + i, total_rows,
+                                               N_local, K, 1.0f, 0.0f, K, K, N_local);
+                }
             }
         }
-    }
-    } // per-expert loop
+    }  // per-expert loop
 
     stream->submit([&](sycl::handler & cgh) {
         char *             dst_data    = (char *) dst->data;
@@ -1991,18 +2059,18 @@ void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) tr
     // MUL_MAT_ID SPIR-V module (same kernels work fine in the MUL_MAT path).
     // Set GGML_SYCL_MUL_MAT_ID_XMX=1 to force MMQ path (requires patched IGC to avoid crashes).
     static const bool enable_mmq = getenv("GGML_SYCL_MUL_MAT_ID_XMX") != nullptr;
-    const bool use_tiled =
+    const bool        use_tiled =
         !enable_mmq && (ctx.force_graph_compatible || ggml_sycl_info().devices[ctx.device].arch == SYCL_ARCH_INTEL_XE2);
     if (use_tiled) {
         GGML_SYCL_ITT_MUL_MAT_ID_TILED(moe);
         GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT_ID TILED ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1],
-                dst->ne[2], dst->ne[3], ggml_type_name(dst->src[0]->type));
+                        dst->ne[2], dst->ne[3], ggml_type_name(dst->src[0]->type));
         ggml_sycl_mul_mat_id_tiled(ctx, dst);
         return;
     }
     GGML_SYCL_ITT_MUL_MAT_ID_MMQ(moe);
     GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT_ID MMQ ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0], dst->ne[1], dst->ne[2],
-            dst->ne[3], ggml_type_name(dst->src[0]->type));
+                    dst->ne[3], ggml_type_name(dst->src[0]->type));
 
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
     const ggml_tensor *  src0 = dst->src[0];

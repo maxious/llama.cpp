@@ -305,6 +305,7 @@ struct ggml_backend_sycl_context {
     std::string      name;
     optimize_feature opt_feature;
     bool             force_graph_compatible = false;
+    bool             graph_recording_active = false;
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
@@ -392,6 +393,12 @@ struct ggml_backend_sycl_context {
     // Flash Attention buffer pool - preallocated to avoid malloc/free overhead per call
     std::unique_ptr<flash_attn_buffers> fattn_buffers;
 
+    // Persistent graph-owned pointer tables for batched/GQA MUL_MAT paths.
+    // Keyed by element count to reuse across graph recording/replay and avoid
+    // stale RAII pool allocations captured in SYCL graphs.
+    std::map<size_t, std::unique_ptr<ggml_sycl_pool_alloc<const void *>>> graph_ptrs_src_cache;
+    std::map<size_t, std::unique_ptr<ggml_sycl_pool_alloc<void *>>>       graph_ptrs_dst_cache;
+
     std::unique_ptr<ggml_sycl_pool> host_pools[GGML_SYCL_MAX_DEVICES];
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device);
@@ -476,6 +483,22 @@ struct ggml_backend_sycl_context {
 
     ggml_sycl_pool & host_pool() { return host_pool(device); }
 
+    const void ** get_graph_batched_src_ptrs(size_t count) {
+        auto & slot = graph_ptrs_src_cache[count];
+        if (!slot) {
+            slot = std::make_unique<ggml_sycl_pool_alloc<const void *>>(pool(), count);
+        }
+        return slot->get();
+    }
+
+    void ** get_graph_batched_dst_ptrs(size_t count) {
+        auto & slot = graph_ptrs_dst_cache[count];
+        if (!slot) {
+            slot = std::make_unique<ggml_sycl_pool_alloc<void *>>(pool(), count);
+        }
+        return slot->get();
+    }
+
     bool enable_op_stats  = false;
     bool enable_op_timing = false;
 
@@ -487,6 +510,25 @@ struct ggml_backend_sycl_context {
     };
 
     std::map<std::string, op_stat_entry> op_stats;
+
+#ifdef GGML_SYCL_GRAPH
+    std::map<std::string, uint64_t> graph_fallback_reason_counts;
+    std::map<std::string, uint64_t> graph_plan_counts;
+
+    void record_graph_fallback_reason(const std::string & reason) {
+        if (!enable_op_stats) {
+            return;
+        }
+        graph_fallback_reason_counts[reason]++;
+    }
+
+    void record_graph_plan_stat(const std::string & key, uint64_t value = 1) {
+        if (!enable_op_stats) {
+            return;
+        }
+        graph_plan_counts[key] += value;
+    }
+#endif
 
     void record_op_stat(const std::string & key, double duration_ms) {
         if (!enable_op_stats) {
@@ -516,6 +558,20 @@ struct ggml_backend_sycl_context {
         });
 
         std::fprintf(stderr, "\n[SYCL OP STATS]%s\n", enable_op_timing ? " (timing)" : "");
+#ifdef GGML_SYCL_GRAPH
+        if (!graph_fallback_reason_counts.empty()) {
+            std::fprintf(stderr, "[SYCL GRAPH FALLBACK REASONS]\n");
+            for (const auto & kv : graph_fallback_reason_counts) {
+                std::fprintf(stderr, "%s: count=%" PRIu64 "\n", kv.first.c_str(), kv.second);
+            }
+        }
+        if (!graph_plan_counts.empty()) {
+            std::fprintf(stderr, "[SYCL GRAPH PLAN STATS]\n");
+            for (const auto & kv : graph_plan_counts) {
+                std::fprintf(stderr, "%s: count=%" PRIu64 "\n", kv.first.c_str(), kv.second);
+            }
+        }
+#endif
         for (const auto & item : entries) {
             const auto & entry = item.second;
             if (enable_op_timing && entry.count > 0) {
