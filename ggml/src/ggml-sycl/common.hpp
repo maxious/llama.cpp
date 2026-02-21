@@ -441,6 +441,10 @@ struct ggml_backend_sycl_context {
 
     std::map<uint64_t, segment_cache_entry> segmented_graph_cache;
 
+    // Topologies that repeatedly fall back to eager due to fragmented plans.
+    // Value is the number of observed fragmented-plan fallbacks for this topology.
+    std::map<uint64_t, uint32_t> fragmented_graph_topologies;
+
     // Dedicated graph execution queue with no_immediate_command_list property.
     // Intel discrete GPUs require this for efficient ext_oneapi_graph() submission.
     queue_ptr   graph_queue = nullptr;

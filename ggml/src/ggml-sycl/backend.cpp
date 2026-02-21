@@ -619,6 +619,68 @@ static bool ggml_sycl_graph_test_allow_flash_attn() {
     return cached == 1;
 }
 
+static int64_t ggml_sycl_mmq_min_nrows_graph_guard() {
+    static int64_t cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    cached           = 128;
+    const char * env = getenv("GGML_SYCL_MMQ_MIN_NROWS");
+    if (env && env[0] != '\0') {
+        char * end = nullptr;
+        long   v   = strtol(env, &end, 10);
+        if (end != env && end && *end == '\0' && v > 0) {
+            cached = (int64_t) v;
+        }
+    }
+    return cached;
+}
+
+static bool ggml_sycl_xmx_int8_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * env = getenv("GGML_SYCL_XMX_INT8");
+        cached           = (env && strcmp(env, "0") == 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+static bool ggml_sycl_xmx_int8_quant_type_supported(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_1:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool ggml_sycl_mul_mat_graph_can_use_xmx_int8(ggml_backend_sycl_context & ctx,
+                                                     const ggml_tensor *         src0,
+                                                     const ggml_tensor *         src1,
+                                                     const ggml_tensor *         dst) {
+    if (!ggml_sycl_xmx_int8_enabled()) {
+        return false;
+    }
+    if (!xmx_gemm_available(ctx.stream())) {
+        return false;
+    }
+    if (!ggml_sycl_xmx_int8_quant_type_supported(src0->type)) {
+        return false;
+    }
+    if (src0->ne[1] < ggml_sycl_mmq_min_nrows_graph_guard()) {
+        return false;
+    }
+    return src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+}
+
 enum class graph_immediate_reason {
     NONE,
     MUL_MAT_ID_DYNAMIC_IDS,
@@ -685,11 +747,6 @@ static graph_immediate_reason node_immediate_mode_reason(ggml_backend_sycl_conte
         // Cast away const for compatibility check functions that take non-const dst
         // (they don't actually modify it, just inspect dimensions/types)
         ggml_tensor *       dst  = const_cast<ggml_tensor *>(node);
-
-        // Q5_0 and Q8_0 MMQ types cause GPU faults under SYCL graphs
-        if (src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q8_0) {
-            return graph_immediate_reason::MUL_MAT_Q5Q8_GRAPH_FAULT;
-        }
 
         const bool split = src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer);
 
@@ -771,11 +828,14 @@ static graph_immediate_reason node_immediate_mode_reason(ggml_backend_sycl_conte
 #    ifdef SYCL_USE_XMX
         use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
 #    endif
-        constexpr int64_t MMQ_MIN_NROWS = 128;
-        use_mul_mat_q                   = use_mul_mat_q && (src0->ne[1] >= MMQ_MIN_NROWS);
-        use_mul_mat_q                   = use_mul_mat_q && (src1->ne[1] >= MMQ_MIN_NROWS);
+        const int64_t mmq_min_nrows = ggml_sycl_mmq_min_nrows_graph_guard();
+        use_mul_mat_q               = use_mul_mat_q && (src0->ne[1] >= mmq_min_nrows);
+        use_mul_mat_q               = use_mul_mat_q && (src1->ne[1] >= mmq_min_nrows);
 
-        if (use_dequantize_mul_mat_vec || use_mul_mat_vec_q || use_mul_mat_q) {
+        const bool q5_q8_mmq_graph_fault =
+            use_mul_mat_q && (src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q8_0);
+
+        if (use_dequantize_mul_mat_vec || use_mul_mat_vec_q || (use_mul_mat_q && !q5_q8_mmq_graph_fault)) {
             return graph_immediate_reason::NONE;  // These paths are graph-compatible
         }
 
@@ -783,11 +843,15 @@ static graph_immediate_reason node_immediate_mode_reason(ggml_backend_sycl_conte
         if (xmx_gemm_available(ctx.stream())) {
             if ((src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) ||
                 (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 &&
-                 (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16))) {
+                 (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16)) ||
+                ggml_sycl_mul_mat_graph_can_use_xmx_int8(ctx, src0, src1, dst)) {
                 return graph_immediate_reason::NONE;  // XMX is graph-compatible
             }
         }
 #    endif
+        if (q5_q8_mmq_graph_fault) {
+            return graph_immediate_reason::MUL_MAT_Q5Q8_GRAPH_FAULT;
+        }
 
         // Tiled GEMM fallback for F16/BF16/MXFP4 × F32 pool-allocates a type-converted
         // temporary for src1. That RAII allocation is freed after the op returns, making
@@ -1365,6 +1429,17 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             return GGML_STATUS_SUCCESS;
         }
 
+        const uint64_t topology_hash = compute_cgraph_hash(cgraph);
+        auto           frag_it       = sycl_ctx->fragmented_graph_topologies.find(topology_hash);
+        if (frag_it != sycl_ctx->fragmented_graph_topologies.end() && frag_it->second >= 2) {
+            sycl_ctx->record_graph_fallback_reason("plan_fragmented_cached_topology");
+            sycl_ctx->record_graph_plan_stat("plan_fragmented_cached_fallbacks");
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] Cached fragmented topology 0x%016llx (count=%u), eager fallback\n",
+                            (unsigned long long) topology_hash, (unsigned) frag_it->second);
+            ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+            return GGML_STATUS_SUCCESS;
+        }
+
         // Build execution plan: partition nodes into graph segments and immediate-mode nodes
         auto plan = build_graph_exec_plan(*sycl_ctx, cgraph);
 
@@ -1399,20 +1474,78 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
 
         // Fragmentation guard: if the plan is highly fragmented, the overhead of
         // recording/finalizing/synchronizing many tiny graph segments exceeds the
-        // benefit. Fall back to eager execution.
-        constexpr int MAX_GRAPH_STEPS = 100;
-        if ((int) plan.size() > MAX_GRAPH_STEPS) {
+        // benefit. Threshold adapts downward when historical segmented boundary waits are high.
+        int    max_graph_steps           = 100;
+        double hist_avg_boundary_wait_us = 0.0;
+        {
+            uint64_t boundary_wait_us = 0;
+            auto     add_timing       = [&](const char * key) {
+                auto it = sycl_ctx->graph_plan_timing_us.find(key);
+                if (it != sycl_ctx->graph_plan_timing_us.end()) {
+                    boundary_wait_us += it->second;
+                }
+            };
+            add_timing("seg_pure_pre_graph_wait_us");
+            add_timing("seg_pure_graph_wait_us");
+            add_timing("seg_record_initial_wait_us");
+            add_timing("seg_record_graph_wait_us");
+            add_timing("seg_record_immediate_wait_us");
+
+            uint64_t prior_boundaries = 0;
+            auto     c1               = sycl_ctx->graph_plan_counts.find("plan_graph_segments_total");
+            auto     c2               = sycl_ctx->graph_plan_counts.find("plan_immediate_steps_total");
+            if (c1 != sycl_ctx->graph_plan_counts.end()) {
+                prior_boundaries += c1->second;
+            }
+            if (c2 != sycl_ctx->graph_plan_counts.end()) {
+                prior_boundaries += c2->second;
+            }
+
+            if (prior_boundaries > 0) {
+                hist_avg_boundary_wait_us = (double) boundary_wait_us / (double) prior_boundaries;
+                if (hist_avg_boundary_wait_us > 250.0) {
+                    max_graph_steps = 48;
+                } else if (hist_avg_boundary_wait_us > 100.0) {
+                    max_graph_steps = 64;
+                }
+            }
+            if (n_immediate_steps > n_graph_segments && plan.size() > 64) {
+                max_graph_steps = std::min(max_graph_steps, 64);
+            }
+            if (n_immediate_steps > 0 && n_graph_segments > 0 && plan.size() > 48) {
+                double immediate_ratio = (double) n_immediate_steps / (double) plan.size();
+                if (immediate_ratio >= 0.40) {
+                    max_graph_steps = std::min(max_graph_steps, 48);
+                }
+            }
+        }
+        sycl_ctx->record_graph_plan_stat("plan_dynamic_max_steps_total", (uint64_t) max_graph_steps);
+        if ((int) plan.size() > max_graph_steps) {
             sycl_ctx->record_graph_fallback_reason("plan_fragmented_too_many_steps");
             sycl_ctx->record_graph_plan_stat("plan_fragmented_fallbacks");
+            sycl_ctx->fragmented_graph_topologies[topology_hash]++;
             GGML_SYCL_DEBUG("[SYCL-GRAPH] Plan too fragmented (%zu steps > %d), falling back to eager\n", plan.size(),
-                            MAX_GRAPH_STEPS);
+                            max_graph_steps);
+            ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+            return GGML_STATUS_SUCCESS;
+        }
+
+        const int total_boundaries = n_graph_segments + n_immediate_steps;
+        if (has_immediate_nodes && cgraph->n_nodes > 400 && n_graph_segments >= 12 && n_immediate_steps >= 12 &&
+            (hist_avg_boundary_wait_us > 200.0 || total_boundaries >= 32)) {
+            sycl_ctx->record_graph_fallback_reason("plan_boundary_cost_high");
+            sycl_ctx->record_graph_plan_stat("plan_boundary_cost_fallbacks");
+            sycl_ctx->fragmented_graph_topologies[topology_hash]++;
+            GGML_SYCL_DEBUG(
+                "[SYCL-GRAPH] High boundary cost (segments=%d immediate=%d avg_wait_us=%.1f), eager fallback\n",
+                n_graph_segments, n_immediate_steps, hist_avg_boundary_wait_us);
             ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
             return GGML_STATUS_SUCCESS;
         }
 
         if (!has_immediate_nodes) {
             // ===== FAST PATH: No immediate nodes, use monolithic three-tier cache =====
-            const uint64_t graph_hash   = compute_cgraph_hash(cgraph);
+            const uint64_t graph_hash   = topology_hash;
             const uint64_t pointer_hash = compute_cgraph_pointer_hash(cgraph);
             GGML_SYCL_DEBUG("[SYCL-GRAPH] Monolithic path hash: 0x%016llx, ptr: 0x%016llx\n",
                             (unsigned long long) graph_hash, (unsigned long long) pointer_hash);
@@ -1491,7 +1624,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             // ===== SEGMENTED PATH: Interleave graph segments with immediate-mode nodes =====
             // This enables graphs even when some nodes (e.g., Q8_0, oneMKL GEMM) can't be recorded.
             // Graph segments are cached per-topology; immediate nodes are always executed eagerly.
-            const uint64_t graph_hash   = compute_cgraph_hash(cgraph);
+            const uint64_t graph_hash   = topology_hash;
             const uint64_t pointer_hash = compute_cgraph_pointer_hash(cgraph);
             GGML_SYCL_DEBUG("[SYCL-GRAPH-SEG] Segmented path hash: 0x%016llx, ptr: 0x%016llx\n",
                             (unsigned long long) graph_hash, (unsigned long long) pointer_hash);

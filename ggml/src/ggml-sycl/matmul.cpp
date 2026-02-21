@@ -1176,6 +1176,65 @@ bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, g
            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 }
 
+static int64_t ggml_sycl_mmq_min_nrows() {
+    static int64_t cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    cached           = 128;
+    const char * env = getenv("GGML_SYCL_MMQ_MIN_NROWS");
+    if (env && env[0] != '\0') {
+        char * end = nullptr;
+        long   v   = strtol(env, &end, 10);
+        if (end != env && end && *end == '\0' && v > 0) {
+            cached = (int64_t) v;
+        }
+    }
+    return cached;
+}
+
+static bool ggml_sycl_xmx_int8_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * env = getenv("GGML_SYCL_XMX_INT8");
+        cached           = (env && std::string(env) == "0") ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+static bool ggml_sycl_xmx_int8_quant_type_supported(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_1:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool ggml_sycl_can_use_xmx_int8_quant(ggml_backend_sycl_context & ctx,
+                                             const ggml_tensor *         src0,
+                                             const ggml_tensor *         src1,
+                                             const ggml_tensor *         dst) {
+    if (!ggml_sycl_xmx_int8_enabled() || !xmx_gemm_available(ctx.stream()) || !has_int8_xmx_support(ctx.stream())) {
+        return false;
+    }
+    if (!ggml_sycl_xmx_int8_quant_type_supported(src0->type)) {
+        return false;
+    }
+    if (src0->ne[1] < ggml_sycl_mmq_min_nrows()) {
+        return false;
+    }
+    return src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+}
+
 // Wrapper for XMX GEMM to match ggml_sycl_op_mul_mat_t signature
 static void ggml_sycl_op_mul_mat_xmx(ggml_backend_sycl_context & ctx,
                                      const ggml_tensor *         src0,
@@ -1321,8 +1380,7 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         // Graph-safe dispatch: use the same fast kernel paths as normal dispatch
         // (DMMV, MMVQ, MMQ, XMX) but never fall through to oneMKL (graph-incompatible).
         // Reordering is already disabled by should_reorder_tensor() checking force_graph_compatible.
-        // Q5_0/Q8_0 nodes are handled by segmented execution (node_needs_immediate_mode) and
-        // won't reach here during graph recording.
+        // Q5_0/Q8_0 MMQ is excluded under graphs, but quantized XMX int8 can be used here.
 
         const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
 
@@ -1356,11 +1414,10 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
 #ifdef SYCL_USE_XMX
         use_mul_mat_q_g = use_mul_mat_q_g && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
 #endif
-        constexpr int64_t MMQ_MIN_NROWS_G = 128;
-        use_mul_mat_q_g                   = use_mul_mat_q_g && (src0->ne[1] >= MMQ_MIN_NROWS_G);
-        use_mul_mat_q_g                   = use_mul_mat_q_g && (src1->ne[1] >= MMQ_MIN_NROWS_G);
-        // Belt-and-suspenders: exclude Q5_0/Q8_0 from MMQ during graph recording
-        // (they should already be segmented out, but guard against edge cases)
+        const int64_t mmq_min_nrows_g = ggml_sycl_mmq_min_nrows();
+        use_mul_mat_q_g               = use_mul_mat_q_g && (src0->ne[1] >= mmq_min_nrows_g);
+        use_mul_mat_q_g               = use_mul_mat_q_g && (src1->ne[1] >= mmq_min_nrows_g);
+        // Q5_0/Q8_0 MMQ can fault under graphs on Xe2; allow these types to reach XMX int8 instead.
         use_mul_mat_q_g = use_mul_mat_q_g && (src0->type != GGML_TYPE_Q5_0) && (src0->type != GGML_TYPE_Q8_0);
 
         if (use_dequantize_mul_mat_vec_g) {
@@ -1385,15 +1442,25 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         // XMX path (F32/F16/quantized via int8)
         if (xmx_gemm_available(ctx.stream())) {
             bool xmx_types = false;
+            bool xmx_quant = false;
             if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
                 xmx_types = true;
             } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16) {
                 xmx_types = true;
+            } else if (ggml_sycl_can_use_xmx_int8_quant(ctx, src0, src1, dst)) {
+                xmx_types = true;
+                xmx_quant = true;
             }
 
             if (xmx_types) {
                 GGML_SYCL_ITT_MUL_MAT_XMX(f32);
-                ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_xmx);
+                if (xmx_quant) {
+                    GGML_SYCL_DEBUG("ggml_sycl: MUL_MAT XMX_INT8 [graph] ne=[%ld,%ld,%ld,%ld] type=%s\n", dst->ne[0],
+                                    dst->ne[1], dst->ne[2], dst->ne[3], ggml_type_name(src0->type));
+                    ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_xmx);
+                } else {
+                    ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_xmx);
+                }
                 return;
             }
         }
@@ -1448,9 +1515,9 @@ void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     // is too small. The MMQ_Y tile sizes range from 32-128, so we use 128 as the minimum.
     // Also guard against small ne11 (output rows) which causes need_check=true path issues.
     // See AGENTS.md for more details.
-    constexpr int64_t MMQ_MIN_NROWS = 128;
-    use_mul_mat_q                   = use_mul_mat_q && (src0->ne[1] >= MMQ_MIN_NROWS);
-    use_mul_mat_q                   = use_mul_mat_q && (src1->ne[1] >= MMQ_MIN_NROWS);
+    const int64_t mmq_min_nrows = ggml_sycl_mmq_min_nrows();
+    use_mul_mat_q               = use_mul_mat_q && (src0->ne[1] >= mmq_min_nrows);
+    use_mul_mat_q               = use_mul_mat_q && (src1->ne[1] >= mmq_min_nrows);
 
     // Dispatch becomes obscure with the reorder, MMVQ when the reorder optimization
     // is enabled takes precedence over DMMV, the current if-else implementation
