@@ -514,6 +514,7 @@ struct ggml_backend_sycl_context {
 #ifdef GGML_SYCL_GRAPH
     std::map<std::string, uint64_t> graph_fallback_reason_counts;
     std::map<std::string, uint64_t> graph_plan_counts;
+    std::map<std::string, uint64_t> graph_plan_timing_us;
 
     void record_graph_fallback_reason(const std::string & reason) {
         if (!enable_op_stats) {
@@ -527,6 +528,13 @@ struct ggml_backend_sycl_context {
             return;
         }
         graph_plan_counts[key] += value;
+    }
+
+    void record_graph_plan_timing_us(const std::string & key, uint64_t value) {
+        if (!enable_op_stats) {
+            return;
+        }
+        graph_plan_timing_us[key] += value;
     }
 #endif
 
@@ -569,6 +577,13 @@ struct ggml_backend_sycl_context {
             std::fprintf(stderr, "[SYCL GRAPH PLAN STATS]\n");
             for (const auto & kv : graph_plan_counts) {
                 std::fprintf(stderr, "%s: count=%" PRIu64 "\n", kv.first.c_str(), kv.second);
+            }
+        }
+        if (!graph_plan_timing_us.empty()) {
+            std::fprintf(stderr, "[SYCL GRAPH PLAN TIMING]\n");
+            for (const auto & kv : graph_plan_timing_us) {
+                std::fprintf(stderr, "%s: total_us=%" PRIu64 " total_ms=%.3f\n", kv.first.c_str(), kv.second,
+                             (double) kv.second / 1000.0);
             }
         }
 #endif

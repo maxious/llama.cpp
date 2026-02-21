@@ -697,3 +697,50 @@ if (r2 > 1 || r3 > 1) return true;  // Immediate mode required
 - Current graph implementation: `ggml/src/ggml-sycl/backend.cpp:595-1191`
 - Graph cache/context: `ggml/src/ggml-sycl/common.hpp:410-423`
 - Queue creation: `ggml/src/ggml-sycl/dpct/helper.hpp:786-810`
+
+## Dual B60 SYCL Backend Review Follow-Up (Feb 2026)
+
+### Backend structure map (hot paths)
+- **Graph orchestration / execution planning**: `ggml/src/ggml-sycl/backend.cpp` (graph compute, segmented graph replay, immediate-mode fallback, multi-device graph path), `ggml/src/ggml-sycl/common.hpp` (context/cache state).
+- **Device/arch setup**: `ggml/src/ggml-sycl/ggml-sycl.cpp` (runtime vendor/arch detection, Xe2 selection), `ggml/src/ggml-sycl/sycl_hw.*`.
+- **Matmul dispatch + quantized paths**: `ggml/src/ggml-sycl/matmul.cpp` (`ggml_sycl_mul_mat`, `MUL_MAT_ID`, graph-safe dispatch), `ggml/src/ggml-sycl/dmmv.cpp`, `ggml/src/ggml-sycl/mmvq.cpp`, `ggml/src/ggml-sycl/mmq*.cpp`, `ggml/src/ggml-sycl/mmq_internal.hpp`, `ggml/src/ggml-sycl/mmq_xmx_int8.cpp`, `ggml/src/ggml-sycl/gemm_tiled.hpp`, `ggml/src/ggml-sycl/gemm_xmx.hpp`.
+- **Flash attention**: `ggml/src/ggml-sycl/fattn.cpp` (dispatch/policy), `ggml/src/ggml-sycl/fattn_xmx*`, `ggml/src/ggml-sycl/fattn_fused.hpp`, `ggml/src/ggml-sycl/fattn_tiled.hpp`, `ggml/src/ggml-sycl/fattn_mkl.*`.
+- **Memory/scratch/instrumentation**: `ggml/src/ggml-sycl/pool.cpp`, `ggml/src/ggml-sycl/flash_attn_buffers.hpp`, `ggml/src/ggml-sycl/itt_annotations.hpp`.
+
+### Likely current bottlenecks (dual B60 and graph mode)
+1. **Segmented graph boundary overhead** in `ggml/src/ggml-sycl/backend.cpp` (repeated queue waits and graph/eager transitions) is a likely dominant token-generation regression source for `n=1`.
+2. **Ephemeral pool allocations captured during graph recording** (notably GQA/batched pointer arrays in `ggml/src/ggml-sycl/matmul.cpp`, FA fallback metadata paths via `ggml/src/ggml-sycl/fattn.cpp` + `flash_attn_buffers.hpp`) force immediate-mode fallback and fragment graphs.
+3. **`MMQ_MIN_NROWS=128` guard in `ggml/src/ggml-sycl/matmul.cpp`** disables MMQ on many small-row tg shapes, pushing quantized matmuls to less optimal paths.
+4. **XMX int8 quantized path still layout/SLM limited** in `ggml/src/ggml-sycl/mmq_xmx_int8.cpp` (AoS block unpack/scatter cost vs contiguous GEMM).
+5. **Fused FA register pressure / occupancy** in `ggml/src/ggml-sycl/fattn_fused.hpp` limits prompt throughput when XMX FA is unavailable.
+6. **Multi-device scheduling is too coarse** in `ggml/src/ggml-sycl/backend.cpp` (split-buffer node assignment + sequentialized sync points) and likely underlaps compute with P2P/BCS transfers.
+
+### Prioritized plan (dual B60 prompt + token generation)
+1. **Graph-safe persistent metadata/pointer tables (highest priority)**
+   - Add graph-owned persistent allocations keyed by graph topology/shape/device for GQA/batched GEMM and FA pointer/metadata tables.
+   - Goal: shrink immediate-mode nodes in `ggml/src/ggml-sycl/backend.cpp` plans and reduce segmentation overhead.
+2. **Dependency-aware multi-device scheduler for dual B60 prompt throughput**
+   - Replace coarse per-device sequencing in `ggml/src/ggml-sycl/backend.cpp` with event-driven per-device subgraph DAG execution and explicit inter-device dependencies.
+   - Preserve overlap of compute + P2P/BCS copies; avoid full queue waits between phases.
+3. **Cost-model graph planner (replace coarse fragmentation heuristic)**
+   - In `ggml/src/ggml-sycl/backend.cpp`, choose eager vs segmented vs monolithic replay from measured submit/wait/eager costs instead of a fixed step-count cutoff.
+4. **Small-batch quantized tg path tuning on Xe2**
+   - Revisit `MMQ_MIN_NROWS` behavior in `ggml/src/ggml-sycl/matmul.cpp` with shape-specialized kernels/fallbacks; reduce dispatch/submission overhead across `dmmv.cpp` / `mmvq.cpp` / MMQ paths.
+5. **Prompt throughput kernel work**
+   - Optimize `ggml/src/ggml-sycl/fattn_fused.hpp` (register pressure / tiles / occupancy) and continue `ggml/src/ggml-sycl/mmq_xmx_int8.cpp` layout work (col-major A, scale application without extra SLM traffic).
+
+### Graph-mode regression root causes (architectural)
+- **Primary issue is architectural, not only kernel speed**: graph replay is fragmented by graph-incompatible temporary allocation patterns and then pays high boundary synchronization costs in `ggml/src/ggml-sycl/backend.cpp`.
+- **Needed changes beyond current guardrails**:
+  - graph-lifetime resource ownership (persistent pointer tables / descriptors / scratch metadata),
+  - finer-grained graph-safe contracts per op subpath (`ggml/src/ggml-sycl/matmul.cpp`, `ggml/src/ggml-sycl/fattn.cpp`),
+  - event-based execution plans instead of frequent full queue waits,
+  - unified single-device + multi-device graph planning/caching strategy.
+- **Do not enable graphs by default** until the above reduces fragmentation for GQA/MLA-heavy models and closes the `tg` regression on B60.
+
+### Measurement / bench harness gaps to close
+- Add **per-reason fallback counters and timing** for `node_needs_immediate_mode()` in `ggml/src/ggml-sycl/backend.cpp` (e.g. GQA pointer arrays, FA pointer arrays, noncontig temps, `MUL_MAT_ID`).
+- Add **segmented graph boundary timing attribution** (graph submit time vs `wait()` boundary cost vs eager step time), ideally with ITT regions (`ggml/src/ggml-sycl/itt_annotations.hpp`).
+- Create a **dual-B60 benchmark matrix** (graph on/off, split-mode layer/row, tensor-split, P2P on/off, prompt/tg sizes, larger models than 1B) to expose scaling behavior.
+- Add **tg-shape microbench coverage** for `MUL_MAT` and `FLASH_ATTN_EXT` hot shapes on Xe2 (not just correctness via `test-backend-ops`).
+- Standardize **SYCL vs Vulkan apples-to-apples runs** (same model, quant, warmup, prompt/tg mix, KV settings) before attributing regressions to kernels.
