@@ -636,7 +636,15 @@ ggml_backend_sycl_split_buffer_init_tensor(ggml_backend_buffer_t buffer,
     ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
 
     ctx->tensor_extras.push_back(extra);
-    ctx->streams.push_back(&(dpct::get_current_device().default_queue()));
+
+    // Ensure per-device streams are initialized (one-time, on first tensor)
+    if (ctx->streams.empty()) {
+        ctx->streams.resize(ggml_sycl_info().device_count);
+        for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
+            ggml_sycl_set_device(i);
+            ctx->streams[i] = &(dpct::get_current_device().default_queue());
+        }
+    }
 
     for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
         int64_t row_low, row_high;
@@ -847,6 +855,10 @@ bool ggml_backend_buffer_is_sycl_split(ggml_backend_buffer_t buffer) {
    return buffer->buft->iface.get_name == ggml_backend_sycl_split_buffer_type_get_name;
 }
 
+bool ggml_backend_buft_is_sycl_split(ggml_backend_buffer_type_t buft) {
+    return buft->iface.get_name == ggml_backend_sycl_split_buffer_type_get_name;
+}
+
 static ggml_backend_buffer_t ggml_backend_sycl_split_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     // since we don't know the exact split after rounding, we cannot allocate the device buffers at this point
     // instead, we allocate them for each tensor separately in init_tensor
@@ -927,6 +939,17 @@ ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(const float * ten
         for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
             tensor_split_arr[i] /= split_sum;
         }
+    }
+
+    GGML_SYCL_DEBUG("[SYCL] split_buffer_type: all_zero=%d, device_count=%d, input_ptr=%p\n",
+                    (int) all_zero, ggml_sycl_info().device_count, (const void *) tensor_split);
+    if (tensor_split) {
+        for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
+            GGML_SYCL_DEBUG("[SYCL] split_buffer_type: raw_input[%d]=%.6f\n", i, tensor_split[i]);
+        }
+    }
+    for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
+        GGML_SYCL_DEBUG("[SYCL] split_buffer_type: tensor_split_arr[%d]=%.6f\n", i, tensor_split_arr[i]);
     }
 
     auto it = buft_map.find(tensor_split_arr);

@@ -179,6 +179,13 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
         }
     }
 
+    if (split) {
+        for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
+            GGML_SYCL_DEBUG("[SYCL][MUL_MAT] dev[%d] row_low=%ld row_high=%ld tensor_split[%d]=%.4f ne01=%ld\n",
+                            i, dev[i].row_low, dev[i].row_high, i, tensor_split[i], ne01);
+        }
+    }
+
     constexpr bool quantize_enabled =
         !std::is_same_v<quantize_f<QK8_1 / WARP_SIZE>, no_quantize_q8_1<QK8_1 / WARP_SIZE>>;
     for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
@@ -195,7 +202,9 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
         queue_ptr stream = ctx.stream(i, 0);
 
         if (src0_is_2d_contiguous) {
-            dev[i].src0_dd = (char *) src0->data;
+            // For split tensors, src0->data is a dummy address (split_buffer_get_base returns 0x1000).
+            // Use the per-device pointer from the tensor extra instead, matching the CUDA backend.
+            dev[i].src0_dd = split ? (char *) src0_extra->data_device[i] : (char *) src0->data;
         } else {
             dev[i].src0_dd = dev[i].src0_dd_alloc.alloc(ctx.pool(i), ggml_nbytes(src0));
         }
@@ -233,6 +242,28 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
         }
     }
 
+    // In row-split mode the scheduler can place the op on a device whose src0 row slice is empty.
+    // We still need source-side src1 q8_1 staging on ctx.device so active devices can copy from it.
+    if (split && dev[ctx.device].row_low == dev[ctx.device].row_high && src1_is_2d_contiguous) {
+        ggml_sycl_set_device(ctx.device);
+        queue_ptr stream = ctx.stream(ctx.device, 0);
+
+        if (dev[ctx.device].src1_ddf == nullptr) {
+            dev[ctx.device].src1_ddf = (float *) src1->data;
+        }
+
+        if constexpr (quantize_enabled) {
+            if (dev[ctx.device].src1_ddq == nullptr) {
+                dev[ctx.device].src1_ddq = dev[ctx.device].src1_ddq_alloc.alloc(
+                    ctx.pool(ctx.device), nrows1 * src1_padded_col_size * q8_1_ts / q8_1_bs);
+            }
+            scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
+                                                 /*num_src=*/2, " : converting src1 to Q8_1 (source-only main)");
+            quantize_row_q8_1_sycl<quantize_f>(dev[ctx.device].src1_ddf, dev[ctx.device].src1_ddq, ne10, nrows1,
+                                               src1_padded_col_size, stream);
+        }
+    }
+
     GGML_SYCL_DEBUG(
         "[SYCL][MUL_MAT] split=%d, device_count=%d, used_devices=%d, ne11=%ld, is_max=%d, MUL_MAT_SRC1_COL_STRIDE=%d\n",
         split, ggml_sycl_info().device_count, used_devices, ne11,
@@ -265,10 +296,13 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
             queue_ptr stream = ctx.stream(i, is);
 
             // wait for main GPU data if necessary
-            if (split && (i != ctx.device || is != 0)) {
+            if (split && used_devices > 1 && (i != ctx.device || is != 0)) {
                 GGML_SYCL_DEBUG("[SYCL][MUL_MAT]DEVICE %d (stream %d) WAITING on main event dev=%d events[%d][0]=%p\n",
                                 i, (int) is, ctx.device, ctx.device, (void *) (src0_extra->events[ctx.device][0]));
-                SYCL_CHECK(CHECK_TRY_ERROR(stream->ext_oneapi_submit_barrier({ *src0_extra->events[ctx.device][0] })));
+                // Use host-side wait instead of cross-device ext_oneapi_submit_barrier.
+                // Level Zero events are device-scoped and cannot be used across devices
+                // without P2P support, which causes deadlocks on discrete GPUs.
+                src0_extra->events[ctx.device][0]->wait();
             }
 
             for (int64_t i0 = 0; i0 < ne13 * ne12; ++i0) {
@@ -317,10 +351,9 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                         if constexpr (quantize_enabled) {
                             char * src1_ddq_i_source = dev[ctx.device].src1_ddq + src1_ddq_i_offset;
                             SYCL_CHECK(
-                                CHECK_TRY_ERROR(stream
-                                                    ->memcpy(src1_ddq_i, src1_ddq_i_source,
-                                                             src1_ncols * src1_padded_col_size * q8_1_ts / q8_1_bs)
-                                                    .wait()));
+                                CHECK_TRY_ERROR(dev2dev_memcpy(*stream, *main_stream, src1_ddq_i, src1_ddq_i_source,
+                                                               src1_ncols * src1_padded_col_size * q8_1_ts / q8_1_bs,
+                                                               ctx.device, i)));
                         } else {
                             float * src1_ddf_i_source;
                             if (src1->type == GGML_TYPE_F16) {
@@ -396,9 +429,16 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                         GGML_ASSERT(dst->nb[1] == ne0 * sizeof(float));
                         dhf_dst_i += src1_col_0 * ne0 + dev[i].row_low;
 
+                        // Cross-device strided copy: stage through host to avoid P2P/BCS hangs
+                        // on discrete GPUs without peer-to-peer access.
+                        const size_t row_bytes = row_diff * sizeof(float);
+                        char * host_buf = (char *) malloc(row_bytes * src1_ncols);
+                        stream->memcpy(host_buf, dst_dd_i, row_bytes * src1_ncols).wait();
                         SYCL_CHECK(CHECK_TRY_ERROR(dpct::async_dpct_memcpy(
-                            dhf_dst_i, ne0 * sizeof(float), dst_dd_i, row_diff * sizeof(float),
-                            row_diff * sizeof(float), src1_ncols, dpct::device_to_device, *stream)));
+                            dhf_dst_i, ne0 * sizeof(float), host_buf, row_bytes,
+                            row_bytes, src1_ncols, dpct::host_to_device, *main_stream)));
+                        main_stream->wait();
+                        free(host_buf);
                     } else {
                         float * dhf_dst_i = (float *) ((char *) dst_off_device + i02 * nb2 + i03 * nb3);
                         GGML_ASSERT(dst->nb[1] == ne0 * sizeof(float));
@@ -409,7 +449,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                 }
 
                 // add event for the main device to wait on until other device is done
-                if (split && (i != ctx.device || is != 0)) {
+                if (split && used_devices > 1 && (i != ctx.device || is != 0)) {
                     GGML_SYCL_DEBUG(
                         "[SYCL][MUL_MAT]DEVICE %d (stream %d) RECORDING completion event at events[%d][%d]=%p\n", i,
                         (int) is, i, (int) is, (void *) (src0_extra->events[i][is]));
@@ -420,7 +460,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
     }
 
     // main device waits for all other devices to be finished
-    if (split && ggml_sycl_info().device_count > 1) {
+    if (split && ggml_sycl_info().device_count > 1 && used_devices > 1) {
         int64_t is_max = (ne11 + MUL_MAT_SRC1_COL_STRIDE - 1) / MUL_MAT_SRC1_COL_STRIDE;
         is_max         = is_max <= GGML_SYCL_MAX_STREAMS ? is_max : GGML_SYCL_MAX_STREAMS;
 
@@ -436,7 +476,9 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
             for (int64_t is = 0; is < is_max; ++is) {
                 GGML_SYCL_DEBUG("[SYCL][MUL_MAT] Main waiting on event from dev %d stream %d at ptr=%p\n", i, (int) is,
                                 (void *) (src0_extra->events[i][is]));
-                SYCL_CHECK(CHECK_TRY_ERROR(ctx.stream()->ext_oneapi_submit_barrier({ *src0_extra->events[i][is] })));
+                // Use host-side wait instead of cross-device ext_oneapi_submit_barrier.
+                // Level Zero events are device-scoped and cannot be used across devices.
+                src0_extra->events[i][is]->wait();
             }
         }
         GGML_SYCL_DEBUG("[SYCL][MUL_MAT] Main device %d finished waiting all devices\n", ctx.device);
@@ -1121,6 +1163,12 @@ static void reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
 bool should_reorder_tensor(ggml_backend_sycl_context & ctx, const ggml_tensor * dst) {
     // Disable reordering when graph compatibility is forced, to avoid host sync in reorder_qw
     if (ctx.force_graph_compatible) {
+        return false;
+    }
+
+    // Disable reordering for split tensors: src0->data is a dummy address (0x1000)
+    // and reorder_qw reads from it, causing a segfault.
+    if (dst->src[0] && dst->src[0]->buffer && ggml_backend_buffer_is_sycl_split(dst->src[0]->buffer)) {
         return false;
     }
 

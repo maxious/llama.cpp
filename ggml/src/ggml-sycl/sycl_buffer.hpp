@@ -26,6 +26,7 @@ ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(const float * ten
 ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type();
 bool ggml_backend_buffer_is_sycl(ggml_backend_buffer_t buffer);
 bool ggml_backend_buffer_is_sycl_split(ggml_backend_buffer_t buffer);
+bool ggml_backend_buft_is_sycl_split(ggml_backend_buffer_type_t buft);
 int64_t get_row_rounding(ggml_type type, const std::array<float, GGML_SYCL_MAX_DEVICES> & tensor_split);
 struct ggml_backend_sycl_split_buffer_type_context {
     std::array<float, GGML_SYCL_MAX_DEVICES> tensor_split;

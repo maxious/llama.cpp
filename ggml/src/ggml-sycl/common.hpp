@@ -427,9 +427,22 @@ struct ggml_backend_sycl_context {
     std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
     uint64_t exec_graph_hash = 0;  // Hash of graph topology for cache invalidation
 
-    // Multi-device graph support: one executable graph per device
+    // Multi-device graph support: one executable graph per device.
+    // Companion hashes enable per-device pure replay / re-record+update behavior.
     std::map<int, std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>> per_device_exec_graphs;
-    bool multi_device_graphs_initialized = false;
+    std::map<int, uint64_t> per_device_exec_graph_hashes;
+    std::map<int, uint64_t> per_device_exec_graph_pointer_hashes;
+    std::map<int, uint64_t> per_device_exec_graph_fattn_scope_hashes;
+    bool                    multi_device_graphs_initialized = false;
+
+    // Cache for strict ordered interleaved layer-mode fallback runs (graph-per-run path).
+    // Keyed by a hash of device + run node range + run topology hash; pointer hash is stored in the entry
+    // for pure replay vs re-record decisions.
+    struct interleaved_run_graph_cache_entry {
+        std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph;
+        uint64_t                                                                  pointer_hash = 0;
+    };
+    std::map<uint64_t, interleaved_run_graph_cache_entry> interleaved_run_graph_cache;
 
     // Graph cache: maps topology hash -> executable graph (for fully-compatible graphs)
     // This allows reusing graphs when the same topology is encountered again
