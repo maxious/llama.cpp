@@ -46,6 +46,21 @@
   - Enable debug logging with `GGML_SYCL_DEBUG=1` to trace split rows and per-device work; `LLAMA_LOG_LEVEL=debug` prints graph/backend pinning.
   - Flash attention auto-check can disable FA if backend assignment mismatches; look for `Flash Attention was auto` log line.
   - P2P copies are opt-in via `GGML_SYCL_ENABLE_P2P=1` (may cause device-lost on some systems).
+  - `llama-bench` uses `;` or `/` as `--tensor-split` separators (e.g., `--tensor-split "0.5;0.5"`).
+- SYCL cross-device synchronization rule (Mar 2026):
+  - **Never use `ext_oneapi_submit_barrier({event})` across devices with different `sycl::context` objects.** Level Zero events are device-scoped; passing an event from device A's queue as a dependency to device B's queue causes indefinite hangs on discrete GPUs without P2P.
+  - **Pattern**: Check `stream->get_context() == other_stream->get_context()` before choosing the sync method:
+    - Same context → `stream->ext_oneapi_submit_barrier({event})` (efficient device-side wait).
+    - Different context → `event.wait()` (host-side wait, always safe).
+  - This applies to all cross-device event dependencies: `ggml_sycl_op_mul_mat` split-tensor sync, multi-device graph fan-in barriers, and any future cross-device coordination.
+  - Same-device barriers (recording an event on queue A, waiting on it from queue A or another queue on the same device) are always safe.
+  - Reference: `ggml/src/ggml-sycl/matmul.cpp` (lines ~300, ~484), `ggml/src/ggml-sycl/backend.cpp` (multi-device graph `chain_before_submit` and fan-in barrier).
+- SYCL split-buffer (row-split) multi-GPU notes (Mar 2026):
+  - `src0->data` is a dummy address (`0x1000`) for split tensors — always use `src0_extra->data_device[i]` for per-device pointers.
+  - Tensor reordering (`opt_for_reorder`) must be disabled for split tensors to avoid segfault on the dummy address.
+  - Cross-device memcpy must use host staging (`dev2dev_memcpy`) when P2P is unavailable; direct `stream->memcpy` between devices hangs.
+  - `ggml_backend_sycl_device_supports_buft` must return `true` for `SYCL_Split` buffer types (checked via `ggml_backend_buft_is_sycl_split`).
+  - Per-device streams in `split_buffer_context` must be initialized for all devices on first tensor, not appended per-tensor.
 - SYCL MMQ kernel known issues:
   - MMQ kernels with `need_check=true` (when nrows < mmq_y tile size) can have shared memory write collisions.
   - Fixed by adding MMQ_MIN_NROWS=128 guard in matmul.cpp to fall back to oneMKL when:

@@ -299,10 +299,14 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
             if (split && used_devices > 1 && (i != ctx.device || is != 0)) {
                 GGML_SYCL_DEBUG("[SYCL][MUL_MAT]DEVICE %d (stream %d) WAITING on main event dev=%d events[%d][0]=%p\n",
                                 i, (int) is, ctx.device, ctx.device, (void *) (src0_extra->events[ctx.device][0]));
-                // Use host-side wait instead of cross-device ext_oneapi_submit_barrier.
-                // Level Zero events are device-scoped and cannot be used across devices
-                // without P2P support, which causes deadlocks on discrete GPUs.
-                src0_extra->events[ctx.device][0]->wait();
+                if (stream->get_context() == main_stream->get_context()) {
+                    // Same SYCL context: cross-queue barrier is safe (shared event pool).
+                    SYCL_CHECK(CHECK_TRY_ERROR(
+                        stream->ext_oneapi_submit_barrier({ *src0_extra->events[ctx.device][0] })));
+                } else {
+                    // Different contexts (discrete GPUs without P2P): host-side wait.
+                    src0_extra->events[ctx.device][0]->wait();
+                }
             }
 
             for (int64_t i0 = 0; i0 < ne13 * ne12; ++i0) {
@@ -476,9 +480,13 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
             for (int64_t is = 0; is < is_max; ++is) {
                 GGML_SYCL_DEBUG("[SYCL][MUL_MAT] Main waiting on event from dev %d stream %d at ptr=%p\n", i, (int) is,
                                 (void *) (src0_extra->events[i][is]));
-                // Use host-side wait instead of cross-device ext_oneapi_submit_barrier.
-                // Level Zero events are device-scoped and cannot be used across devices.
-                src0_extra->events[i][is]->wait();
+                queue_ptr dev_stream = ctx.stream(i, is);
+                if (dev_stream->get_context() == ctx.stream()->get_context()) {
+                    SYCL_CHECK(CHECK_TRY_ERROR(
+                        ctx.stream()->ext_oneapi_submit_barrier({ *src0_extra->events[i][is] })));
+                } else {
+                    src0_extra->events[i][is]->wait();
+                }
             }
         }
         GGML_SYCL_DEBUG("[SYCL][MUL_MAT] Main device %d finished waiting all devices\n", ctx.device);
