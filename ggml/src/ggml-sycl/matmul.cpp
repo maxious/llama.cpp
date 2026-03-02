@@ -701,19 +701,25 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
         }
         // oneDNN handles strided data and does not need overhead of get_to_fp16_nc_sycl
         const int64_t ne_src1 = src1->nb[last_str] * src1->ne[last_dim] / type_size_src1;
-        src1_f16_alloc.alloc(ne_src1);
+        // Use persistent buffer during graph recording to avoid stale pool pointers on replay
+        sycl::half * src1_f16_dst = ctx.graph_recording_active
+            ? ctx.get_graph_src1_f16_buf(ne_src1, queue)
+            : (src1_f16_alloc.alloc(ne_src1), src1_f16_alloc.get());
         const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
         GGML_ASSERT(to_fp16_sycl != nullptr);
-        to_fp16_sycl(src1_f16, src1_f16_alloc.get(), ne_src1, queue);
+        to_fp16_sycl(src1_f16, src1_f16_dst, ne_src1, queue);
 #else
         const int64_t ne_src1 = ggml_nelements(src1);
-        src1_f16_alloc.alloc(ne_src1);
+        // Use persistent buffer during graph recording to avoid stale pool pointers on replay
+        sycl::half * src1_f16_dst = ctx.graph_recording_active
+            ? ctx.get_graph_src1_f16_buf(ne_src1, queue)
+            : (src1_f16_alloc.alloc(ne_src1), src1_f16_alloc.get());
         const to_fp16_nc_sycl_t to_fp16_nc_sycl = get_to_fp16_nc_sycl(src1->type);
         GGML_ASSERT(to_fp16_nc_sycl != nullptr);
-        to_fp16_nc_sycl(src1_f16, src1_f16_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, queue);
+        to_fp16_nc_sycl(src1_f16, src1_f16_dst, ne10, ne11, ne12, ne13, s11, s12, s13, queue);
 #endif
 
-        src1_f16 = src1_f16_alloc.get();
+        src1_f16 = src1_f16_dst;
         s11      = ne10;
         s12      = ne11 * s11;
         s13      = ne12 * s12;
@@ -762,15 +768,27 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
             persistent_ptrs_dst = ptrs_dst_local.get();
         }
 
-        sycl::range<3> block_dims(1, ne12, ne13);
+        // Use a simple 2D range — ne12*ne13 can exceed max workgroup size (1024),
+        // so we cannot use nd_range with block_dims == global_dims.
         queue->submit([&](sycl::handler & cgh) {
             const void ** ptrs_src_get = persistent_ptrs_src;
             void **       ptrs_dst_get = persistent_ptrs_dst;
             size_t        nb12_scaled  = src1->type == GGML_TYPE_F16 ? nb12 : s12 * sizeof(sycl::half);
             size_t        nb13_scaled  = src1->type == GGML_TYPE_F16 ? nb13 : s13 * sizeof(sycl::half);
-            cgh.parallel_for(sycl::nd_range<3>(block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-                k_compute_batched_ptrs(src0_f16, src1_f16, dst_ddf, ptrs_src_get, ptrs_dst_get, ne12, ne13, ne23, nb02,
-                                       nb03, nb12_scaled, nb13_scaled, nbd2, nbd3, r2, r3, item_ct1);
+            cgh.parallel_for(sycl::range<2>((size_t) ne13, (size_t) ne12), [=](sycl::item<2> item) {
+                const int64_t i13 = item.get_id(0);
+                const int64_t i12 = item.get_id(1);
+
+                const int64_t i03 = i13 / r3;
+                const int64_t i02 = i12 / r2;
+
+                const uint8_t * src0_bytes = reinterpret_cast<const uint8_t *>(src0_f16);
+                const uint8_t * src1_bytes = reinterpret_cast<const uint8_t *>(src1_f16);
+                uint8_t *       dst_bytes  = reinterpret_cast<uint8_t *>(dst_ddf);
+
+                ptrs_src_get[0 * ne23 + i12 + i13 * ne12] = src0_bytes + i02 * nb02 + i03 * nb03;
+                ptrs_src_get[1 * ne23 + i12 + i13 * ne12] = src1_bytes + i12 * nb12_scaled + i13 * nb13_scaled;
+                ptrs_dst_get[0 * ne23 + i12 + i13 * ne12] = dst_bytes + i12 * nbd2 + i13 * nbd3;
             });
         });
 

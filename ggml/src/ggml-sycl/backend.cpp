@@ -740,7 +740,14 @@ static graph_immediate_reason node_immediate_mode_reason(ggml_backend_sycl_conte
             return graph_immediate_reason::NONE;
         }
 
-        if (ggml_sycl_graph_test_allow_flash_attn()) {
+        // FA is graph-safe when:
+        // - fattn_buffer_binding_guard swaps in persistent graph-owned flash_attn_buffers
+        //   (the tiled path allocates through get_S/get_ptrs which use get_graph_usm_slot)
+        // - Fused path uses tensor data directly (no device allocations)
+        // - XMX path uses tensor data directly
+        // Validate shape/type constraints that ensure we won't fall through to the
+        // raw-alloc ggml_sycl_op_flash_attn_2 fallback during graph recording.
+        {
             const ggml_tensor * Q     = node->src[0];
             const ggml_tensor * K     = node->src[1];
             const ggml_tensor * V     = node->src[2];
@@ -807,10 +814,14 @@ static graph_immediate_reason node_immediate_mode_reason(ggml_backend_sycl_conte
         // ggml_sycl_op_mul_mat loops over batches, avoiding pool allocations if 2D contiguous.
         // Note: For batched GQA with F16, the inner dispatch uses batched pointers
         // which pool-allocate ptrs_src arrays inside ggml_sycl_mul_mat_batched_sycl.
-        // If it goes there, we MUST use immediate mode.
+        // Persistent graph-owned pointer tables (graph_ptrs_src_cache/graph_ptrs_dst_cache)
+        // and persistent F16 conversion buffer (graph_src1_f16_buf) handle all pool temps.
         bool       is_batched_f16        = (!split && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) &&
                                !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1);
-        const bool batched_f16_graphsafe = is_batched_f16 && src1->type == GGML_TYPE_F16 && src1->ne[3] == 1 && r3 == 1;
+        // F32 src1 is now graph-safe: persistent F16 conversion buffer replaces pool-allocated temp.
+        const bool batched_f16_graphsafe = is_batched_f16 &&
+            (src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32) &&
+            src1->ne[3] == 1 && r3 == 1;
 
         // F16/F32 XMX and tiled GEMM paths show flaky graph update() issues with the
         // Level Zero driver — stale results when different data reuses the same graph
@@ -922,6 +933,11 @@ static std::vector<graph_exec_step> build_graph_exec_plan(ggml_backend_sycl_cont
         bool                   needs_immediate  = immediate_reason != graph_immediate_reason::NONE;
         if (needs_immediate) {
             ctx.record_graph_fallback_reason(graph_immediate_reason_name(immediate_reason));
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] Immediate node[%d] op=%s name=%s reason=%s src0_type=%s ne=[%ld,%ld,%ld,%ld]\n",
+                            i, ggml_op_name(node->op), node->name,
+                            graph_immediate_reason_name(immediate_reason),
+                            node->src[0] ? ggml_type_name(node->src[0]->type) : "null",
+                            node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
         }
 
         if (needs_immediate) {

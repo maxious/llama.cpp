@@ -321,6 +321,13 @@ struct ggml_backend_sycl_context {
         opt_feature = ggml_sycl_info().devices[device].opt_feature;
     }
 
+    ~ggml_backend_sycl_context() {
+        if (graph_src1_f16_buf) {
+            sycl::free(graph_src1_f16_buf, *(stream()));
+            graph_src1_f16_buf = nullptr;
+        }
+    }
+
     queue_ptr stream(int device, int stream) {
         if (qptrs[device][stream] == nullptr) {
             qptrs[device][stream] = &(dpct::get_device(device).default_queue());
@@ -406,6 +413,25 @@ struct ggml_backend_sycl_context {
     // stale RAII pool allocations captured in SYCL graphs.
     std::map<size_t, std::unique_ptr<ggml_sycl_pool_alloc<const void *>>> graph_ptrs_src_cache;
     std::map<size_t, std::unique_ptr<ggml_sycl_pool_alloc<void *>>>       graph_ptrs_dst_cache;
+
+    // Persistent graph-owned F16 conversion buffer for batched MUL_MAT.
+    // When src1 is F32, ggml_sycl_mul_mat_batched_sycl converts to F16 into
+    // a pool-allocated temp that would be freed after recording. This persistent
+    // buffer survives across graph replays so the recorded pointers stay valid.
+    sycl::half * graph_src1_f16_buf      = nullptr;
+    size_t       graph_src1_f16_buf_size = 0;  // in elements
+
+    sycl::half * get_graph_src1_f16_buf(size_t nelements, sycl::queue * stream) {
+        if (nelements <= graph_src1_f16_buf_size && graph_src1_f16_buf != nullptr) {
+            return graph_src1_f16_buf;
+        }
+        if (graph_src1_f16_buf) {
+            sycl::free(graph_src1_f16_buf, *stream);
+        }
+        graph_src1_f16_buf      = (sycl::half *) sycl::malloc_device(nelements * sizeof(sycl::half), *stream);
+        graph_src1_f16_buf_size = nelements;
+        return graph_src1_f16_buf;
+    }
 
     std::unique_ptr<ggml_sycl_pool> host_pools[GGML_SYCL_MAX_DEVICES];
 
