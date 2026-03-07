@@ -178,7 +178,7 @@ static void flash_attn_fused_kernel(
     for (int i = 0; i < D_PER_THREAD; ++i) {
         acc[i] = 0.0f;
     }
-    float m_curr = -1.0e20f;
+    float m_curr = -HALF_MAX_HALF;
     float l_curr = 0.0f;
 
     // ================================================================
@@ -249,7 +249,7 @@ static void flash_attn_fused_kernel(
                     if (global_k < N_kv) {
                         logit += static_cast<float>(maskh[q_idx * mask_row_stride + global_k]);
                     } else {
-                        logit = -1.0e20f;
+                        logit = -HALF_MAX_HALF;
                     }
                 }
 
@@ -262,7 +262,7 @@ static void flash_attn_fused_kernel(
                 }
                 l_curr *= alpha_prev;
 
-                float exp_val = sycl::exp(sycl::fmax(logit - m_new, -20.0f));
+                float exp_val = sycl::exp(sycl::fmax(logit - m_new, SOFTMAX_FTZ_THRESHOLD));
                 l_curr += exp_val;
 
 #pragma unroll
@@ -283,7 +283,7 @@ static void flash_attn_fused_kernel(
                 for (int i = 0; i < D_PER_THREAD; ++i) {
                     acc[i] *= alpha_sink;
                 }
-                l_curr = l_curr * alpha_sink + sycl::exp(sycl::fmax(sink_val - m_sink, -20.0f));
+                l_curr = l_curr * alpha_sink + sycl::exp(sycl::fmax(sink_val - m_sink, SOFTMAX_FTZ_THRESHOLD));
                 m_curr = m_sink;
             }
         }
