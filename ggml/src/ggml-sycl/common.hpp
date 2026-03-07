@@ -52,6 +52,7 @@ extern int g_ggml_sycl_debug;
 extern int g_ggml_sycl_disable_optimize;
 extern int g_ggml_sycl_prioritize_dmmv;
 extern int g_ggml_sycl_enable_flash_attention;
+extern int g_ggml_sycl_enable_fattn_fused;
 
 
 #if defined(__clang__) && __has_builtin(__builtin_expect)

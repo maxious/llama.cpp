@@ -63,6 +63,7 @@ int g_ggml_sycl_disable_dnn = 0;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_enable_flash_attention = 1;
+int g_ggml_sycl_enable_fattn_fused = 1;
 
 
 static ggml_sycl_device_info ggml_sycl_init() {
@@ -217,6 +218,7 @@ static void ggml_check_sycl() try {
 
 #ifdef SYCL_FLASH_ATTN
         g_ggml_sycl_enable_flash_attention = get_sycl_env("GGML_SYCL_ENABLE_FLASH_ATTN", 1);
+        g_ggml_sycl_enable_fattn_fused = get_sycl_env("GGML_SYCL_ENABLE_FATTN_FUSED", 1);
 #else
         g_ggml_sycl_enable_flash_attention = 0;
 #endif
@@ -262,9 +264,9 @@ static void ggml_check_sycl() try {
 
 #ifdef SYCL_FLASH_ATTN
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_FLASH_ATTN: %d\n", g_ggml_sycl_enable_flash_attention);
+        GGML_LOG_INFO("  GGML_SYCL_ENABLE_FATTN_FUSED: %d\n", g_ggml_sycl_enable_fattn_fused);
 #else
-        GGML_LOG_INFO("  GGML_SYCL_ENABLE_FLASH_ATTN: %d disabled by compile flag\n",
-            g_ggml_sycl_enable_flash_attention);
+        GGML_LOG_INFO("  GGML_SYCL_ENABLE_FLASH_ATTN: disabled by compile flag\n");
 #endif
 
 /* NOT REMOVE, keep it for next optimize for XMX.

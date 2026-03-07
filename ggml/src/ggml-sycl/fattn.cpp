@@ -223,7 +223,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
                                && K->ne[0] % 16 == 0
                                && K->ne[0] <= 256;
 
-    if (can_use_fused && Q->ne[1] <= FATTN_FUSED_ROWS_PER_WG) {
+    if (can_use_fused && Q->ne[1] <= FATTN_FUSED_ROWS_PER_WG && g_ggml_sycl_enable_fattn_fused) {
         return BEST_FATTN_KERNEL_FUSED;
     }
 
