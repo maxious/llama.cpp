@@ -15,6 +15,7 @@
 #include "dpct/helper.hpp"
 #include "common.hpp"
 #include "fattn-common.hpp"
+#include "fattn-fused.hpp"
 #include "fattn-tile.hpp"
 #include "fattn-vec.hpp"
 #include "fattn.hpp"
@@ -91,10 +92,38 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
     GGML_ABORT("Not match KV type in vec");
 }
 
+// Fused kernel dispatch: subgroup D-splitting, 32 rows/WG, Q in registers.
+// Handles F16/F32 K/V types only. For quantized types, use fattn-vec.
+#define FATTN_FUSED_CASE(D, type_K, type_V)                                                                      \
+    {                                                                                                            \
+        const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \
+        const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16); \
+        if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                     \
+            ggml_sycl_flash_attn_ext_fused_case<D, type_K, type_V>(ctx, dst);                                    \
+            return;                                                                                              \
+        }                                                                                                        \
+    }
+
+static void ggml_sycl_flash_attn_ext_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * Q = dst->src[0];
+    ggml_tensor * K = dst->src[1];
+    ggml_tensor * V = dst->src[2];
+
+    FATTN_FUSED_CASE( 64, GGML_TYPE_F16, GGML_TYPE_F16)
+    FATTN_FUSED_CASE( 80, GGML_TYPE_F16, GGML_TYPE_F16)
+    FATTN_FUSED_CASE( 96, GGML_TYPE_F16, GGML_TYPE_F16)
+    FATTN_FUSED_CASE(112, GGML_TYPE_F16, GGML_TYPE_F16)
+    FATTN_FUSED_CASE(128, GGML_TYPE_F16, GGML_TYPE_F16)
+    FATTN_FUSED_CASE(256, GGML_TYPE_F16, GGML_TYPE_F16)
+
+    GGML_ABORT("Fused flash attention: unsupported type combination");
+}
+
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
     BEST_FATTN_KERNEL_VEC      = 100,
+    BEST_FATTN_KERNEL_FUSED    = 150,
     BEST_FATTN_KERNEL_TILE     = 200,
 };
 
@@ -187,9 +216,18 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
-    // Todo: Use the XMX kernel if possible:
+    // The fused kernel (subgroup D-splitting, 32 rows/WG, Q in registers) is preferred
+    // for F16/F32 types with small batch. It requires DQK == DV and both must be multiples of 16.
+    const bool can_use_fused = !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)
+                               && V->ne[0] == K->ne[0]
+                               && K->ne[0] % 16 == 0
+                               && K->ne[0] <= 256;
 
-    // If there are no tensor cores available, use the generic tile kernel:
+    if (can_use_fused && Q->ne[1] <= FATTN_FUSED_ROWS_PER_WG) {
+        return BEST_FATTN_KERNEL_FUSED;
+    }
+
+    // Fall back to vec kernel for quantized small batch:
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
             if (Q->ne[1] == 1) {
@@ -211,6 +249,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     switch (ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("Not support Flash-Attention");
+        case BEST_FATTN_KERNEL_FUSED:
+            ggml_sycl_flash_attn_ext_fused(ctx, dst);
+            break;
         case BEST_FATTN_KERNEL_TILE:
             ggml_sycl_flash_attn_ext_tile(ctx, dst);
             break;
