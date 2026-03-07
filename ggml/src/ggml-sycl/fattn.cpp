@@ -96,8 +96,8 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
 // Handles F16/F32 K/V types only. For quantized types, use fattn-vec.
 #define FATTN_FUSED_CASE(D, type_K, type_V)                                                                      \
     {                                                                                                            \
-        const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \
-        const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16); \
+        const bool type_K_okay = K->type == (type_K); \
+        const bool type_V_okay = V->type == (type_V); \
         if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                     \
             ggml_sycl_flash_attn_ext_fused_case<D, type_K, type_V>(ctx, dst);                                    \
             return;                                                                                              \
@@ -218,12 +218,17 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     // The fused kernel (subgroup D-splitting, 32 rows/WG, Q in registers) is preferred
     // for F16/F32 types with small batch. It requires DQK == DV and both must be multiples of 16.
-    const bool can_use_fused = !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)
+    float logit_softcap = 0.0f;
+    std::memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    const bool can_use_fused = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16
                                && V->ne[0] == K->ne[0]
                                && K->ne[0] % 16 == 0
-                               && K->ne[0] <= 256;
+                               && K->ne[0] <= 256
+                               && max_bias == 0.0f
+                               && logit_softcap == 0.0f;
 
-    if (can_use_fused && Q->ne[1] <= FATTN_FUSED_ROWS_PER_WG && g_ggml_sycl_enable_fattn_fused) {
+    if (can_use_fused && Q->ne[1] <= FATTN_ROWS_PER_WG && g_ggml_sycl_enable_fattn_fused) {
         return BEST_FATTN_KERNEL_FUSED;
     }
 
