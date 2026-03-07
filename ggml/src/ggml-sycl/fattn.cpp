@@ -116,6 +116,13 @@ static void ggml_sycl_flash_attn_ext_fused(ggml_backend_sycl_context & ctx, ggml
     FATTN_FUSED_CASE(128, GGML_TYPE_F16, GGML_TYPE_F16)
     FATTN_FUSED_CASE(256, GGML_TYPE_F16, GGML_TYPE_F16)
 
+    FATTN_FUSED_CASE( 64, GGML_TYPE_F32, GGML_TYPE_F32)
+    FATTN_FUSED_CASE( 80, GGML_TYPE_F32, GGML_TYPE_F32)
+    FATTN_FUSED_CASE( 96, GGML_TYPE_F32, GGML_TYPE_F32)
+    FATTN_FUSED_CASE(112, GGML_TYPE_F32, GGML_TYPE_F32)
+    FATTN_FUSED_CASE(128, GGML_TYPE_F32, GGML_TYPE_F32)
+    FATTN_FUSED_CASE(256, GGML_TYPE_F32, GGML_TYPE_F32)
+
     GGML_ABORT("Fused flash attention: unsupported type combination");
 }
 
@@ -221,7 +228,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     float logit_softcap = 0.0f;
     std::memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
-    const bool can_use_fused = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16
+    const bool is_f16 = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+    const bool is_f32 = K->type == GGML_TYPE_F32 && V->type == GGML_TYPE_F32;
+    const bool can_use_fused = (is_f16 || is_f32)
                                && V->ne[0] == K->ne[0]
                                && K->ne[0] % 16 == 0
                                && K->ne[0] <= 256
