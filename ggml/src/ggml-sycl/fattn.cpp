@@ -17,6 +17,7 @@
 #include "fattn-common.hpp"
 #include "fattn-tile.hpp"
 #include "fattn-vec.hpp"
+#include "fattn-xmx.hpp"
 #include "fattn.hpp"
 
 
@@ -96,6 +97,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
     BEST_FATTN_KERNEL_VEC      = 100,
     BEST_FATTN_KERNEL_TILE     = 200,
+    BEST_FATTN_KERNEL_XMX      = 300,
 };
 
 static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -190,7 +192,17 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
-    // Todo: Use the XMX kernel if possible:
+    // Prefer XMX for prompt processing with F16/F32 KV on Intel Xe
+    if (Q->ne[1] > 32 && logit_softcap == 0.0f &&
+        !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type) &&
+        K->ne[0] == V->ne[0] && K->ne[0] % 16 == 0) {
+        switch (K->ne[0]) {
+            case 64: case 80: case 96: case 112: case 128: case 256:
+                return BEST_FATTN_KERNEL_XMX;
+            default:
+                break;
+        }
+    }
 
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
@@ -211,6 +223,13 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_set_device(ctx.device);
+
+    // Try XMX-accelerated path first for prompt processing on Intel Xe
+    if (ggml_sycl_fattn_xmx_supported(ctx, dst)) {
+        ggml_sycl_flash_attn_ext_xmx(ctx, dst);
+        return;
+    }
+
     switch (ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("Not support Flash-Attention");
@@ -219,6 +238,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_VEC:
             ggml_sycl_flash_attn_ext_vec(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_XMX:
+            ggml_sycl_flash_attn_ext_xmx(ctx, dst);
             break;
     }
 }
