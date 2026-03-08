@@ -1002,10 +1002,75 @@ static void flash_attn_tile(const char *  Q,
             }
             item_ct1.barrier(sycl::access::fence_space::local_space);
 
-            // Per-row attention: each subgroup handles one query row
+            // Per-row attention: each subgroup handles one query row.
+            // 2-way unrolled: compute two dot products reusing regQ, then apply softmax sequentially.
             if (active_row) {
-                for (int k = 0; k < kv_chunk; ++k) {
-                    // D-split dot product: each lane computes partial over DKQ/SG_SIZE
+                int k = 0;
+                for (; k + 1 < kv_chunk; k += 2) {
+                    // Compute two partial dot products in one pass over regQ
+                    float partial_dot0 = 0.0f;
+                    float partial_dot1 = 0.0f;
+#pragma unroll
+                    for (int di = 0; di < DK_PER_THREAD; ++di) {
+                        const int d = lane + di * SG_SIZE;
+                        const float q = regQ[di];
+                        partial_dot0 += q * shK[(k + 0) * DKQ + d];
+                        partial_dot1 += q * shK[(k + 1) * DKQ + d];
+                    }
+                    float dot0 = warp_reduce_sum<SG_SIZE>(partial_dot0);
+                    float dot1 = warp_reduce_sum<SG_SIZE>(partial_dot1);
+
+                    // --- Process k+0 ---
+                    float logit0 = dot0;
+                    if (maskh != nullptr) {
+                        const int gk0 = kv_start + k;
+                        logit0 += (gk0 < N_kv) ? static_cast<float>(maskh[q_idx * mask_stride + gk0])
+                                                : -FLT_MAX / 2.0f;
+                    }
+
+                    float m_new = sycl::fmax(m_curr, logit0);
+                    float alpha_prev = sycl::native::exp(m_curr - m_new);
+#pragma unroll
+                    for (int i = 0; i < DV_PER_THREAD; ++i) {
+                        acc[i] *= alpha_prev;
+                    }
+                    l_curr *= alpha_prev;
+                    float exp_val0 = sycl::native::exp(sycl::fmax(logit0 - m_new, SOFTMAX_FTZ_THRESHOLD));
+                    l_curr += exp_val0;
+#pragma unroll
+                    for (int i = 0; i < DV_PER_THREAD; ++i) {
+                        const int d = lane + i * SG_SIZE;
+                        acc[i] += exp_val0 * shV[(k + 0) * DV + d];
+                    }
+                    m_curr = m_new;
+
+                    // --- Process k+1 ---
+                    float logit1 = dot1;
+                    if (maskh != nullptr) {
+                        const int gk1 = kv_start + k + 1;
+                        logit1 += (gk1 < N_kv) ? static_cast<float>(maskh[q_idx * mask_stride + gk1])
+                                                : -FLT_MAX / 2.0f;
+                    }
+
+                    m_new = sycl::fmax(m_curr, logit1);
+                    alpha_prev = sycl::native::exp(m_curr - m_new);
+#pragma unroll
+                    for (int i = 0; i < DV_PER_THREAD; ++i) {
+                        acc[i] *= alpha_prev;
+                    }
+                    l_curr *= alpha_prev;
+                    float exp_val1 = sycl::native::exp(sycl::fmax(logit1 - m_new, SOFTMAX_FTZ_THRESHOLD));
+                    l_curr += exp_val1;
+#pragma unroll
+                    for (int i = 0; i < DV_PER_THREAD; ++i) {
+                        const int d = lane + i * SG_SIZE;
+                        acc[i] += exp_val1 * shV[(k + 1) * DV + d];
+                    }
+                    m_curr = m_new;
+                }
+
+                // Handle odd remainder
+                for (; k < kv_chunk; ++k) {
                     float partial_dot = 0.0f;
 #pragma unroll
                     for (int di = 0; di < DK_PER_THREAD; ++di) {
@@ -1014,18 +1079,13 @@ static void flash_attn_tile(const char *  Q,
                     }
                     float dot = warp_reduce_sum<SG_SIZE>(partial_dot);
 
-                    float logit = dot;  // scale already applied to Q
-
+                    float logit = dot;
                     if (maskh != nullptr) {
                         const int global_k = kv_start + k;
-                        if (global_k < N_kv) {
-                            logit += static_cast<float>(maskh[q_idx * mask_stride + global_k]);
-                        } else {
-                            logit = -FLT_MAX / 2.0f;
-                        }
+                        logit += (global_k < N_kv) ? static_cast<float>(maskh[q_idx * mask_stride + global_k])
+                                                   : -FLT_MAX / 2.0f;
                     }
 
-                    // Online softmax + P*V accumulation (fused per-element)
                     float m_new = sycl::fmax(m_curr, logit);
                     float alpha_prev = sycl::native::exp(m_curr - m_new);
 #pragma unroll
@@ -1033,16 +1093,13 @@ static void flash_attn_tile(const char *  Q,
                         acc[i] *= alpha_prev;
                     }
                     l_curr *= alpha_prev;
-
                     float exp_val = sycl::native::exp(sycl::fmax(logit - m_new, SOFTMAX_FTZ_THRESHOLD));
                     l_curr += exp_val;
-
 #pragma unroll
                     for (int i = 0; i < DV_PER_THREAD; ++i) {
                         const int d = lane + i * SG_SIZE;
                         acc[i] += exp_val * shV[k * DV + d];
                     }
-
                     m_curr = m_new;
                 }
 
