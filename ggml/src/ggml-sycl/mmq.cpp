@@ -11,6 +11,7 @@
 //
 
 #include "mmq.hpp"
+#include "mmq-xmx.hpp"
 #include "vecdotq.hpp"
 
 typedef void (*allocate_tiles_sycl_t)(
@@ -2965,6 +2966,16 @@ void ggml_sycl_op_mul_mat_q(
     // the main device has a larger memory buffer to hold the results from all GPUs
     // nrows_dst == nrows of the matrix that the dequantize_mul_mat kernel writes into
     const int64_t nrows_dst = device_id == ctx.device ? ne0 : row_diff;
+
+#ifdef SYCL_USE_XMX
+    // Try XMX-accelerated path first for supported types
+    if (ggml_sycl_supports_xmx_mmq(stream->get_device(), src0->type)) {
+        ggml_sycl_op_mul_mat_q_xmx(ctx, src0, src1, dst,
+            src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
+            row_low, row_high, src1_ncols, src1_padded_row_size, stream);
+        return;
+    }
+#endif
 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
