@@ -65,6 +65,7 @@ int g_ggml_sycl_disable_dnn = 0;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_enable_flash_attention = 1;
+int g_ggml_sycl_disable_xmx = 0;
 
 
 static ggml_sycl_device_info ggml_sycl_init() {
@@ -218,6 +219,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_disable_graph = get_sycl_env("GGML_SYCL_DISABLE_GRAPH", 1);
         g_ggml_sycl_disable_dnn = get_sycl_env("GGML_SYCL_DISABLE_DNN", 0);
         g_ggml_sycl_prioritize_dmmv = get_sycl_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
+        g_ggml_sycl_disable_xmx = get_sycl_env("GGML_SYCL_DISABLE_XMX", 0);
 
 #ifdef SYCL_FLASH_ATTN
         g_ggml_sycl_enable_flash_attention = get_sycl_env("GGML_SYCL_ENABLE_FLASH_ATTN", 1);
@@ -263,6 +265,11 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: DNN disabled by compile flag\n");
 #endif
         GGML_LOG_INFO("  GGML_SYCL_PRIORITIZE_DMMV: %d\n", g_ggml_sycl_prioritize_dmmv);
+#ifdef SYCL_USE_XMX
+        GGML_LOG_INFO("  GGML_SYCL_DISABLE_XMX: %d\n", g_ggml_sycl_disable_xmx);
+#else
+        GGML_LOG_INFO("  GGML_SYCL_DISABLE_XMX: XMX disabled by compile flag\n");
+#endif
 
 #ifdef SYCL_FLASH_ATTN
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_FLASH_ATTN: %d\n", g_ggml_sycl_enable_flash_attention);
@@ -271,13 +278,6 @@ static void ggml_check_sycl() try {
             g_ggml_sycl_enable_flash_attention);
 #endif
 
-/* NOT REMOVE, keep it for next optimize for XMX.
-#if defined(SYCL_USE_XMX)
-        fprintf(stderr, "%s: SYCL_USE_XMX: yes\n", __func__);
-#else
-        fprintf(stderr, "%s: SYCL_USE_XMX: no\n", __func__);
-#endif
-*/
         // Currently, we only use async malloc / free when graphs are enabled as it is required for the calls to be
         // properly recorded. As this SYCL extension matures it may be beneficial to enable as the default path and in
         // other places.
