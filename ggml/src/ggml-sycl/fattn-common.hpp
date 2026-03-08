@@ -925,8 +925,6 @@ void launch_fattn(
     ggml_sycl_pool_alloc<sycl::half>   K_f16(pool);
     ggml_sycl_pool_alloc<sycl::half>   V_f16(pool);
     ggml_sycl_pool_alloc<int>    KV_max(pool);
-    ggml_sycl_pool_alloc<float>  dst_tmp(pool);
-    ggml_sycl_pool_alloc<sycl::float2> dst_tmp_meta(pool);
 
     const char * K_data = (const char *) K->data;
     size_t nb11 = K->nb[1];
@@ -1057,7 +1055,7 @@ void launch_fattn(
         blocks_num.z = 1;
 
         if (ntiles_total % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
-            dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
+            ctx.fa_bufs.ensure_dst_tmp_meta(pool, size_t(blocks_num.x) * ncols * (2 + DV/2));
         }
     } else {
         const int ntiles_KQ = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by tensor size.
@@ -1094,8 +1092,8 @@ void launch_fattn(
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
 
         if (parallel_blocks > 1) {
-            dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
-            dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
+            ctx.fa_bufs.ensure_dst_tmp(pool, parallel_blocks*ggml_nelements(KQV));
+            ctx.fa_bufs.ensure_dst_tmp_meta(pool, parallel_blocks*ggml_nrows(KQV));
         }
     }
 
@@ -1125,7 +1123,8 @@ void launch_fattn(
     lauch_kernel<fattn_kernel, warp_size>(
         blocks_num, block_dim, main_stream, (unsigned int) nbytes_shared, (const char *) Q->data, K_data, V_data,
         mask ? ((const char *) mask->data) : nullptr, sinks ? ((const char *) sinks->data) : nullptr, KV_max.ptr,
-        !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, (sycl::float2 *)dst_tmp_meta.ptr, scale, max_bias, m0, m1,
+        !stream_k && parallel_blocks > 1 ? ctx.fa_bufs.dst_tmp->get() : (float *) KQV->data,
+        ctx.fa_bufs.dst_tmp_meta ? ctx.fa_bufs.dst_tmp_meta->get() : nullptr, scale, max_bias, m0, m1,
         n_head_log2, logit_softcap, Q->ne[0], ne01, Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->ne[0],
         K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13, nb21, nb22, nb23, mask ? mask->ne[1] : 0,
         mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0,
@@ -1139,7 +1138,7 @@ void launch_fattn(
 
             main_stream->submit([&](sycl::handler & cgh) {
                 auto KQV_data_ct0         = (float *) KQV->data;
-                auto dst_tmp_meta_ptr_ct1 = dst_tmp_meta.ptr;
+                auto dst_tmp_meta_ptr_ct1 = ctx.fa_bufs.dst_tmp_meta->get();
                 auto Q_ne_ct2             = Q->ne[1];
                 auto Q_ne_ct3             = Q->ne[2];
                 auto Q_ne_ct4             = Q->ne[3];
@@ -1162,8 +1161,8 @@ void launch_fattn(
         main_stream->submit([&](sycl::handler & cgh) {
             sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(sycl::range<1>(nbytes_shared_combine), cgh);
 
-            auto dst_tmp_ptr_ct0      = dst_tmp.ptr;
-            auto dst_tmp_meta_ptr_ct1 = dst_tmp_meta.ptr;
+            auto dst_tmp_ptr_ct0      = ctx.fa_bufs.dst_tmp->get();
+            auto dst_tmp_meta_ptr_ct1 = ctx.fa_bufs.dst_tmp_meta->get();
             auto KQV_data_ct2         = (float *) KQV->data;
 
             cgh.parallel_for(sycl::nd_range<3>(blocks_num_combine * block_dim_combine, block_dim_combine),

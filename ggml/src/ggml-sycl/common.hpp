@@ -103,10 +103,10 @@ extern int g_ggml_sycl_enable_flash_attention;
 
 // dmmv = dequantize_mul_mat_vec
 #ifndef GGML_SYCL_DMMV_X
-#define GGML_SYCL_DMMV_X 32
+#define GGML_SYCL_DMMV_X 64
 #endif
 #ifndef GGML_SYCL_MMV_Y
-#define GGML_SYCL_MMV_Y 1
+#define GGML_SYCL_MMV_Y 2
 #endif
 
 typedef sycl::queue *queue_ptr;
@@ -477,6 +477,24 @@ struct ggml_backend_sycl_context {
         return _graph_exec_queue.get();
     }
 #endif
+
+    // Cached FA (flash attention) buffers — avoids per-call pool alloc/free overhead
+    struct fattn_bufs {
+        std::unique_ptr<ggml_sycl_pool_alloc<float>>        dst_tmp;
+        std::unique_ptr<ggml_sycl_pool_alloc<sycl::float2>> dst_tmp_meta;
+
+        float * ensure_dst_tmp(ggml_sycl_pool & p, size_t n) {
+            if (!dst_tmp) { dst_tmp = std::make_unique<ggml_sycl_pool_alloc<float>>(p); }
+            if (dst_tmp->actual_size < n * sizeof(float)) { dst_tmp->realloc(n); }
+            return dst_tmp->get();
+        }
+        sycl::float2 * ensure_dst_tmp_meta(ggml_sycl_pool & p, size_t n) {
+            if (!dst_tmp_meta) { dst_tmp_meta = std::make_unique<ggml_sycl_pool_alloc<sycl::float2>>(p); }
+            if (dst_tmp_meta->actual_size < n * sizeof(sycl::float2)) { dst_tmp_meta->realloc(n); }
+            return dst_tmp_meta->get();
+        }
+    };
+    fattn_bufs fa_bufs;
 
     ggml_sycl_pool & host_pool(int device) {
         if (host_pools[device] == nullptr) {
