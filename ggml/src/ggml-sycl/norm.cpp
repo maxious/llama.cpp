@@ -3,6 +3,9 @@
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/presets.hpp"
 
+// Max row size (in floats) for SLM-cached norm kernels (16KB of shared local memory)
+static constexpr int GGML_SYCL_NORM_SLM_THRESHOLD = 4096;
+
 // SLM-cached LayerNorm kernel for rows that fit in shared local memory
 // This avoids re-reading input data from global memory for the normalization pass
 static void norm_f32_slm(const float *            x,
@@ -432,33 +435,6 @@ for (int col = tid; col < ncols; col += block_size) {
 }
 }
 
-static void l2_norm_f32(const float *            x,
-                        float *                  dst,
-                        const int                ncols,
-                        const float              eps,
-                        const sycl::nd_item<3> & item_ct1,
-                        float *                  s_sum,
-                        int                      block_size) {
-    const int row      = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
-    const int tid      = item_ct1.get_local_id(2);
-    const int nthreads = item_ct1.get_local_range(2);
-    const int nwarps   = nthreads / WARP_SIZE;
->>>>>>> 635768f1d (SYCL: pp performance optimizations for Intel Arc (Xe2))
-    float     tmp      = 0.0f;  // partial sum for thread in warp
-
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col];
-        tmp += xi * xi;
-    }
-
-    tmp               = block_reduce<block_reduce_method::SUM, warp_size>(tmp, s_sum, block_size);
-    const float scale = sycl::rsqrt(sycl::fmax(tmp, eps * eps));
-
-    for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = scale * x[col];
-    }
-}
-
 static void norm_f32_sycl(const float * x,
                           float *       dst,
                           const int     ncols,
@@ -473,10 +449,7 @@ static void norm_f32_sycl(const float * x,
                           int           device) {
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
 
-    // Use SLM-cached kernel for rows that fit in shared local memory (up to 4096 floats = 16KB)
-    constexpr int SLM_CACHE_THRESHOLD = 4096;
-
-    if (ncols <= SLM_CACHE_THRESHOLD && ncols >= 256) {
+    if (ncols <= GGML_SYCL_NORM_SLM_THRESHOLD && ncols >= 256) {
         const int            work_group_size = std::min(ncols, 256);
         const sycl::range<3> block_dims(1, 1, work_group_size);
 
@@ -568,13 +541,9 @@ static void rms_norm_f32_sycl(const float * x,
                               queue_ptr     stream,
                               int           device) {
     // printf("%s ncols=%d, nrows=%d, WARP_SIZE=%d\n", __func__, ncols, nrows, WARP_SIZE);
-
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
 
-    // Use SLM-cached kernel for rows that fit in shared local memory (up to 4096 floats = 16KB)
-    constexpr int SLM_CACHE_THRESHOLD = 4096;
-
-    if (ncols <= SLM_CACHE_THRESHOLD && ncols >= 256) {
+    if (ncols <= GGML_SYCL_NORM_SLM_THRESHOLD && ncols >= 256) {
         const int            work_group_size = std::min(ncols, 256);
         const sycl::range<3> block_dims(1, 1, work_group_size);
 

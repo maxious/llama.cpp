@@ -833,11 +833,6 @@ sycl::float2 __dpct_inline__ make_float2( T x, T y) {
     return res;
 }
 
-sycl::float2 __dpct_inline__ __half22float2(sycl::half2 &H) {
-    sycl::float2 float2_value(static_cast<float>(H.x()), static_cast<float>(H.y()));
-    return float2_value;
-}
-
 static __dpct_inline__ sycl::uint2 fast_div_modulo(uint32_t n, const sycl::uint3 fastdiv_values) {
     const uint32_t div_val = fastdiv(n, fastdiv_values);
     const uint32_t mod_val = n - div_val * fastdiv_values.z();

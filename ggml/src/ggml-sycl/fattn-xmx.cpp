@@ -282,8 +282,8 @@ static void flash_attn_xmx_kernel(
         if (sg_id < 2) {
             const int sg_m_off = sg_id * FA_TM;  // 0 or 8
 
-            syclmx::joint_matrix<sycl::sub_group, sycl::half, syclmx::use::accumulator, FA_TM, FA_TN> mat_score;
-            syclmx::joint_matrix_fill(sg, mat_score, sycl::half(0.0f));
+            syclmx::joint_matrix<sycl::sub_group, float, syclmx::use::accumulator, FA_TM, FA_TN> mat_score;
+            syclmx::joint_matrix_fill(sg, mat_score, 0.0f);
 
             // Accumulate over D dimension
             for (int dk = 0; dk < DKQ / FA_TK; ++dk) {
@@ -306,32 +306,23 @@ static void flash_attn_xmx_kernel(
             }
 
             // Store scores to SF_slm (FP32) for softmax computation
-            // Use joint_matrix_store to SLM scratch, then barrier
             syclmx::joint_matrix_store(sg, mat_score,
                 sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
-                    (sycl::half *)(SF_slm) + sg_m_off * FA_BK),
+                    SF_slm + sg_m_off * FA_BK),
                 FA_BK, syclmx::layout::row_major);
         }
 
         item_ct1.barrier(sycl::access::fence_space::local_space);
 
         // ===== Step 2: Softmax in FP32 =====
-        // Convert scores from FP16 to FP32, apply mask, compute per-row exp/sum
-        // Each SG handles FA_BQ/FA_NWARPS rows cooperatively
+        // Scores are already FP32 in SF_slm. Apply mask, compute per-row exp/sum.
+        // Each SG handles FA_BQ/FA_NWARPS rows cooperatively.
 
-        // tile_meta stores [tile_max, tile_sum] per row, placed after SF_slm scores
-        // SF_slm has FA_BQ * FA_BK floats. tile_meta needs FA_BQ * 2 floats.
-        // But SF_slm is being used for scores as FP16... Let me use a separate area.
-        // Actually SF_slm was declared as float[FA_BQ * FA_BK] but we stored FP16 scores.
-        // The FP16 scores take FA_BQ * FA_BK * 2 bytes = FA_BQ * FA_BK / 2 floats.
-        // So we can use the second half of SF_slm for tile_meta.
-        // FP16 scores in SF_slm: FA_BQ * FA_BK * sizeof(half) = 16*16*2 = 512 bytes
-        // SF_slm total: FA_BQ * FA_BK * sizeof(float) = 16*16*4 = 1024 bytes
-        // tile_meta: FA_BQ * 2 * sizeof(float) = 128 bytes. Fits in second half.
-        sycl::half * score_h16 = (sycl::half *)SF_slm;
-        float * tile_meta = SF_slm + (FA_BQ * FA_BK) / 2;  // after the FP16 scores
+        // tile_meta stores [tile_max, tile_sum] per row, placed after SF_slm scores.
+        // PV_scratch area is used for tile_meta (separate from SF_slm).
+        float * tile_meta = PV_scratch;  // [FA_BQ * 2] floats
 
-        // Convert FP16 scores to FP32, apply mask, and compute softmax
+        // Apply mask and compute softmax
         {
             constexpr int rows_per_sg = (FA_BQ + FA_NWARPS - 1) / FA_NWARPS;
             for (int r = 0; r < rows_per_sg; ++r) {
@@ -339,17 +330,17 @@ static void flash_attn_xmx_kernel(
                 if (qr >= FA_BQ) break;
                 const int q_row = q_start + qr;
 
-                // Read FP16 scores and convert to FP32 with mask
+                // Read FP32 scores, apply mask
                 float local_max = -FLT_MAX / 2.0f;
                 for (int kp = lane_id; kp < FA_BK; kp += WARP_SIZE) {
-                    float s = static_cast<float>(score_h16[qr * FA_BK + kp]);
+                    float s = SF_slm[qr * FA_BK + kp];
                     const int global_kv = kv_start + kp;
                     if (mask_h && q_row < ne01 && global_kv < ne11) {
                         s += static_cast<float>(mask_h[q_row * mask_stride + global_kv]);
                     } else if (q_row >= ne01 || global_kv >= ne11) {
                         s = -FLT_MAX / 2.0f;
                     }
-                    SF_slm[qr * FA_BK + kp] = s;  // overwrite with float scores
+                    SF_slm[qr * FA_BK + kp] = s;
                     local_max = sycl::fmax(local_max, s);
                 }
                 float tile_max_val = warp_reduce_max<WARP_SIZE>(local_max);
