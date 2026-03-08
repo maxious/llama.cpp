@@ -305,6 +305,36 @@ struct ggml_tensor_extra_gpu {
 void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> streams={});
 
 namespace sycl_ex = sycl::ext::oneapi::experimental;
+
+#ifdef GGML_SYCL_GRAPH
+// Cached properties of a graph node for replay decision (mirrors CUDA's approach)
+struct ggml_sycl_graph_node_properties {
+    void *    node_data;
+    ggml_op   node_op;
+    ggml_type node_type;
+    int32_t   flags;
+    int64_t   ne[GGML_MAX_DIMS];
+    size_t    nb[GGML_MAX_DIMS];
+    void *    src_data[GGML_MAX_SRC];
+    int32_t   op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
+};
+
+static_assert(std::is_trivial<ggml_sycl_graph_node_properties>::value,
+              "ggml_sycl_graph_node_properties must be trivial");
+
+struct ggml_sycl_graph {
+    std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph;
+    std::vector<ggml_sycl_graph_node_properties> props;
+    std::vector<ggml_sycl_graph_node_properties> extra;  // non-node input tensors
+};
+
+// Cache entry for segmented graph execution
+struct ggml_sycl_segmented_graph_cache_entry {
+    std::vector<std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>> segment_graphs;
+    uint64_t pointer_hash = 0;
+};
+#endif // GGML_SYCL_GRAPH
+
 struct ggml_backend_sycl_context {
     int device;
     std::string name;
@@ -415,7 +445,37 @@ struct ggml_backend_sycl_context {
     }
 
 #ifdef GGML_SYCL_GRAPH
-    std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
+    // Monolithic graph cache: keyed by first node pointer (same approach as CUDA backend)
+    std::unordered_map<const void *, std::unique_ptr<ggml_sycl_graph>> sycl_graphs;
+
+    ggml_sycl_graph * sycl_graph(const void * key) {
+        auto it = sycl_graphs.find(key);
+        if (it == sycl_graphs.end()) {
+            sycl_graphs[key] = std::make_unique<ggml_sycl_graph>();
+            return sycl_graphs[key].get();
+        }
+        return it->second.get();
+    }
+
+    // Segmented graph cache: keyed by topology hash
+    std::unordered_map<uint64_t, ggml_sycl_segmented_graph_cache_entry> segmented_graph_cache;
+    // Pointer hash cache for monolithic path
+    std::unordered_map<uint64_t, uint64_t> graph_pointer_hashes;
+    // Monolithic graph cache keyed by topology hash
+    std::unordered_map<uint64_t, std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>> graph_cache;
+
+    static constexpr size_t MAX_GRAPH_CACHE_SIZE = 8;
+
+    // Dedicated graph execution queue (lazily initialized)
+    std::unique_ptr<sycl::queue> _graph_exec_queue;
+
+    queue_ptr graph_exec_stream() {
+        if (!_graph_exec_queue) {
+            _graph_exec_queue = std::make_unique<sycl::queue>(
+                dpct::get_device(device).create_in_order_queue());
+        }
+        return _graph_exec_queue.get();
+    }
 #endif
 
     ggml_sycl_pool & host_pool(int device) {
