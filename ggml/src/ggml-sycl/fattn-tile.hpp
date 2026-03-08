@@ -955,34 +955,49 @@ static void flash_attn_tile(const char *  Q,
         const int mask_stride = nb31 / sizeof(sycl::half);
 
         // Loop over KV blocks
+        // Vectorized loading: load half4 (8 bytes), convert to float4 (16 bytes), store to SLM.
+        constexpr int VEC_SIZE = 4;  // half4 -> float4
+        static_assert(DKQ % VEC_SIZE == 0, "DKQ must be a multiple of VEC_SIZE for vectorized loads");
+        static_assert(DV  % VEC_SIZE == 0, "DV must be a multiple of VEC_SIZE for vectorized loads");
+        constexpr int K_vecs = BK * (DKQ / VEC_SIZE);  // total half4 vectors for K tile
+        constexpr int V_vecs = BK * (DV  / VEC_SIZE);  // total half4 vectors for V tile
+
         for (int kv_start = 0; kv_start < N_kv; kv_start += BK) {
             const int kv_chunk = sycl::min(BK, N_kv - kv_start);
 
-            // Load K tile cooperatively (all WG_SIZE threads participate)
-            // TODO: vectorized ggml_sycl_memcpy_1 loads are an option here
-            for (int idx = lid; idx < BK * DKQ; idx += WG_SIZE) {
-                const int k_local = idx / DKQ;
-                const int d       = idx % DKQ;
+            // Load K tile cooperatively: half4 -> float4, 4 elements per thread per iteration
+            for (int vi = lid; vi < K_vecs; vi += WG_SIZE) {
+                const int k_local = vi / (DKQ / VEC_SIZE);
+                const int d_base  = (vi % (DKQ / VEC_SIZE)) * VEC_SIZE;
                 const int kv_idx  = kv_start + k_local;
+                float * dst_ptr = shK + k_local * DKQ + d_base;
                 if (kv_idx < N_kv) {
-                    shK[k_local * DKQ + d] = fattn_dsplit::to_float<KVType>(
-                        (const KVType *)(K_base + (ptrdiff_t)kv_idx * nb11) + d);
+                    sycl::half4 h4;
+                    ggml_sycl_memcpy_1<sizeof(sycl::half4)>(
+                        &h4, (const KVType *)(K_base + (ptrdiff_t)kv_idx * nb11) + d_base);
+                    sycl::float4 f4 = h4.convert<float, sycl::rounding_mode::automatic>();
+                    ggml_sycl_memcpy_1<sizeof(sycl::float4)>(dst_ptr, &f4);
                 } else {
-                    shK[k_local * DKQ + d] = 0.0f;
+                    sycl::float4 zero4(0.0f);
+                    ggml_sycl_memcpy_1<sizeof(sycl::float4)>(dst_ptr, &zero4);
                 }
             }
 
-            // Load V tile cooperatively
-            // TODO: vectorized ggml_sycl_memcpy_1 loads are an option here
-            for (int idx = lid; idx < BK * DV; idx += WG_SIZE) {
-                const int v_local = idx / DV;
-                const int d       = idx % DV;
+            // Load V tile cooperatively: half4 -> float4, 4 elements per thread per iteration
+            for (int vi = lid; vi < V_vecs; vi += WG_SIZE) {
+                const int v_local = vi / (DV / VEC_SIZE);
+                const int d_base  = (vi % (DV / VEC_SIZE)) * VEC_SIZE;
                 const int kv_idx  = kv_start + v_local;
+                float * dst_ptr = shV + v_local * DV + d_base;
                 if (kv_idx < N_kv) {
-                    shV[v_local * DV + d] = fattn_dsplit::to_float<KVType>(
-                        (const KVType *)(V_base + (ptrdiff_t)kv_idx * nb21) + d);
+                    sycl::half4 h4;
+                    ggml_sycl_memcpy_1<sizeof(sycl::half4)>(
+                        &h4, (const KVType *)(V_base + (ptrdiff_t)kv_idx * nb21) + d_base);
+                    sycl::float4 f4 = h4.convert<float, sycl::rounding_mode::automatic>();
+                    ggml_sycl_memcpy_1<sizeof(sycl::float4)>(dst_ptr, &f4);
                 } else {
-                    shV[v_local * DV + d] = 0.0f;
+                    sycl::float4 zero4(0.0f);
+                    ggml_sycl_memcpy_1<sizeof(sycl::float4)>(dst_ptr, &zero4);
                 }
             }
             item_ct1.barrier(sycl::access::fence_space::local_space);
