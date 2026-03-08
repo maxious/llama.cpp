@@ -119,6 +119,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {

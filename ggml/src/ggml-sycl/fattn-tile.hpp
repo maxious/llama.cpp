@@ -1,11 +1,13 @@
+#include <climits>
+#include <cfloat>
+#include <cmath>
+#include <float.h>
+
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/work_group_static.hpp>
 #include "dpct/helper.hpp"
 #include "common.hpp"
 #include "fattn-common.hpp"
-
-#include <cmath>
-#include <float.h>
 
 namespace syclex = sycl::ext::oneapi::experimental;
 
@@ -130,6 +132,35 @@ static constexpr uint32_t ggml_sycl_fattn_tile_get_config_fp32(const int DKQ, co
 
     return 0;
 }
+
+// SG16 D-splitting mode: fixed nthreads=512 (32×16), single-pass (nbatch_fa=INT_MAX), full D loaded at once (nbatch_K=DKQ).
+// Only used for DQK==DV, DQK%16==0, DQK<=256 with ncols=32 (the only ncols1 supported in this mode).
+static constexpr uint32_t ggml_sycl_fattn_tile_get_config_sg16(const int DKQ, const int DV, const int ncols) {
+    // SG16 mode only supports ncols=32 and DQK==DV
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE( 64,  64, 32, 512, 2, 256, 64)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE( 80,  80, 32, 512, 2, 256, 80)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE( 96,  96, 32, 512, 2, 256, 96)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(112, 112, 32, 512, 2, 256,112)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(128, 128, 32, 512, 2, 256,128)
+    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 32, 512, 2, 256,256)
+
+    return 0;
+}
+
+// Helper: convert any KV type to float for element-wise SLM loads (used in D-splitting mode)
+namespace fattn_dsplit {
+    template <typename T> static __dpct_inline__ float to_float(const T * ptr);
+
+    template <> __dpct_inline__ float to_float<float>(const float * ptr) {
+        return *ptr;
+    }
+
+    template <> __dpct_inline__ float to_float<sycl::half>(const sycl::half * ptr) {
+        return static_cast<float>(*ptr);
+    }
+
+    constexpr int SG16_BK = 32;  // KV positions per tile in D-splitting mode
+} // namespace fattn_dsplit
 
 static constexpr uint32_t ggml_sycl_fattn_tile_get_config_amd(const int DKQ, const int DV, const int ncols) {
     GGML_SYCL_FATTN_TILE_CONFIG_CASE( 40,  40,  2,  64, 2,  32,  40)
@@ -770,7 +801,7 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
     }
 }
 
-template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, int warp_size>  // D == head size
+template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, int warp_size, bool d_splitting_mode = false>  // D == head size
 /*
 The total declared local variable size in device function flash_attn_tile exceeds 128 bytes and may cause high register pressure. Consult with your hardware vendor to find the total register size available and adjust the code, or use smaller sub-group size to avoid high register pressure.
 */
@@ -826,6 +857,213 @@ static void flash_attn_tile(const char *  Q,
                   nb31, nb32, nb33);
         return;
     }
+
+    // ================================================================
+    // D-splitting mode: SG16 subgroup D-splitting with Q in registers, fused online softmax.
+    // This path replaces the separate fattn-tile-sg16 kernel.
+    // ================================================================
+    if constexpr (d_splitting_mode) {
+        GGML_UNUSED(KV_max);
+        GGML_UNUSED(dst_meta);
+        GGML_UNUSED(max_bias);
+        GGML_UNUSED(m0);
+        GGML_UNUSED(m1);
+        GGML_UNUSED(n_head_log2);
+        GGML_UNUSED(logit_softcap);
+        GGML_UNUSED(ne00);
+        GGML_UNUSED(ne10);
+        GGML_UNUSED(ne12);
+        GGML_UNUSED(ne13);
+        GGML_UNUSED(ne03);
+        GGML_UNUSED(ne31);
+        GGML_UNUSED(ne32);
+        GGML_UNUSED(nb32);
+
+        static_assert(DKQ == DV, "D-splitting mode requires DKQ == DV");
+        static_assert(DKQ % warp_size == 0, "DKQ must be a multiple of warp_size in D-splitting mode");
+        static_assert(ncols1 == 32, "D-splitting mode requires ncols1 == 32 (ROWS_PER_WG)");
+        static_assert(ncols2 == 1, "D-splitting mode requires ncols2 == 1");
+
+        using KVType = sycl::half;  // F32 K/V is converted to F16 by launch_fattn
+
+        constexpr int ROWS_PER_WG   = ncols1;  // == 32
+        constexpr int SG_SIZE       = warp_size;  // == 16
+        constexpr int WG_SIZE       = SG_SIZE * ROWS_PER_WG;
+        constexpr int DK_PER_THREAD = DKQ / SG_SIZE;
+        constexpr int DV_PER_THREAD = DV  / SG_SIZE;
+        constexpr int BK            = fattn_dsplit::SG16_BK;
+
+        const int row_in_wg = item_ct1.get_local_id(1);   // 0..ROWS_PER_WG-1
+        const int lane      = item_ct1.get_local_id(2);    // 0..SG_SIZE-1
+        const int lid       = row_in_wg * SG_SIZE + lane;  // linear local id
+
+        // Grid mapping: group(0) = sequence*ne02+head, group(2) = q_block
+        const int q_block_idx = item_ct1.get_group(2);
+        const int head_seq    = item_ct1.get_group(0);
+        const int sequence    = head_seq / ne02;
+        const int head        = head_seq - sequence * ne02;
+        const int gqa_ratio   = ne02 / ne12;
+        const int kv_head     = head / gqa_ratio;
+
+        const int N    = ne01.z();  // number of Q rows
+        const int N_kv = ne11;      // number of KV rows
+
+        const int q_start = q_block_idx * ROWS_PER_WG;
+
+        if (q_start >= N) {
+            return;
+        }
+
+        const int  q_idx      = q_start + row_in_wg;
+        const bool active_row = (q_idx < N);
+
+        // SLM: K tile [BK][DQK] + V tile [BK][DV], stored as float
+        constexpr int shmem_floats = BK * DKQ + BK * DV;
+        sycl::ext::oneapi::experimental::work_group_static<float[shmem_floats]> shmem;
+        float * shK = &shmem[0];
+        float * shV = shK + BK * DKQ;
+
+        // Load Q into registers (each lane loads its D-slice, loaded once)
+        const float * Q_f = (const float *)(Q + nb03 * sequence + nb02 * head);
+
+        float regQ[DK_PER_THREAD];
+#pragma unroll
+        for (int i = 0; i < DK_PER_THREAD; ++i) {
+            if (active_row) {
+                const int d = lane + i * SG_SIZE;
+                regQ[i] = Q_f[(ptrdiff_t)q_idx * (nb01 / sizeof(float)) + d] * scale;
+            } else {
+                regQ[i] = 0.0f;
+            }
+        }
+
+        // Thread-local accumulators (D-split)
+        float acc[DV_PER_THREAD];
+#pragma unroll
+        for (int i = 0; i < DV_PER_THREAD; ++i) {
+            acc[i] = 0.0f;
+        }
+        float m_curr = -FLT_MAX / 2.0f;
+        float l_curr = 0.0f;
+
+        // KV base pointers
+        const char * K_base = K + nb13 * sequence + nb12 * kv_head;
+        const char * V_base = V + nb23 * sequence + nb22 * kv_head;
+
+        const sycl::half * maskh = mask ?
+            (const sycl::half *)(mask + nb33 * (sequence % ne33)) : nullptr;
+        const int mask_stride = nb31 / sizeof(sycl::half);
+
+        // Loop over KV blocks
+        for (int kv_start = 0; kv_start < N_kv; kv_start += BK) {
+            const int kv_chunk = sycl::min(BK, N_kv - kv_start);
+
+            // Load K tile cooperatively (all WG_SIZE threads participate)
+            // TODO: vectorized ggml_sycl_memcpy_1 loads are an option here
+            for (int idx = lid; idx < BK * DKQ; idx += WG_SIZE) {
+                const int k_local = idx / DKQ;
+                const int d       = idx % DKQ;
+                const int kv_idx  = kv_start + k_local;
+                if (kv_idx < N_kv) {
+                    shK[k_local * DKQ + d] = fattn_dsplit::to_float<KVType>(
+                        (const KVType *)(K_base + (ptrdiff_t)kv_idx * nb11) + d);
+                } else {
+                    shK[k_local * DKQ + d] = 0.0f;
+                }
+            }
+
+            // Load V tile cooperatively
+            // TODO: vectorized ggml_sycl_memcpy_1 loads are an option here
+            for (int idx = lid; idx < BK * DV; idx += WG_SIZE) {
+                const int v_local = idx / DV;
+                const int d       = idx % DV;
+                const int kv_idx  = kv_start + v_local;
+                if (kv_idx < N_kv) {
+                    shV[v_local * DV + d] = fattn_dsplit::to_float<KVType>(
+                        (const KVType *)(V_base + (ptrdiff_t)kv_idx * nb21) + d);
+                } else {
+                    shV[v_local * DV + d] = 0.0f;
+                }
+            }
+            item_ct1.barrier(sycl::access::fence_space::local_space);
+
+            // Per-row attention: each subgroup handles one query row
+            if (active_row) {
+                for (int k = 0; k < kv_chunk; ++k) {
+                    // D-split dot product: each lane computes partial over DKQ/SG_SIZE
+                    float partial_dot = 0.0f;
+#pragma unroll
+                    for (int di = 0; di < DK_PER_THREAD; ++di) {
+                        const int d = lane + di * SG_SIZE;
+                        partial_dot += regQ[di] * shK[k * DKQ + d];
+                    }
+                    float dot = warp_reduce_sum<SG_SIZE>(partial_dot);
+
+                    float logit = dot;  // scale already applied to Q
+
+                    if (maskh != nullptr) {
+                        const int global_k = kv_start + k;
+                        if (global_k < N_kv) {
+                            logit += static_cast<float>(maskh[q_idx * mask_stride + global_k]);
+                        } else {
+                            logit = -FLT_MAX / 2.0f;
+                        }
+                    }
+
+                    // Online softmax + P*V accumulation (fused per-element)
+                    float m_new = sycl::fmax(m_curr, logit);
+                    float alpha_prev = sycl::native::exp(m_curr - m_new);
+#pragma unroll
+                    for (int i = 0; i < DV_PER_THREAD; ++i) {
+                        acc[i] *= alpha_prev;
+                    }
+                    l_curr *= alpha_prev;
+
+                    float exp_val = sycl::native::exp(sycl::fmax(logit - m_new, SOFTMAX_FTZ_THRESHOLD));
+                    l_curr += exp_val;
+
+#pragma unroll
+                    for (int i = 0; i < DV_PER_THREAD; ++i) {
+                        const int d = lane + i * SG_SIZE;
+                        acc[i] += exp_val * shV[k * DV + d];
+                    }
+
+                    m_curr = m_new;
+                }
+
+                // Handle attention sinks (first tile only)
+                if (kv_start == 0 && sinks != nullptr) {
+                    float sink_val   = ((const float *)sinks)[head];
+                    float m_sink     = sycl::fmax(m_curr, sink_val);
+                    float alpha_sink = sycl::native::exp(m_curr - m_sink);
+#pragma unroll
+                    for (int i = 0; i < DV_PER_THREAD; ++i) {
+                        acc[i] *= alpha_sink;
+                    }
+                    l_curr = l_curr * alpha_sink + sycl::native::exp(sycl::fmax(sink_val - m_sink, SOFTMAX_FTZ_THRESHOLD));
+                    m_curr = m_sink;
+                }
+            }
+
+            item_ct1.barrier(sycl::access::fence_space::local_space);
+        }  // end KV blocks
+
+        // Final normalization and store
+        if (active_row) {
+            const float inv_l = 1.0f / (l_curr > 1e-10f ? l_curr : 1.0f);
+
+#pragma unroll
+            for (int i = 0; i < DV_PER_THREAD; ++i) {
+                const int d = lane + i * SG_SIZE;
+                const ptrdiff_t o_idx = ((ptrdiff_t)(sequence * N + q_idx) * ne02 + head) * DV + d;
+                dst[o_idx] = acc[i] * inv_l;
+            }
+        }
+        return;
+    }
+    // ================================================================
+    // End D-splitting mode.
+    // ================================================================
 
     static_assert(ggml_sycl_fattn_tile_get_config(DKQ, DV, ncols1*ncols2) != 0, "kernel config not defined");
 
@@ -1193,6 +1431,27 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_sycl_context & ctx, ggm
     const int warp_size = WARP_32_SIZE; //can't support WARP_16_SIZE
 
     constexpr size_t nbytes_shared = 0;
+
+    // D-splitting mode: SG16 subgroup D-splitting, 32 rows/WG, Q in registers.
+    // Preferred for F16/F32 types with small batch, DQK==DV, both multiples of 16.
+    // Does not support ALiBi (max_bias != 0), so fall through to regular tile kernel in that case.
+    if constexpr (DKQ == DV && DKQ % WARP_16_SIZE == 0 && DKQ <= 256 && ncols2 == 1 && !use_logit_softcap) {
+        constexpr int sg16_config = ggml_sycl_fattn_tile_get_config_sg16(DKQ, DV, 32);
+        if constexpr (sg16_config != 0) {
+            float max_bias = 0.0f;
+            memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+
+            if (Q->ne[1] <= 32 && max_bias == 0.0f) {
+                constexpr int ROWS_PER_WG = 32;
+                constexpr int nwarps      = ROWS_PER_WG;  // one subgroup per row
+                launch_fattn<DV, ROWS_PER_WG, 1,
+                    flash_attn_tile<DKQ, DV, ROWS_PER_WG, 1, false, WARP_16_SIZE, true>,
+                    WARP_16_SIZE>
+                    (ctx, dst, nwarps, 0, INT_MAX, true, true, false);
+                return;
+            }
+        }
+    }
 
     if (DV < 512 && Q->ne[1] < 32) {
         if constexpr (ncols2 <= 32) {
