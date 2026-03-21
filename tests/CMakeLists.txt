@@ -297,3 +297,8 @@ if (TARGET gguf-model-data)
     target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# MUL_MAT_ID benchmark (SYCL-specific)
+if (GGML_SYCL)
+    llama_build(test-mul-mat-id-bench.cpp)
+endif()
