@@ -3701,59 +3701,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const int64_t n_as  = ne02;
     const int64_t n_ids = ids->ne[0];
 
-    // Direct device-side path — no host memcpy needed
-    if (can_use_mul_mat_id_direct(dst)) {
-        const int64_t        n_tokens    = ids->ne[1];
-        const int            block_num_y = (ne01 + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
-        const sycl::range<3> block_nums(1, n_tokens * n_ids, block_num_y);
-        const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
-
-        const char *    src0_data   = (const char *) src0->data;
-        const float *   src1_data   = (const float *) src1->data;
-        float *         dst_data    = (float *) dst->data;
-        const int32_t * ids_data    = (const int32_t *) ids->data;
-        const int64_t   ids_nb1_val = ids->nb[1];
-        const int64_t   ids_nb0_val = ids->nb[0];
-
-        switch (src0->type) {
-            case GGML_TYPE_F32:
-                stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                         mul_mat_id_direct_f32_f32(src0_data, src1_data, dst_data, ids_data, ne00, ne01,
-                                                                   nb02, ne11, nb11, nb12, n_ids, ids_nb1_val,
-                                                                   ids_nb0_val, nb1, nb2, item_ct1);
-                                     });
-                break;
-            case GGML_TYPE_F16:
-                stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                         mul_mat_id_direct_f16_f32(src0_data, src1_data, dst_data, ids_data, ne00, ne01,
-                                                                   nb02, ne11, nb11, nb12, n_ids, ids_nb1_val,
-                                                                   ids_nb0_val, nb1, nb2, item_ct1);
-                                     });
-                break;
-            case GGML_TYPE_Q8_0:
-                stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                         mul_mat_id_direct_q8_0_f32(src0_data, src1_data, dst_data, ids_data, ne00,
-                                                                    ne01, nb02, ne11, nb11, nb12, n_ids, ids_nb1_val,
-                                                                    ids_nb0_val, nb1, nb2, item_ct1);
-                                     });
-                break;
-            case GGML_TYPE_Q4_K:
-                stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                         mul_mat_id_direct_q4_K_f32(src0_data, src1_data, dst_data, ids_data, ne00,
-                                                                    ne01, nb02, ne11, nb11, nb12, n_ids, ids_nb1_val,
-                                                                    ids_nb0_val, nb1, nb2, item_ct1);
-                                     });
-                break;
-            default:
-                GGML_ABORT("mul_mat_id_direct: unsupported type");
-        }
-        return;
-    }
-
     // Fallback: host-side routing (requires memcpy + wait)
     std::vector<char> ids_host(ggml_nbytes(ids));
     const char *      ids_dev = (const char *) ids->data;
@@ -4431,11 +4378,7 @@ static bool node_needs_immediate_mode(const ggml_tensor * node) {
         return true;
     }
     if (node->op == GGML_OP_MUL_MAT_ID) {
-        // Direct device-side kernel is graph-compatible (no host memcpy/wait)
-        if (can_use_mul_mat_id_direct(node)) {
-            return false;
-        }
-        // Fallback path uses host memcpy + blocking wait
+        // Data-dependent expert routing changes each call
         return true;
     }
     if (node->op == GGML_OP_MUL_MAT) {

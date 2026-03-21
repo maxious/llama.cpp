@@ -366,6 +366,7 @@ static void l2_norm_f32(const float *            x,
     const int channel = item_ct1.get_group(1);
     const int sample  = item_ct1.get_group(0);
     const int tid     = item_ct1.get_local_id(2);
+    const int nwarps  = block_size / WARP_SIZE;
 
     x += sample * stride_sample + channel * stride_channel + row * stride_row;
     dst += ((sample * nchannels + channel) * nrows + row) * ncols;
@@ -402,37 +403,6 @@ static void l2_norm_f32(const float *            x,
     for (int col = tid; col < ncols; col += block_size) {
         dst[col] = scale * x[col];
     }
-}
-
-// Warp-level reduction
-tmp = warp_reduce_sum(tmp, item_ct1);
-if (block_size > WARP_SIZE) {
-    const auto sub_group = item_ct1.get_sub_group();
-    const auto sg_id     = sub_group.get_group_linear_id();
-    const auto wi_in_sg  = sub_group.get_local_linear_id();
-    if (wi_in_sg == 0) {
-        s_sum[sg_id] = tmp;
-    }
-
-    item_ct1.barrier(sycl::access::fence_space::local_space);
-    const size_t nreduce = ceil_div(nwarps, WARP_SIZE);
-    tmp                  = 0.f;
-    for (size_t i = 0; i < nreduce; i += 1) {
-        tmp += s_sum[wi_in_sg + i * WARP_SIZE];
-    }
-    tmp = warp_reduce_sum(tmp, item_ct1);
-}
-
-// Ensure all threads have finished writing to s_row before reading
-item_ct1.barrier(sycl::access::fence_space::local_space);
-
-const float mean  = tmp / ncols;
-const float scale = sycl::rsqrt(mean + eps);
-
-// Second pass: read from SLM instead of global memory
-for (int col = tid; col < ncols; col += block_size) {
-    dst[col] = scale * s_row[col];
-}
 }
 
 static void norm_f32_sycl(const float * x,
