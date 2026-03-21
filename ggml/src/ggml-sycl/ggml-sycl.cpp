@@ -3793,6 +3793,59 @@ static void mul_mat_id_direct_f16_f32(const char * __restrict__ src0,
     }
 }
 
+// Direct MUL_MAT_ID kernel for ne12==1 (BF16 src0, F32 src1)
+#ifdef GGML_SYCL_HAS_BF16
+static void mul_mat_id_direct_bf16_f32(const char * __restrict__ src0,
+                                       const float * __restrict__ src1,
+                                       float * __restrict__ dst,
+                                       const int32_t * __restrict__ ids,
+                                       const int64_t            ne00,
+                                       const int64_t            ne01,
+                                       const int64_t            nb02,
+                                       const int64_t            ne11,
+                                       const int64_t            nb11,
+                                       const int64_t            nb12,
+                                       const int64_t            n_ids,
+                                       const int64_t            ids_nb1,
+                                       const int64_t            ids_nb0,
+                                       const int64_t            nb1,
+                                       const int64_t            nb2,
+                                       const sycl::nd_item<3> & item_ct1) {
+    const int row       = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+    const int token_idx = item_ct1.get_group(1);
+
+    if (row >= ne01) {
+        return;
+    }
+
+    const int64_t iid1 = token_idx / n_ids;
+    const int64_t id   = token_idx % n_ids;
+
+    const int32_t expert = *(const int32_t *) ((const char *) ids + iid1 * ids_nb1 + id * ids_nb0);
+
+    const int64_t i11 = id % ne11;
+    const int64_t i12 = iid1;
+
+    const sycl::ext::oneapi::bfloat16 * src0_expert =
+        (const sycl::ext::oneapi::bfloat16 *) ((const char *) src0 + (int64_t) expert * nb02);
+    const float * src1_token = (const float *) ((const char *) src1 + i11 * nb11 + i12 * nb12);
+    float *       dst_out    = (float *) ((char *) dst + id * nb1 + iid1 * nb2);
+
+    const int tid = item_ct1.get_local_id(2);
+
+    float sum = 0.0f;
+    for (int k = tid; k < ne00; k += WARP_SIZE) {
+        sum += static_cast<float>(src0_expert[row * ne00 + k]) * src1_token[k];
+    }
+
+    sum = warp_reduce_sum<WARP_SIZE>(sum, item_ct1);
+
+    if (tid == 0) {
+        dst_out[row] = sum;
+    }
+}
+#endif
+
 // Direct MUL_MAT_ID kernel for ne12==1 (Q8_0 src0, F32 src1)
 static void mul_mat_id_direct_q8_0_f32(const char * __restrict__ src0,
                                        const float * __restrict__ src1,
@@ -3927,15 +3980,17 @@ static void mul_mat_id_direct_q4_K_f32(const char * __restrict__ src0,
     }
 }
 
-// Check if the direct (graph-compatible) MUL_MAT_ID path can be used
 static bool can_use_mul_mat_id_direct(const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
-    // ne12==1 required: fallback path handles ne12>1 with pool allocations
-    // Supported src0 types, F32 src1/dst, contiguous
+    bool                bf16_support =
+#ifdef GGML_SYCL_HAS_BF16
+        src0->type == GGML_TYPE_BF16 ||
+#endif
+        false;
     return dst->ne[2] == 1 &&
-           (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_Q8_0 ||
-            src0->type == GGML_TYPE_Q4_K) &&
+           (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || bf16_support ||
+            src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_K) &&
            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) &&
            ggml_is_contiguous(src1);
 }
@@ -3985,6 +4040,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                                    ids_nb0_val, nb1, nb2, item_ct1);
                                      });
                 break;
+#ifdef GGML_SYCL_HAS_BF16
+            case GGML_TYPE_BF16:
+                stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                         mul_mat_id_direct_bf16_f32(src0_data, src1_data, dst_data, ids_data, ne00,
+                                                                    ne01, nb02, ne11, nb11, nb12, n_ids, ids_nb1_val,
+                                                                    ids_nb0_val, nb1, nb2, item_ct1);
+                                     });
+                break;
+#endif
             case GGML_TYPE_Q8_0:
                 stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                                      [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
