@@ -3687,6 +3687,259 @@ __dpct_inline__ static void k_copy_dst_from_contiguous(char * __restrict__ dst_o
     }
 }
 
+// Direct MUL_MAT_ID kernel for ne12==1 (F32 src0)
+// Each work-group handles one (row_block, iid1, id) and computes dot products
+// without any host-side expert routing.
+static void mul_mat_id_direct_f32_f32(
+    const char * __restrict__ src0,    // all experts: [ne02 experts, ne01 rows, ne00 cols]
+    const float * __restrict__ src1,   // input
+    float * __restrict__ dst,          // output
+    const int32_t * __restrict__ ids,  // expert IDs on device
+    const int64_t            ne00,     // src0 cols (K dimension)
+    const int64_t            ne01,     // src0 rows per expert
+    const int64_t            nb02,     // src0 bytes per expert
+    const int64_t            ne11,     // src1 rows
+    const int64_t            nb11,     // src1 row stride bytes
+    const int64_t            nb12,     // src1 batch stride bytes
+    const int64_t            n_ids,    // top-k
+    const int64_t            ids_nb1,  // ids row stride bytes
+    const int64_t            ids_nb0,  // ids element stride bytes
+    const int64_t            nb1,      // dst row stride bytes
+    const int64_t            nb2,      // dst batch stride bytes
+    const sycl::nd_item<3> & item_ct1) {
+    const int row       = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+    const int token_idx = item_ct1.get_group(1);
+
+    if (row >= ne01) {
+        return;
+    }
+
+    const int64_t iid1 = token_idx / n_ids;
+    const int64_t id   = token_idx % n_ids;
+
+    // Read expert ID directly from device memory
+    const int32_t expert = *(const int32_t *) ((const char *) ids + iid1 * ids_nb1 + id * ids_nb0);
+
+    const int64_t i11 = id % ne11;
+    const int64_t i12 = iid1;
+
+    const float * src0_expert = (const float *) ((const char *) src0 + (int64_t) expert * nb02);
+    const float * src1_token  = (const float *) ((const char *) src1 + i11 * nb11 + i12 * nb12);
+    float *       dst_out     = (float *) ((char *) dst + id * nb1 + iid1 * nb2);
+
+    const int tid = item_ct1.get_local_id(2);
+
+    // Dot product: src0_expert[row, :] · src1_token[:]
+    float sum = 0.0f;
+    for (int k = tid; k < ne00; k += WARP_SIZE) {
+        sum += src0_expert[row * ne00 + k] * src1_token[k];
+    }
+
+    // Warp reduction
+    sum = warp_reduce_sum<WARP_SIZE>(sum, item_ct1);
+
+    if (tid == 0) {
+        dst_out[row] = sum;
+    }
+}
+
+// Direct MUL_MAT_ID kernel for ne12==1 (F16 src0, F32 src1)
+static void mul_mat_id_direct_f16_f32(const char * __restrict__ src0,
+                                      const float * __restrict__ src1,
+                                      float * __restrict__ dst,
+                                      const int32_t * __restrict__ ids,
+                                      const int64_t            ne00,
+                                      const int64_t            ne01,
+                                      const int64_t            nb02,
+                                      const int64_t            ne11,
+                                      const int64_t            nb11,
+                                      const int64_t            nb12,
+                                      const int64_t            n_ids,
+                                      const int64_t            ids_nb1,
+                                      const int64_t            ids_nb0,
+                                      const int64_t            nb1,
+                                      const int64_t            nb2,
+                                      const sycl::nd_item<3> & item_ct1) {
+    const int row       = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+    const int token_idx = item_ct1.get_group(1);
+
+    if (row >= ne01) {
+        return;
+    }
+
+    const int64_t iid1 = token_idx / n_ids;
+    const int64_t id   = token_idx % n_ids;
+
+    const int32_t expert = *(const int32_t *) ((const char *) ids + iid1 * ids_nb1 + id * ids_nb0);
+
+    const int64_t i11 = id % ne11;
+    const int64_t i12 = iid1;
+
+    const sycl::half * src0_expert = (const sycl::half *) ((const char *) src0 + (int64_t) expert * nb02);
+    const float *      src1_token  = (const float *) ((const char *) src1 + i11 * nb11 + i12 * nb12);
+    float *            dst_out     = (float *) ((char *) dst + id * nb1 + iid1 * nb2);
+
+    const int tid = item_ct1.get_local_id(2);
+
+    float sum = 0.0f;
+    for (int k = tid; k < ne00; k += WARP_SIZE) {
+        sum += static_cast<float>(src0_expert[row * ne00 + k]) * src1_token[k];
+    }
+
+    sum = warp_reduce_sum<WARP_SIZE>(sum, item_ct1);
+
+    if (tid == 0) {
+        dst_out[row] = sum;
+    }
+}
+
+// Direct MUL_MAT_ID kernel for ne12==1 (Q8_0 src0, F32 src1)
+static void mul_mat_id_direct_q8_0_f32(const char * __restrict__ src0,
+                                       const float * __restrict__ src1,
+                                       float * __restrict__ dst,
+                                       const int32_t * __restrict__ ids,
+                                       const int64_t            ne00,
+                                       const int64_t            ne01,
+                                       const int64_t            nb02,
+                                       const int64_t            ne11,
+                                       const int64_t            nb11,
+                                       const int64_t            nb12,
+                                       const int64_t            n_ids,
+                                       const int64_t            ids_nb1,
+                                       const int64_t            ids_nb0,
+                                       const int64_t            nb1,
+                                       const int64_t            nb2,
+                                       const sycl::nd_item<3> & item_ct1) {
+    const int row       = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+    const int token_idx = item_ct1.get_group(1);
+
+    if (row >= ne01) {
+        return;
+    }
+
+    const int64_t iid1 = token_idx / n_ids;
+    const int64_t id   = token_idx % n_ids;
+
+    const int32_t expert = *(const int32_t *) ((const char *) ids + iid1 * ids_nb1 + id * ids_nb0);
+
+    const int64_t i11 = id % ne11;
+    const int64_t i12 = iid1;
+
+    const char *  src0_expert = src0 + (int64_t) expert * nb02;
+    const float * src1_token  = (const float *) ((const char *) src1 + i11 * nb11 + i12 * nb12);
+    float *       dst_out     = (float *) ((char *) dst + id * nb1 + iid1 * nb2);
+
+    const int tid = item_ct1.get_local_id(2);
+
+    // Q8_0: blocks of 32 int8 quants with fp16 scale
+    const int blocks_per_row = ne00 / QK8_0;
+    float     sum            = 0.0f;
+
+    for (int b = tid; b < blocks_per_row; b += WARP_SIZE) {
+        const block_q8_0 * bx = (const block_q8_0 *) (src0_expert + row * blocks_per_row * sizeof(block_q8_0)) + b;
+        const float        d  = sycl::vec<sycl::half, 1>(bx->d).convert<float, sycl::rounding_mode::automatic>()[0];
+
+        float block_sum = 0.0f;
+        for (int k = 0; k < QK8_0; ++k) {
+            block_sum += (float) bx->qs[k] * src1_token[b * QK8_0 + k];
+        }
+        sum += d * block_sum;
+    }
+
+    sum = warp_reduce_sum<WARP_SIZE>(sum, item_ct1);
+
+    if (tid == 0) {
+        dst_out[row] = sum;
+    }
+}
+
+// Direct MUL_MAT_ID kernel for ne12==1 (Q4_K src0, F32 src1)
+static void mul_mat_id_direct_q4_K_f32(const char * __restrict__ src0,
+                                       const float * __restrict__ src1,
+                                       float * __restrict__ dst,
+                                       const int32_t * __restrict__ ids,
+                                       const int64_t            ne00,
+                                       const int64_t            ne01,
+                                       const int64_t            nb02,
+                                       const int64_t            ne11,
+                                       const int64_t            nb11,
+                                       const int64_t            nb12,
+                                       const int64_t            n_ids,
+                                       const int64_t            ids_nb1,
+                                       const int64_t            ids_nb0,
+                                       const int64_t            nb1,
+                                       const int64_t            nb2,
+                                       const sycl::nd_item<3> & item_ct1) {
+    const int row       = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+    const int token_idx = item_ct1.get_group(1);
+
+    if (row >= ne01) {
+        return;
+    }
+
+    const int64_t iid1 = token_idx / n_ids;
+    const int64_t id   = token_idx % n_ids;
+
+    const int32_t expert = *(const int32_t *) ((const char *) ids + iid1 * ids_nb1 + id * ids_nb0);
+
+    const int64_t i11 = id % ne11;
+    const int64_t i12 = iid1;
+
+    const char *  src0_expert = src0 + (int64_t) expert * nb02;
+    const float * src1_token  = (const float *) ((const char *) src1 + i11 * nb11 + i12 * nb12);
+    float *       dst_out     = (float *) ((char *) dst + id * nb1 + iid1 * nb2);
+
+    const int tid = item_ct1.get_local_id(2);
+
+    // Q4_K: super-blocks of 256 elements, 8 sub-blocks of 32
+    const int blocks_per_row = ne00 / QK_K;
+    float     sum            = 0.0f;
+
+    for (int b = tid; b < blocks_per_row; b += WARP_SIZE) {
+        const block_q4_K * bx   = (const block_q4_K *) (src0_expert + row * blocks_per_row * sizeof(block_q4_K)) + b;
+        const sycl::float2 dm   = bx->dm.convert<float, sycl::rounding_mode::automatic>();
+        const float        d    = dm.x();
+        const float        dmin = dm.y();
+
+        for (int sb = 0; sb < 8; ++sb) {
+            uint8_t sc_val, m_val;
+            get_scale_min_k4(sb, bx->scales, sc_val, m_val);
+
+            const float scale   = d * sc_val;
+            const float min_val = dmin * m_val;
+
+            const int pair = sb / 2;
+            const int hi   = sb & 1;
+
+            for (int k = 0; k < 32; ++k) {
+                const int     elem_idx = sb * 32 + k;
+                const uint8_t byte     = bx->qs[32 * pair + k];
+                const int8_t  q        = hi ? (int8_t) (byte >> 4) : (int8_t) (byte & 0x0F);
+                sum += (scale * q - min_val) * src1_token[b * QK_K + elem_idx];
+            }
+        }
+    }
+
+    sum = warp_reduce_sum<WARP_SIZE>(sum, item_ct1);
+
+    if (tid == 0) {
+        dst_out[row] = sum;
+    }
+}
+
+// Check if the direct (graph-compatible) MUL_MAT_ID path can be used
+static bool can_use_mul_mat_id_direct(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    // ne12==1 required: fallback path handles ne12>1 with pool allocations
+    // Supported src0 types, F32 src1/dst, contiguous
+    return dst->ne[2] == 1 &&
+           (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_Q8_0 ||
+            src0->type == GGML_TYPE_Q4_K) &&
+           src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) &&
+           ggml_is_contiguous(src1);
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
     const ggml_tensor *  src0 = dst->src[0];
@@ -3700,6 +3953,59 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
     const int64_t n_as  = ne02;
     const int64_t n_ids = ids->ne[0];
+
+    // Direct device-side path — no host memcpy needed
+    if (can_use_mul_mat_id_direct(dst)) {
+        const int64_t        n_tokens    = ids->ne[1];
+        const int            block_num_y = (ne01 + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+        const sycl::range<3> block_nums(1, n_tokens * n_ids, block_num_y);
+        const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+
+        const char *    src0_data   = (const char *) src0->data;
+        const float *   src1_data   = (const float *) src1->data;
+        float *         dst_data    = (float *) dst->data;
+        const int32_t * ids_data    = (const int32_t *) ids->data;
+        const int64_t   ids_nb1_val = ids->nb[1];
+        const int64_t   ids_nb0_val = ids->nb[0];
+
+        switch (src0->type) {
+            case GGML_TYPE_F32:
+                stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                         mul_mat_id_direct_f32_f32(src0_data, src1_data, dst_data, ids_data, ne00, ne01,
+                                                                   nb02, ne11, nb11, nb12, n_ids, ids_nb1_val,
+                                                                   ids_nb0_val, nb1, nb2, item_ct1);
+                                     });
+                break;
+            case GGML_TYPE_F16:
+                stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                         mul_mat_id_direct_f16_f32(src0_data, src1_data, dst_data, ids_data, ne00, ne01,
+                                                                   nb02, ne11, nb11, nb12, n_ids, ids_nb1_val,
+                                                                   ids_nb0_val, nb1, nb2, item_ct1);
+                                     });
+                break;
+            case GGML_TYPE_Q8_0:
+                stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                         mul_mat_id_direct_q8_0_f32(src0_data, src1_data, dst_data, ids_data, ne00,
+                                                                    ne01, nb02, ne11, nb11, nb12, n_ids, ids_nb1_val,
+                                                                    ids_nb0_val, nb1, nb2, item_ct1);
+                                     });
+                break;
+            case GGML_TYPE_Q4_K:
+                stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                         mul_mat_id_direct_q4_K_f32(src0_data, src1_data, dst_data, ids_data, ne00,
+                                                                    ne01, nb02, ne11, nb11, nb12, n_ids, ids_nb1_val,
+                                                                    ids_nb0_val, nb1, nb2, item_ct1);
+                                     });
+                break;
+            default:
+                GGML_ABORT("mul_mat_id_direct: unsupported type");
+        }
+        return;
+    }
 
     // Fallback: host-side routing (requires memcpy + wait)
     std::vector<char> ids_host(ggml_nbytes(ids));
@@ -4378,7 +4684,11 @@ static bool node_needs_immediate_mode(const ggml_tensor * node) {
         return true;
     }
     if (node->op == GGML_OP_MUL_MAT_ID) {
-        // Data-dependent expert routing changes each call
+        // Direct device-side kernel is graph-compatible (no host memcpy/wait)
+        if (can_use_mul_mat_id_direct(node)) {
+            return false;
+        }
+        // Fallback path uses host memcpy + blocking wait
         return true;
     }
     if (node->op == GGML_OP_MUL_MAT) {
