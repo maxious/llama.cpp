@@ -4457,8 +4457,15 @@ static bool node_needs_immediate_mode(const ggml_tensor * node) {
         // Non-contiguous tensors cause pool alloc of temp copies — stale pointers on replay.
         // Batched paths (ne12*ne13 > 1) iterate with varying offsets.
         // F16/F32 type matmuls go through oneMKL GEMM which has internal .wait() calls.
-        if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || src1->ne[2] * src1->ne[3] > 1 ||
-            src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32) {
+        if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || src0->type == GGML_TYPE_F16 ||
+            src0->type == GGML_TYPE_F32) {
+            // Batched F16 matmul (KQV attention): graph-compatible when async memory
+            // is available, since pool allocs become async_malloc (graph-recordable)
+            // and oneDNN matmul is fully asynchronous with no host waits.
+            if (src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) &&
+                src1->ne[2] * src1->ne[3] > 1) {
+                return !g_ggml_sycl_use_async_mem_op;
+            }
             return true;
         }
 
