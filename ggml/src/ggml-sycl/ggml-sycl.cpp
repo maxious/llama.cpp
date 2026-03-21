@@ -5181,15 +5181,19 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                 // Segmented Tier 0: Pure replay cached segments + eager immediate nodes
                 GGML_SYCL_DEBUG("[SYCL-GRAPH-SEG] pure replay (%d graph segments)\n", n_graph_segments);
 
-                int seg_idx = 0;
+                int         seg_idx = 0;
+                sycl::event last_graph_event;
                 for (const auto & step : plan) {
                     if (step.kind == graph_exec_step::GRAPH_SEGMENT) {
+                        auto &                   exec = seg_cache_it->second.segment_graphs[seg_idx];
+                        std::vector<sycl::event> deps;
                         if (seg_idx > 0 || n_immediate_steps > 0) {
-                            sycl_ctx->stream()->wait();
+                            deps.push_back(sycl_ctx->stream()->ext_oneapi_submit_barrier());
                         }
-                        sycl_ctx->graph_exec_stream()->ext_oneapi_graph(
-                            *(seg_cache_it->second.segment_graphs[seg_idx]));
-                        sycl_ctx->graph_exec_stream()->wait();
+                        last_graph_event = sycl_ctx->graph_exec_stream()->ext_oneapi_graph(*exec, deps);
+                        if (seg_idx < n_graph_segments - 1 || n_immediate_steps > 0) {
+                            sycl_ctx->stream()->ext_oneapi_submit_barrier({ last_graph_event });
+                        }
                         seg_idx++;
                     } else {
                         ggml_backend_sycl_compute_nodes(sycl_ctx, cgraph, step.node_begin, step.node_end);
@@ -5200,8 +5204,6 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                 GGML_SYCL_DEBUG("[SYCL-GRAPH-SEG] %s (%d graph segments)\n",
                                 seg_cached ? "re-recording" : "cache miss, recording", n_graph_segments);
 
-                sycl_ctx->stream()->wait();
-
                 if (!seg_cached && sycl_ctx->segmented_graph_cache.size() >= sycl_ctx->MAX_GRAPH_CACHE_SIZE) {
                     auto evict_it = sycl_ctx->segmented_graph_cache.begin();
                     sycl_ctx->segmented_graph_cache.erase(evict_it);
@@ -5210,6 +5212,11 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                 auto & cache_entry = sycl_ctx->segmented_graph_cache[graph_hash];
                 cache_entry.segment_graphs.clear();
                 cache_entry.segment_graphs.reserve(n_graph_segments);
+                cache_entry.segment_events.clear();
+                cache_entry.segment_events.reserve(n_graph_segments);
+
+                sycl::event last_graph_event;
+                int         executed_seg_idx = 0;
 
                 for (const auto & step : plan) {
                     if (step.kind == graph_exec_step::GRAPH_SEGMENT) {
@@ -5225,11 +5232,19 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                             std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(
                                 std::move(exec)));
 
-                        sycl_ctx->graph_exec_stream()->ext_oneapi_graph(*(cache_entry.segment_graphs.back()));
-                        sycl_ctx->graph_exec_stream()->wait();
+                        std::vector<sycl::event> deps;
+                        if (executed_seg_idx > 0 || n_immediate_steps > 0) {
+                            deps.push_back(sycl_ctx->stream()->ext_oneapi_submit_barrier());
+                        }
+                        last_graph_event =
+                            sycl_ctx->graph_exec_stream()->ext_oneapi_graph(*(cache_entry.segment_graphs.back()), deps);
+                        cache_entry.segment_events.push_back(last_graph_event);
+                        if (executed_seg_idx < n_graph_segments - 1 || n_immediate_steps > 0) {
+                            sycl_ctx->stream()->ext_oneapi_submit_barrier({ last_graph_event });
+                        }
+                        executed_seg_idx++;
                     } else {
                         ggml_backend_sycl_compute_nodes(sycl_ctx, cgraph, step.node_begin, step.node_end);
-                        sycl_ctx->stream()->wait();
                     }
                 }
 

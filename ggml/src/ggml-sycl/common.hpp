@@ -313,6 +313,7 @@ struct ggml_sycl_graph {
 // Cache entry for segmented graph execution
 struct ggml_sycl_segmented_graph_cache_entry {
     std::vector<std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>> segment_graphs;
+    std::vector<sycl::event>                                                               segment_events;
     uint64_t                                                                               pointer_hash = 0;
 };
 #endif  // GGML_SYCL_GRAPH
