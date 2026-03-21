@@ -3831,7 +3831,6 @@ static void mul_mat_id_direct_q8_0_f32(const char * __restrict__ src0,
 
     const int tid = item_ct1.get_local_id(2);
 
-    // Q8_0: blocks of 32 int8 quants with fp16 scale
     const int blocks_per_row = ne00 / QK8_0;
     float     sum            = 0.0f;
 
@@ -3840,6 +3839,7 @@ static void mul_mat_id_direct_q8_0_f32(const char * __restrict__ src0,
         const float        d  = sycl::vec<sycl::half, 1>(bx->d).convert<float, sycl::rounding_mode::automatic>()[0];
 
         float block_sum = 0.0f;
+#pragma unroll
         for (int k = 0; k < QK8_0; ++k) {
             block_sum += (float) bx->qs[k] * src1_token[b * QK8_0 + k];
         }
@@ -3891,7 +3891,6 @@ static void mul_mat_id_direct_q4_K_f32(const char * __restrict__ src0,
 
     const int tid = item_ct1.get_local_id(2);
 
-    // Q4_K: super-blocks of 256 elements, 8 sub-blocks of 32
     const int blocks_per_row = ne00 / QK_K;
     float     sum            = 0.0f;
 
@@ -3908,14 +3907,15 @@ static void mul_mat_id_direct_q4_K_f32(const char * __restrict__ src0,
             const float scale   = d * sc_val;
             const float min_val = dmin * m_val;
 
-            const int pair = sb / 2;
-            const int hi   = sb & 1;
+            const int pair     = sb / 2;
+            const int hi       = sb & 1;
+            const int base_idx = b * QK_K + sb * 32;
 
+#pragma unroll
             for (int k = 0; k < 32; ++k) {
-                const int     elem_idx = sb * 32 + k;
-                const uint8_t byte     = bx->qs[32 * pair + k];
-                const int8_t  q        = hi ? (int8_t) (byte >> 4) : (int8_t) (byte & 0x0F);
-                sum += (scale * q - min_val) * src1_token[b * QK_K + elem_idx];
+                const uint8_t byte = bx->qs[32 * pair + k];
+                const int8_t  q    = hi ? (int8_t) (byte >> 4) : (int8_t) (byte & 0x0F);
+                sum += (scale * q - min_val) * src1_token[base_idx + k];
             }
         }
     }
