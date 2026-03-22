@@ -322,11 +322,19 @@ struct ggml_backend_sycl_context {
     int              device;
     std::string      name;
     optimize_feature opt_feature;
+    bool             graph_recording_active = false;
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
     explicit ggml_backend_sycl_context(int device) : device(device), name(GGML_SYCL_NAME + std::to_string(device)) {
         opt_feature = ggml_sycl_info().devices[device].opt_feature;
+    }
+
+    ~ggml_backend_sycl_context() {
+        if (graph_src1_f16_buf) {
+            sycl::free(graph_src1_f16_buf, *(stream()));
+            graph_src1_f16_buf = nullptr;
+        }
     }
 
     queue_ptr stream(int device, int stream) {
@@ -337,6 +345,47 @@ struct ggml_backend_sycl_context {
     }
 
     queue_ptr stream() { return stream(device, 0); }
+
+    // Persistent graph-owned F16 conversion buffer for batched MUL_MAT.
+    // When src1 is F32, ggml_sycl_mul_mat_batched_sycl converts to F16 into
+    // a pool-allocated temp that would be freed after recording. This persistent
+    // buffer survives across graph replays so the recorded pointers stay valid.
+    sycl::half * graph_src1_f16_buf      = nullptr;
+    size_t       graph_src1_f16_buf_size = 0;  // in elements
+
+    sycl::half * get_graph_src1_f16_buf(size_t nelements, sycl::queue * stream) {
+        if (nelements <= graph_src1_f16_buf_size && graph_src1_f16_buf != nullptr) {
+            return graph_src1_f16_buf;
+        }
+        if (graph_src1_f16_buf) {
+            sycl::free(graph_src1_f16_buf, *stream);
+        }
+        graph_src1_f16_buf      = (sycl::half *) sycl::malloc_device(nelements * sizeof(sycl::half), *stream);
+        graph_src1_f16_buf_size = nelements;
+        return graph_src1_f16_buf;
+    }
+
+    // Persistent graph-owned pointer tables for batched/GQA MUL_MAT paths.
+    // Keyed by element count to reuse across graph recording/replay and avoid
+    // stale RAII pool allocations captured in SYCL graphs.
+    std::map<size_t, std::unique_ptr<ggml_sycl_pool_alloc<const void *>>> graph_ptrs_src_cache;
+    std::map<size_t, std::unique_ptr<ggml_sycl_pool_alloc<void *>>>       graph_ptrs_dst_cache;
+
+    const void ** get_graph_batched_src_ptrs(size_t count) {
+        auto & slot = graph_ptrs_src_cache[count];
+        if (!slot) {
+            slot = std::make_unique<ggml_sycl_pool_alloc<const void *>>(pool(), count);
+        }
+        return slot->get();
+    }
+
+    void ** get_graph_batched_dst_ptrs(size_t count) {
+        auto & slot = graph_ptrs_dst_cache[count];
+        if (!slot) {
+            slot = std::make_unique<ggml_sycl_pool_alloc<void *>>(pool(), count);
+        }
+        return slot->get();
+    }
 
 #if GGML_SYCL_DNNL
     dnnl::engine make_engine(sycl::queue * q) {

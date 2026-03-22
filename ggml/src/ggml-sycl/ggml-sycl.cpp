@@ -3012,23 +3012,28 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
         }
 #if GGML_SYCL_DNNL
         // oneDNN handles strided data and does not need overhead of ggml_get_to_fp16_nc_sycl
-        const int64_t ne_src1 = src1->nb[last_str] * src1->ne[last_dim] / type_size_src1;
-        src1_f16_alloc.alloc(ne_src1);
+        const int64_t        ne_src1      = src1->nb[last_str] * src1->ne[last_dim] / type_size_src1;
+        // Use persistent buffer during graph recording to avoid stale pool pointers on replay
+        sycl::half *         src1_f16_dst = ctx.graph_recording_active ? ctx.get_graph_src1_f16_buf(ne_src1, queue) :
+                                                                         (src1_f16_alloc.alloc(ne_src1), src1_f16_alloc.get());
         const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
         GGML_ASSERT(to_fp16_sycl != nullptr);
-        to_fp16_sycl(src1_f16, src1_f16_alloc.get(), ne_src1, queue);
+        to_fp16_sycl(src1_f16, src1_f16_dst, ne_src1, queue);
+        src1_f16 = src1_f16_dst;
 #else
-        const int64_t ne_src1 = ggml_nelements(src1);
-        src1_f16_alloc.alloc(ne_src1);
+        const int64_t           ne_src1      = ggml_nelements(src1);
+        // Use persistent buffer during graph recording to avoid stale pool pointers on replay
+        sycl::half *            src1_f16_dst = ctx.graph_recording_active ? ctx.get_graph_src1_f16_buf(ne_src1, queue) :
+                                                                            (src1_f16_alloc.alloc(ne_src1), src1_f16_alloc.get());
         const to_fp16_nc_sycl_t to_fp16_nc_sycl = ggml_get_to_fp16_nc_sycl(src1->type);
         GGML_ASSERT(to_fp16_nc_sycl != nullptr);
-        to_fp16_nc_sycl(src1_f16, src1_f16_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, queue);
+        to_fp16_nc_sycl(src1_f16, src1_f16_dst, ne10, ne11, ne12, ne13, s11, s12, s13, queue);
+        src1_f16 = src1_f16_dst;
 #endif
 
-        src1_f16 = src1_f16_alloc.get();
-        s11      = ne10;
-        s12      = ne11 * s11;
-        s13      = ne12 * s12;
+        s11 = ne10;
+        s12 = ne11 * s11;
+        s13 = ne12 * s12;
 
         is_src1_cont_2 = true;
     }
@@ -3156,27 +3161,38 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
         } else {
             const int ne23 = ne12 * ne13;
 
-            ggml_sycl_pool_alloc<const void *>         ptrs_src(ctx.pool(), 2 * ne23);
-            ggml_sycl_pool_alloc<void *>               ptrs_dst(ctx.pool(), 1 * ne23);
+            ggml_sycl_pool_alloc<const void *>         ptrs_src_local;
+            ggml_sycl_pool_alloc<void *>               ptrs_dst_local;
             ggml_sycl_pool_alloc<matrix_info_t<float>> matrix_info(ctx.host_pool(), 1);
+
+            const void ** ptrs_src_ptrs;
+            void **       ptrs_dst_ptrs;
+
+            if (ctx.graph_recording_active) {
+                ptrs_src_ptrs = ctx.get_graph_batched_src_ptrs(2 * ne23);
+                ptrs_dst_ptrs = ctx.get_graph_batched_dst_ptrs(1 * ne23);
+            } else {
+                ptrs_src_local.alloc(ctx.pool(), 2 * ne23);
+                ptrs_dst_local.alloc(ctx.pool(), 1 * ne23);
+                ptrs_src_ptrs = ptrs_src_local.get();
+                ptrs_dst_ptrs = ptrs_dst_local.get();
+            }
 
             sycl::range<3> block_dims(1, ne12, ne13);
             queue->submit([&](sycl::handler & cgh) {
-                const void ** ptrs_src_get = ptrs_src.get();
-                void **       ptrs_dst_get = ptrs_dst.get();
-                size_t        nb12_scaled  = src1->type == GGML_TYPE_F16 ? nb12 : s12 * sizeof(sycl::half);
-                size_t        nb13_scaled  = src1->type == GGML_TYPE_F16 ? nb13 : s13 * sizeof(sycl::half);
+                size_t nb12_scaled = src1->type == GGML_TYPE_F16 ? nb12 : s12 * sizeof(sycl::half);
+                size_t nb13_scaled = src1->type == GGML_TYPE_F16 ? nb13 : s13 * sizeof(sycl::half);
                 cgh.parallel_for(sycl::nd_range<3>(block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-                    k_compute_batched_ptrs(src0_f16, src1_f16, dst_ddf, ptrs_src_get, ptrs_dst_get, ne12, ne13, ne23,
+                    k_compute_batched_ptrs(src0_f16, src1_f16, dst_ddf, ptrs_src_ptrs, ptrs_dst_ptrs, ne12, ne13, ne23,
                                            nb02, nb03, nb12_scaled, nb13_scaled, nbd2, nbd3, r2, r3, item_ct1);
                 });
             });
 
             SYCL_CHECK(CHECK_TRY_ERROR(dpct::gemm_batch(
                 *queue, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans, ne01, ne11, ne10, alpha,
-                (const void **) (ptrs_src.get() + 0 * ne23), dpct::library_data_t::real_half, nb01 / nb00,
-                (const void **) (ptrs_src.get() + 1 * ne23), dpct::library_data_t::real_half, s11, beta,
-                (void **) (ptrs_dst.get() + 0 * ne23), mkl_data_type, ne0, ne23, mkl_compute_type, matrix_info.get())));
+                (const void **) (ptrs_src_ptrs + 0 * ne23), dpct::library_data_t::real_half, nb01 / nb00,
+                (const void **) (ptrs_src_ptrs + 1 * ne23), dpct::library_data_t::real_half, s11, beta,
+                (void **) (ptrs_dst_ptrs + 0 * ne23), mkl_data_type, ne0, ne23, mkl_compute_type, matrix_info.get())));
         }
     }
 } catch (const sycl::exception & exc) {
@@ -5160,9 +5176,11 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
 
                 sycl_ex::command_graph mod_graph(*(sycl_ctx->stream()),
                                                  { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
+                sycl_ctx->graph_recording_active = true;
                 mod_graph.begin_recording(*(sycl_ctx->stream()));
                 ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
                 mod_graph.end_recording();
+                sycl_ctx->graph_recording_active = false;
 
                 auto exec =
                     updatable ? mod_graph.finalize(sycl_ex::property::graph::updatable{}) : mod_graph.finalize();
@@ -5222,9 +5240,11 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                     if (step.kind == graph_exec_step::GRAPH_SEGMENT) {
                         sycl_ex::command_graph seg_graph(*(sycl_ctx->stream()),
                                                          { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
+                        sycl_ctx->graph_recording_active = true;
                         seg_graph.begin_recording(*(sycl_ctx->stream()));
                         ggml_backend_sycl_compute_nodes(sycl_ctx, cgraph, step.node_begin, step.node_end);
                         seg_graph.end_recording();
+                        sycl_ctx->graph_recording_active = false;
 
                         auto exec = updatable ? seg_graph.finalize(sycl_ex::property::graph::updatable{}) :
                                                 seg_graph.finalize();
