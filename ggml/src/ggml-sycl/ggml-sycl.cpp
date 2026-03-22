@@ -270,12 +270,25 @@ static void ggml_check_sycl() try {
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
         g_ggml_sycl_use_async_mem_op = !g_ggml_sycl_disable_graph;
         if (g_ggml_sycl_use_async_mem_op) {
+            fprintf(stderr, "[SYCL] Checking async memory support for %d devices\n",
+                    dpct::dev_mgr::instance().device_count());
             for (unsigned int i = 0; i < dpct::dev_mgr::instance().device_count(); ++i) {
-                if (!dpct::dev_mgr::instance().get_device(i).has(sycl::aspect::ext_oneapi_async_memory_alloc)) {
+                auto & dev = dpct::dev_mgr::instance().get_device(i);
+                fprintf(stderr, "[SYCL]   Device %d: is_cpu=%d, has_async_mem=%d\n", i, dev.has(sycl::aspect::cpu),
+                        dev.has(sycl::aspect::ext_oneapi_async_memory_alloc));
+                // Only check GPU devices - CPU devices don't support async memory allocation
+                // and should not affect whether we can use it for graph operations
+                if (dev.has(sycl::aspect::cpu)) {
+                    fprintf(stderr, "[SYCL]     -> Skipping CPU device\n");
+                    continue;
+                }
+                if (!dev.has(sycl::aspect::ext_oneapi_async_memory_alloc)) {
+                    fprintf(stderr, "[SYCL]     -> GPU device lacks async memory support, disabling async mem ops\n");
                     g_ggml_sycl_use_async_mem_op = 0;
                     break;
                 }
             }
+            fprintf(stderr, "[SYCL] g_ggml_sycl_use_async_mem_op = %d\n", g_ggml_sycl_use_async_mem_op);
         }
 #endif
         if (CHECK_TRY_ERROR(g_all_sycl_device_count = dpct::dev_mgr::instance().device_count()) != 0) {
@@ -4761,15 +4774,15 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
 // Check if a node must be executed in immediate mode (can't be graph-recorded)
 static bool node_needs_immediate_mode(const ggml_tensor * node) {
     if (node->op == GGML_OP_CONCAT) {
-        // ggml_sycl_op_concat() does blocking host waits after memcpy
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] IMMEDIATE: op=%s reason=concat_has_blocking_memcpy\n", ggml_op_name(node->op));
         return true;
     }
     if (node->op == GGML_OP_MUL_MAT_ID) {
-        // Direct device-side kernel is graph-compatible (no host memcpy/wait)
         if (can_use_mul_mat_id_direct(node)) {
             return false;
         }
-        // Fallback path uses host memcpy + blocking wait
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] IMMEDIATE: op=%s reason=mul_mat_id_fallback_needs_host_memcpy\n",
+                        ggml_op_name(node->op));
         return true;
     }
     if (node->op == GGML_OP_MUL_MAT) {
@@ -4778,7 +4791,6 @@ static bool node_needs_immediate_mode(const ggml_tensor * node) {
         ggml_tensor *       dst   = const_cast<ggml_tensor *>(node);
         const bool          split = src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer);
 
-        // Specialized F16 vec paths are graph-safe (no pool allocs, no waits)
         if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) &&
             src1->ne[1] == 1 && src0->ne[3] == 1 && src1->ne[3] == 1) {
             return false;
@@ -4788,22 +4800,27 @@ static bool node_needs_immediate_mode(const ggml_tensor * node) {
             return false;
         }
 
-        // Non-contiguous tensors cause pool alloc of temp copies — stale pointers on replay.
-        // Batched paths (ne12*ne13 > 1) iterate with varying offsets.
-        // F16/F32 type matmuls go through oneMKL GEMM which has internal .wait() calls.
         if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || src0->type == GGML_TYPE_F16 ||
             src0->type == GGML_TYPE_F32) {
-            // Batched F16 matmul (KQV attention): graph-compatible when async memory
-            // is available, since pool allocs become async_malloc (graph-recordable)
-            // and oneDNN matmul is fully asynchronous with no host waits.
-            if (src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) &&
-                src1->ne[2] * src1->ne[3] > 1) {
-                return !g_ggml_sycl_use_async_mem_op;
+            if (src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1)) {
+                bool result = !g_ggml_sycl_use_async_mem_op;
+                if (result) {
+                    GGML_SYCL_DEBUG(
+                        "[SYCL-GRAPH] IMMEDIATE: op=%s reason=f16_needs_async_mem src0=%s src1=%s "
+                        "ne12=%zu ne13=%zu async=%d contig=%d/%d\n",
+                        ggml_op_name(node->op), ggml_type_name(src0->type), ggml_type_name(src1->type), src1->ne[2],
+                        src1->ne[3], g_ggml_sycl_use_async_mem_op, ggml_is_contiguous(src0), ggml_is_contiguous(src1));
+                }
+                return result;
             }
+            GGML_SYCL_DEBUG(
+                "[SYCL-GRAPH] IMMEDIATE: op=%s reason=matmul_non_contiguous_or_f16_f32 src0=%s src1=%s "
+                "contig=%d/%d\n",
+                ggml_op_name(node->op), ggml_type_name(src0->type), ggml_type_name(src1->type),
+                ggml_is_contiguous(src0), ggml_is_contiguous(src1));
             return true;
         }
 
-        // DMMV, MMVQ, MMQ paths are graph-compatible
         bool use_dmmv = can_use_dequantize_mul_mat_vec(src0, src1, dst);
         bool use_mmvq = can_use_mul_mat_vec_q(src0, src1, dst);
         bool use_mmq  = ggml_sycl_supports_mmq(src0->type) && src1->type == GGML_TYPE_F32 &&
@@ -4815,7 +4832,8 @@ static bool node_needs_immediate_mode(const ggml_tensor * node) {
             return false;
         }
 
-        // Falls through to oneMKL GEMM — not graph-compatible
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] IMMEDIATE: op=%s reason=matmul_falls_through_to_onemkl_gemm src0=%s src1=%s\n",
+                        ggml_op_name(node->op), ggml_type_name(src0->type), ggml_type_name(src1->type));
         return true;
     }
     return false;
