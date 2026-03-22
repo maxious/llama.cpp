@@ -4774,8 +4774,9 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
 // Check if a node must be executed in immediate mode (can't be graph-recorded)
 static bool node_needs_immediate_mode(const ggml_tensor * node) {
     if (node->op == GGML_OP_CONCAT) {
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] IMMEDIATE: op=%s reason=concat_has_blocking_memcpy\n", ggml_op_name(node->op));
-        return true;
+        // CONCAT is graph-compatible: uses either kernels (dim != 3, non-contiguous) or
+        // async device-to-device memcpy (dim == 3, contiguous) - no blocking host sync
+        return false;
     }
     if (node->op == GGML_OP_MUL_MAT_ID) {
         if (can_use_mul_mat_id_direct(node)) {
