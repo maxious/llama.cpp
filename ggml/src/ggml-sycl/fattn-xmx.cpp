@@ -28,8 +28,8 @@
 // Online softmax and rescaling done in FP32.
 //
 // Tile dimensions:
-//   BQ = 32  (query rows per work-group)
-//   BK = 16  (KV positions per tile)
+//   BQ = 64  (query rows per work-group)  [vLLM uses 128-256]
+//   BK = 32  (KV positions per tile)     [vLLM uses 32-64]
 //   TM = 8, TK = 16, TN = 16  (FP16 joint_matrix shapes for Intel Xe)
 //
 // Work-group: 4 sub-groups of size 16 = 64 threads
@@ -53,8 +53,8 @@ static constexpr int FA_TK = 16;  // K dimension per MAD
 static constexpr int FA_TN = 16;  // cols per tile for B operand / accumulator
 
 // Work-group tile sizes
-static constexpr int FA_BQ     = 32;  // query rows per work-group (4 * FA_TM)
-static constexpr int FA_BK     = 16;  // KV positions per tile (1 * FA_TN)
+static constexpr int FA_BQ     = 64;  // query rows per work-group (4 * FA_TM)
+static constexpr int FA_BK     = 32;  // KV positions per tile (1 * FA_TN)
 static constexpr int FA_NWARPS = 4;   // sub-groups per work-group
 
 // ============================================================================
@@ -225,8 +225,8 @@ static void flash_attn_xmx_kernel(const char * __restrict__ Q,
         // Reinterpret: K_slm as [DKQ][FA_BK]
         // Total elements needed: DKQ * FA_BK <= BK * DKQ_PAD (if FA_BK <= DKQ_PAD, which is true for DKQ >= 64)
         // Actually we need DKQ * FA_BK elements, and K_slm has BK * DKQ_PAD elements.
-        // DKQ * FA_BK = DKQ * 16; BK * DKQ_PAD = 16 * (DKQ + 4)
-        // DKQ * 16 <= 16 * (DKQ + 4), always true. OK.
+        // DKQ * FA_BK = DKQ * 32; BK * DKQ_PAD = 32 * (DKQ + 4)
+        // DKQ * 32 <= 32 * (DKQ + 4), always true. OK.
 
         for (int i = lid; i < DKQ * FA_BK; i += FA_NWARPS * WARP_SIZE) {
             const int  d         = i / FA_BK;
