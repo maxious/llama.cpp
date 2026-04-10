@@ -34,7 +34,7 @@
 //
 // Work-group: 4 sub-groups of size 16 = 64 threads
 //   All 4 sub-groups cooperate on Q loading and softmax
-//   Sub-groups 0-3 each handle 8 rows of BQ for Q*K^T
+//   Each sub-group handles multiple rows in strided access for Q*K^T
 //
 // Memory layout in SLM:
 //   Q_slm[BQ][D_padded]    - FP16, loaded once per Q tile
