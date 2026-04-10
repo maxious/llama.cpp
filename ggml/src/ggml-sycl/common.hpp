@@ -19,6 +19,7 @@
 #include "ggml.h"
 #include "presets.hpp"
 #include "sycl_hw.hpp"
+#include "type.hpp"
 
 #include <cstddef>
 #include <fstream>
@@ -88,8 +89,7 @@ extern int g_ggml_sycl_disable_xmx;
 
 #define GGML_SYCL_MAX_NODES 8192          // TODO: adapt to hardwares
 
-// define for XMX in Intel GPU
-// TODO: currently, it's not used for XMX really.
+// define for XMX in Intel GPU - uses joint_matrix (DPAS) instructions for flash attention
 #if !defined(GGML_SYCL_FORCE_MMQ)
 #    define SYCL_USE_XMX
 #endif
