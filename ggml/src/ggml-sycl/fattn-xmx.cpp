@@ -16,6 +16,7 @@
 
 #include <cfloat>
 #include <cmath>
+#include <sycl/ext/oneapi/experimental/prefetch.hpp>
 #include <sycl/ext/oneapi/work_group_static.hpp>
 #include <sycl/sycl.hpp>
 
@@ -263,6 +264,16 @@ static void flash_attn_xmx_kernel(const char * __restrict__ Q,
         }
 
         item_ct1.barrier(sycl::access::fence_space::local_space);
+
+        // Prefetch next K/V tile during Q*K^T computation
+        const int next_kv_start = kv_start + FA_BK;
+        if (next_kv_start < ne11) {
+            const int    next_kv_len = sycl::min(FA_BK, ne11 - next_kv_start);
+            const char * K_next      = reinterpret_cast<const char *>(K_h) + next_kv_start * nb11;
+            sycl::ext::oneapi::experimental::prefetch((void *) K_next, next_kv_len * nb11);
+            const char * V_next = reinterpret_cast<const char *>(V_h) + next_kv_start * nb21;
+            sycl::ext::oneapi::experimental::prefetch((void *) V_next, next_kv_len * nb21);
+        }
 
         // ===== Step 1: Q * K^T using XMX =====
         // Result: score[BQ][BK] in FP32
