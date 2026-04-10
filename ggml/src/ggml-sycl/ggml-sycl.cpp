@@ -65,6 +65,10 @@ int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_enable_flash_attention = 1;
 
+static bool g_ggml_sycl_disable_p2p = 0;
+static bool g_ggml_sycl_force_p2p = 0;
+static bool p2p_access[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_DEVICES] = {};
+
 
 static ggml_sycl_device_info ggml_sycl_init() {
     ggml_sycl_device_info info = {};
@@ -217,6 +221,8 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_disable_graph = get_sycl_env("GGML_SYCL_DISABLE_GRAPH", 1);
         g_ggml_sycl_disable_dnn = get_sycl_env("GGML_SYCL_DISABLE_DNN", 0);
         g_ggml_sycl_prioritize_dmmv = get_sycl_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
+        g_ggml_sycl_disable_p2p = get_sycl_env("GGML_SYCL_DISABLE_P2P", 0);
+        g_ggml_sycl_force_p2p = get_sycl_env("GGML_SYCL_FORCE_P2P", 0);
 
 #ifdef SYCL_FLASH_ATTN
         g_ggml_sycl_enable_flash_attention = get_sycl_env("GGML_SYCL_ENABLE_FLASH_ATTN", 1);
@@ -262,6 +268,8 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: DNN disabled by compile flag\n");
 #endif
         GGML_LOG_INFO("  GGML_SYCL_PRIORITIZE_DMMV: %d\n", g_ggml_sycl_prioritize_dmmv);
+        GGML_LOG_INFO("  GGML_SYCL_DISABLE_P2P: %d\n", g_ggml_sycl_disable_p2p);
+        GGML_LOG_INFO("  GGML_SYCL_FORCE_P2P: %d\n", g_ggml_sycl_force_p2p);
 
 #ifdef SYCL_FLASH_ATTN
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_FLASH_ATTN: %d\n", g_ggml_sycl_enable_flash_attention);
@@ -498,12 +506,19 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-static void dev2dev_memcpy(sycl::queue &q_dst, sycl::queue &q_src, void *ptr_dst,
-                    const void *ptr_src, size_t size) {
-    char *host_buf = (char *)malloc(size);
-    q_src.memcpy(host_buf, (const char *)ptr_src, size).wait();
-    q_dst.memcpy((char *)ptr_dst, host_buf, size).wait();
-    free(host_buf);
+static void dev2dev_memcpy(int dst_dev, sycl::queue & q_dst, int src_dev, sycl::queue & q_src, void *ptr_dst,
+                            const void *ptr_src, size_t size) {
+    if (g_ggml_sycl_force_p2p || (p2p_access[dst_dev][src_dev] && !g_ggml_sycl_disable_p2p)) {
+        if (g_ggml_sycl_debug) {
+            GGML_LOG_DEBUG("P2P: direct copy from device %d to %d, size %zu\n", src_dev, dst_dev, size);
+        }
+        q_dst.copy((const char *) ptr_src, (char *) ptr_dst, size);
+    } else {
+        char *host_buf = (char *)malloc(size);
+        q_src.memcpy(host_buf, (const char *)ptr_src, size).wait();
+        q_dst.memcpy((char *)ptr_dst, host_buf, size).wait();
+        free(host_buf);
+    }
 }
 
 static bool
@@ -545,8 +560,7 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         queue_ptr stream_src = src_ctx->stream;
         size_t size = ggml_nbytes(src);
 
-        //todo. it's dirty solutino to walkaroud known issue:device2device cross GPUs.
-        dev2dev_memcpy(*stream_dst, *stream_src, dst->data, src->data, size);
+        dev2dev_memcpy(dst_ctx->device, *stream_dst, src_ctx->device, *stream_src, dst->data, src->data, size);
 
 //todo, it's known issue：error in device2device cross GPUs. reused when the issue is fixed. DON"T remove
 #if 0
@@ -2525,44 +2539,52 @@ inline void ggml_sycl_op_scale(ggml_backend_sycl_context & ctx, ggml_tensor * ds
 }
 
 static void ggml_sycl_set_peer_access(const int n_tokens, int main_device) {
-    static bool peer_access_enabled = false;
+    GGML_UNUSED(n_tokens);
+    GGML_UNUSED(main_device);
 
-    const bool enable_peer_access = n_tokens <= GGML_SYCL_PEER_MAX_BATCH_SIZE;
+    static bool peer_access_initialized = false;
 
-    if (peer_access_enabled == enable_peer_access) {
+    if (peer_access_initialized) {
         return;
     }
 
-#ifdef NDEBUG
-    for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
-        SYCL_CHECK(ggml_sycl_set_device(i));
+    if (g_ggml_sycl_disable_p2p) {
+        GGML_LOG_DEBUG("P2P: disabled by GGML_SYCL_DISABLE_P2P\n");
+        peer_access_initialized = true;
+        return;
     }
 
-    for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
-        SYCL_CHECK(ggml_sycl_set_device(i));
-
-        for (int id_other = 0; id_other < ggml_sycl_info().device_count; ++id_other) {
-            if (i == id_other) {
+    int device_count = dpct::dev_mgr::instance().device_count();
+    for (int i = 0; i < device_count; ++i) {
+        sycl::device dev_i = dpct::dev_mgr::instance().get_device(i);
+        for (int j = 0; j < device_count; ++j) {
+            if (i == j) {
+                p2p_access[i][j] = true;
                 continue;
             }
-            if (i != main_device && id_other != main_device) {
-                continue;
+            sycl::device dev_j = dpct::dev_mgr::instance().get_device(j);
+            try {
+                bool can_access = dev_i.ext_oneapi_can_access_peer(dev_j, sycl::ext::oneapi::peer_access::access_supported);
+                p2p_access[i][j] = can_access;
+                if (g_ggml_sycl_debug) {
+                    GGML_LOG_DEBUG("P2P: device %d can access device %d: %s\n", i, j, can_access ? "yes" : "no");
+                }
+                if (can_access && !g_ggml_sycl_disable_p2p) {
+                    dev_i.ext_oneapi_enable_peer_access(dev_j);
+                    if (g_ggml_sycl_debug) {
+                        GGML_LOG_DEBUG("P2P: enabled access from device %d to device %d\n", i, j);
+                    }
+                }
+            } catch (const sycl::exception & e) {
+                p2p_access[i][j] = false;
+                if (g_ggml_sycl_debug) {
+                    GGML_LOG_DEBUG("P2P: device %d cannot access device %d: %s\n", i, j, e.what());
+                }
             }
-
-            // int can_access_peer;
-            // SYCL_CHECK(syclDeviceCanAccessPeer(&can_access_peer, id, id_other));
-            // if (can_access_peer) {
-            //     if (enable_peer_access) {
-            //         SYCL_CHECK(syclDeviceEnablePeerAccess(id_other, 0));
-            //     } else {
-            //         SYCL_CHECK(syclDeviceDisablePeerAccess(id_other));
-            //     }
-            // }
         }
     }
-#endif // NDEBUG
 
-    peer_access_enabled = enable_peer_access;
+    peer_access_initialized = true;
 }
 
 template <template <int> typename quantize_f>
@@ -2778,7 +2800,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                             src1_ddf_i_source += (i0 * ne11 + src1_col_0) * ne10;
 
                             SYCL_CHECK(
-                                CHECK_TRY_ERROR(dev2dev_memcpy(*stream, *main_stream, src1_ddf_i, src1_ddf_i_source,
+                                CHECK_TRY_ERROR(dev2dev_memcpy(i, *stream, ctx.device, *main_stream, src1_ddf_i, src1_ddf_i_source,
                                                                src1_ncols * ne10 * sizeof(float))));
                         }
                     }
