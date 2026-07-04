@@ -38,6 +38,10 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst) {
     if (!mask || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1 || sinks) {
         return false;
     }
+    // mask is passed in-place: must be contiguous [seq,q] row-major to match oneDNN's [1,1,q,seq] strided logical_tensor
+    if (mask->nb[0] != sizeof(sycl::half) || mask->nb[1] != mask->ne[0] * sizeof(sycl::half)) {
+        return false;
+    }
     float max_bias = 0.0f, logit_softcap = 0.0f;
     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
@@ -56,6 +60,13 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst) {
     // Prefill only.
     if (Q->ne[1] < GGML_SYCL_FA_ONEDNN_MIN_Q) {
         return false;
+    }
+    // Q/K/V strides must be multiples of element size for cont_to_f16_sycl to index correctly
+    for (const ggml_tensor * t : {Q, K, V}) {
+        const size_t esz = ggml_type_size(t->type);
+        if (t->nb[1] % esz != 0 || t->nb[2] % esz != 0 || t->nb[3] % esz != 0) {
+            return false;
+        }
     }
     return true;
 #endif
@@ -87,17 +98,23 @@ static void cont_to_f16_sycl(const char * src, sycl::half * dst,
     });
 }
 
-// oneDNN SDPA out (f16 contiguous [mb,H,q,d]) -> ggml dst (f32 [head_dim,H,n_tok,mb], contiguous).
-static void permute_sdpa_out_sycl(const sycl::half * out, float * dst,
+// oneDNN SDPA out (f16 contiguous [mb,H,q,d]) -> ggml dst (f32 [head_dim,H,n_tok,mb]).
+// Uses dst->nb[] for stride-aware output; fixes multi-turn KV corruption when ggml pads output dims.
+static void permute_sdpa_out_sycl(const sycl::half * out, ggml_tensor * dst,
         int64_t mb, int64_t H, int64_t q, int64_t d, dpct::queue_ptr stream) {
     const int64_t n = mb * H * q * d;
+    char * dst_data = (char *) dst->data;
+    const size_t nb0 = dst->nb[0];
+    const size_t nb1 = dst->nb[1];
+    const size_t nb2 = dst->nb[2];
+    const size_t nb3 = dst->nb[3];
     stream->parallel_for(sycl::range<1>(n), [=](sycl::id<1> ix) {
         const int64_t gid = ix[0];
         int64_t       i   = gid;
         const int64_t e = i % d; i /= d;
         const int64_t t = i % q; i /= q;
         const int64_t h = i % H; const int64_t b = i / H;
-        dst[e + h * d + t * d * H + b * d * H * q] = (float) out[gid];
+        *(float *)(dst_data + e*nb0 + h*nb1 + t*nb2 + b*nb3) = (float) out[gid];
     });
 }
 
@@ -236,7 +253,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     tensor to(E.out, eng, outf.get());
     E.cp.execute(strm, ti, {to});
 
-    permute_sdpa_out_sycl(outf.get(), (float *) dst->data, mb, H, q, d, stream);
+    permute_sdpa_out_sycl(outf.get(), dst, mb, H, q, d, stream);
 }
 catch (const std::exception & e) {
     // any oneDNN/SYCL failure is non-fatal: fall back to the existing kernel (strictly additive).
