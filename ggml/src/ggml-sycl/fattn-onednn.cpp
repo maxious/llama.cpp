@@ -254,6 +254,16 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     E.cp.execute(strm, ti, {to});
 
     permute_sdpa_out_sycl(outf.get(), dst, mb, H, q, d, stream);
+
+    // The cont_to_f16 -> oneDNN execute -> permute chain is fully async on this stream. The
+    // pool_alloc RAII destructors below run on the host *now* and return Qf/Kf/Vf/scbuf/outf
+    // to the host-side pool. Without flushing, the next scheduler-dispatched op (e.g. the next
+    // layer's flash-attn) can free the same device bytes back out to a different op while the
+    // GPU is still reading them, so the in-flight SDPA / permute reads garbage and the model
+    // collapses to a repeated token ('GGGGG...'). Flushing before freeing is the same fix used
+    // in the XMX path (commit da66dd3b5: "Add stream->wait() before sycl::free() in XMX KV-split
+    // cleanup") and is required for multi-turn correctness when GGML_SYCL_FA_ONEDNN_MIN_Q is hit.
+    stream->wait_and_throw();
 }
 catch (const std::exception & e) {
     // any oneDNN/SYCL failure is non-fatal: fall back to the existing kernel (strictly additive).
